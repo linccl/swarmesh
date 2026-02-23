@@ -1,0 +1,48 @@
+{
+  "name": "链式接力流程",
+  "description": "数据库 → 后端 → 前端 的三级接力开发流程",
+  "version": "1.0",
+  "stages": [
+    {
+      "stage": 1,
+      "name": "数据库设计",
+      "parallel": false,
+      "tasks": [
+        {
+          "id": "db-schema",
+          "role": "database",
+          "template": "请设计数据库 Schema：{{requirement}}",
+          "timeout": 300
+        }
+      ]
+    },
+    {
+      "stage": 2,
+      "name": "后端开发",
+      "parallel": false,
+      "tasks": [
+        {
+          "id": "api-dev",
+          "role": "backend",
+          "depends_on": ["db-schema"],
+          "template": "基于以下数据库设计实现 REST API：\n\n{{db-schema}}",
+          "timeout": 600
+        }
+      ]
+    },
+    {
+      "stage": 3,
+      "name": "前端开发",
+      "parallel": false,
+      "tasks": [
+        {
+          "id": "ui-dev",
+          "role": "frontend",
+          "depends_on": ["api-dev"],
+          "template": "调用以下 API 实现前端页面：\n\n{{api-dev}}",
+          "timeout": 600
+        }
+      ]
+    }
+  ]
+}

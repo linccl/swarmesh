@@ -1,0 +1,60 @@
+{
+  "description": "CLI 能力画像与任务路由推荐配置",
+  "version": "1.0.0",
+  "cli_profiles": {
+    "claude": {
+      "command": "claude chat",
+      "strengths": ["complex-reasoning", "architecture", "security-audit", "long-context", "code-review-deep"],
+      "weaknesses": ["speed", "cost"],
+      "cost_tier": "high",
+      "best_for": "核心业务逻辑、架构设计、安全审计、复杂 Bug 修复"
+    },
+    "codex": {
+      "command": "codex chat",
+      "strengths": ["code-review", "testing", "quick-fix", "instruction-following", "devops"],
+      "weaknesses": ["complex-architecture", "creative-design"],
+      "cost_tier": "medium",
+      "best_for": "代码审查、测试编写、DevOps 配置、标准化修改"
+    },
+    "gemini": {
+      "command": "gemini --approval-mode yolo",
+      "strengths": ["frontend", "ui-design", "rapid-iteration", "multimodal", "prototyping"],
+      "weaknesses": ["deep-reasoning", "complex-logic"],
+      "cost_tier": "low",
+      "best_for": "前端开发、UI 设计、快速原型、多模态任务"
+    }
+  },
+  "task_routing": {
+    "develop": {
+      "frontend":    { "recommended": "gemini",  "fallback": "claude" },
+      "backend":     { "recommended": "claude",  "fallback": "codex" },
+      "database":    { "recommended": "claude",  "fallback": "codex" },
+      "devops":      { "recommended": "codex",   "fallback": "claude" },
+      "ui-designer": { "recommended": "gemini",  "fallback": "claude" }
+    },
+    "review": {
+      "*":           { "recommended": "codex",   "fallback": "claude" }
+    },
+    "test": {
+      "*":           { "recommended": "codex",   "fallback": "claude" }
+    },
+    "security": {
+      "*":           { "recommended": "claude",  "fallback": "codex" }
+    },
+    "architecture": {
+      "*":           { "recommended": "claude",  "fallback": "codex" }
+    }
+  },
+  "override_hints": {
+    "simple-crud":       "codex",
+    "complex-state":     "claude",
+    "css-heavy":         "gemini",
+    "performance-tuning":"claude",
+    "ci-cd-pipeline":    "codex",
+    "api-design":        "claude",
+    "unit-test":         "codex",
+    "e2e-test":          "codex",
+    "security-audit":    "claude",
+    "quick-prototype":   "gemini"
+  }
+}

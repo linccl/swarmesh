@@ -1,0 +1,62 @@
+{
+  "name": "完整功能开发流程",
+  "description": "从需求分析到代码审查的完整功能开发工作流",
+  "version": "1.0",
+  "stages": [
+    {
+      "stage": 1,
+      "name": "数据库设计",
+      "parallel": false,
+      "tasks": [
+        {
+          "id": "db-design",
+          "role": "database",
+          "template": "请为以下需求设计数据库表结构，包括：表定义、字段类型、索引、约束关系。需求：{{requirement}}",
+          "timeout": 300
+        }
+      ]
+    },
+    {
+      "stage": 2,
+      "name": "核心开发",
+      "parallel": true,
+      "tasks": [
+        {
+          "id": "backend-dev",
+          "role": "backend",
+          "depends_on": ["db-design"],
+          "template": "基于以下数据库设计，实现后端 API 接口（RESTful 风格）。需求：{{requirement}}\n\n数据库设计：\n{{db-design}}",
+          "timeout": 600
+        },
+        {
+          "id": "frontend-dev",
+          "role": "frontend",
+          "depends_on": ["db-design"],
+          "template": "基于以下数据模型，实现前端页面和组件。需求：{{requirement}}\n\n数据模型参考：\n{{db-design}}",
+          "timeout": 600
+        }
+      ]
+    },
+    {
+      "stage": 3,
+      "name": "测试与审查",
+      "parallel": true,
+      "tasks": [
+        {
+          "id": "code-test",
+          "role": "tester",
+          "depends_on": ["backend-dev", "frontend-dev"],
+          "template": "请为以下实现编写测试用例并执行测试。需求：{{requirement}}\n\n后端实现：\n{{backend-dev}}\n\n前端实现：\n{{frontend-dev}}",
+          "timeout": 300
+        },
+        {
+          "id": "code-review",
+          "role": "reviewer",
+          "depends_on": ["backend-dev", "frontend-dev"],
+          "template": "请审查以下代码实现，检查代码质量、规范性、安全性和性能问题。\n\n后端代码：\n{{backend-dev}}\n\n前端代码：\n{{frontend-dev}}",
+          "timeout": 300
+        }
+      ]
+    }
+  ]
+}

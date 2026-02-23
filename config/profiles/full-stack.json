@@ -1,0 +1,135 @@
+{
+  "name": "全栈开发团队",
+  "description": "包含全部 13 个角色的完整配置 - 覆盖开发、质量、管理全流程",
+  "version": "1.0.0",
+  "created": "2026-02-12",
+  "roles": [
+    {
+      "name": "frontend",
+      "cli": "gemini --approval-mode yolo",
+      "config": "core/frontend.md",
+      "alias": "fe,front,frontend,0",
+      "title": "前端专家",
+      "description": "React/Vue 前端开发专家，负责 UI 实现和用户体验"
+    },
+    {
+      "name": "backend",
+      "cli": "claude chat",
+      "config": "core/backend.md",
+      "alias": "be,back,backend,1",
+      "title": "后端专家",
+      "description": "后端开发专家，负责 API 设计、业务逻辑和数据处理"
+    },
+    {
+      "name": "database",
+      "cli": "claude chat",
+      "config": "core/database.md",
+      "alias": "db,database,2",
+      "title": "数据库专家",
+      "description": "数据库设计和优化专家，负责数据架构和查询优化"
+    },
+    {
+      "name": "devops",
+      "cli": "codex chat",
+      "config": "core/devops.md",
+      "alias": "ops,devops,3",
+      "title": "DevOps专家",
+      "description": "CI/CD 和自动化专家，负责部署流水线和基础设施"
+    },
+    {
+      "name": "tester",
+      "cli": "codex chat",
+      "config": "quality/tester.md",
+      "alias": "test,tester,4",
+      "title": "测试专家",
+      "description": "自动化测试专家，负责测试策略和质量保障"
+    },
+    {
+      "name": "security",
+      "cli": "claude chat",
+      "config": "quality/security.md",
+      "alias": "sec,security,5",
+      "title": "安全专家",
+      "description": "安全审计专家，负责安全扫描和漏洞防护"
+    },
+    {
+      "name": "performance",
+      "cli": "claude chat",
+      "config": "quality/performance.md",
+      "alias": "perf,performance,6",
+      "title": "性能专家",
+      "description": "性能优化专家，负责性能分析和调优"
+    },
+    {
+      "name": "reviewer",
+      "cli": "codex chat",
+      "config": "quality/reviewer.md",
+      "alias": "review,rv,reviewer,7",
+      "title": "代码审查员",
+      "description": "代码质量审查专家，负责代码规范和最佳实践验证"
+    },
+    {
+      "name": "ui-designer",
+      "cli": "gemini --approval-mode yolo",
+      "config": "management/ui-designer.md",
+      "alias": "ui,designer,8",
+      "title": "UI设计专家",
+      "description": "UI 设计专家，负责视觉设计、交互设计和设计系统"
+    },
+    {
+      "name": "architect",
+      "cli": "claude chat",
+      "config": "management/architect.md",
+      "alias": "arch,architect,9",
+      "title": "系统架构师",
+      "description": "系统架构师，负责架构设计、技术选型和技术指导"
+    },
+    {
+      "name": "auditor",
+      "cli": "codex chat",
+      "config": "management/auditor.md",
+      "alias": "audit,auditor,10",
+      "title": "审核专家",
+      "description": "审核专家，负责代码规范审核、标准符合性验证和发布检查"
+    },
+    {
+      "name": "supervisor",
+      "cli": "claude chat",
+      "config": "management/supervisor.md",
+      "alias": "sup,supervisor,11",
+      "title": "编排者",
+      "description": "编排者，负责任务拆解、角色调度、进度监控和跨角色协调"
+    },
+    {
+      "name": "inspector",
+      "cli": "claude chat",
+      "config": "management/inspector.md",
+      "alias": "insp,inspector,12",
+      "title": "督查员",
+      "description": "督查员，负责任务验收、质量把关、返工决策和风险预警"
+    }
+  ],
+  "config": {
+    "session_name": "swarm",
+    "window_name": "full-stack",
+    "layout": "tiled",
+    "log_enabled": true,
+    "startup_wait": 3,
+    "config_send_delay": 2
+  },
+  "metadata": {
+    "author": "tmux-swarm-dev",
+    "purpose": "全栈开发完整团队配置",
+    "use_cases": [
+      "大型全栈 Web 应用开发",
+      "需要完整质量保障的企业级项目",
+      "需要架构设计和技术治理的复杂系统",
+      "需要流程监督和跨团队协调的团队项目"
+    ],
+    "team_composition": {
+      "core_dev": ["frontend", "backend", "database", "devops"],
+      "quality": ["tester", "security", "performance", "reviewer"],
+      "management": ["ui-designer", "architect", "auditor", "supervisor", "inspector"]
+    }
+  }
+}

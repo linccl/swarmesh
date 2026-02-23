@@ -1,0 +1,18 @@
+# 运行时数据（每次启动重新生成）
+runtime/
+
+# 原型/实验代码
+prototype/
+fifo-test/
+
+# macOS
+.DS_Store
+
+# 编辑器
+*.swp
+*.swo
+*~
+
+# 临时文件
+*.tmp
+.claude/

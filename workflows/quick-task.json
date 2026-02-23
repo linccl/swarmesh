@@ -1,0 +1,26 @@
+{
+  "name": "快速并行任务",
+  "description": "向多个角色同时派发独立任务（无依赖）",
+  "version": "1.0",
+  "stages": [
+    {
+      "stage": 1,
+      "name": "并行执行",
+      "parallel": true,
+      "tasks": [
+        {
+          "id": "fe-task",
+          "role": "frontend",
+          "template": "{{requirement}}",
+          "timeout": 300
+        },
+        {
+          "id": "be-task",
+          "role": "backend",
+          "template": "{{requirement}}",
+          "timeout": 300
+        }
+      ]
+    }
+  ]
+}

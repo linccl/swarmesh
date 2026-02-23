@@ -1,0 +1,78 @@
+{
+  "name": "Web 开发团队",
+  "description": "完整的 Web 开发团队 - 6 个核心角色",
+  "version": "1.0.0",
+  "created": "2026-02-12",
+  "roles": [
+    {
+      "name": "frontend",
+      "cli": "gemini --approval-mode yolo",
+      "config": "core/frontend.md",
+      "alias": "fe,front,frontend,0",
+      "title": "🎨 前端专家",
+      "description": "React/Vue 前端开发专家"
+    },
+    {
+      "name": "backend",
+      "cli": "claude chat",
+      "config": "core/backend.md",
+      "alias": "be,back,backend,1",
+      "title": "⚙️ 后端专家",
+      "description": "后端开发专家"
+    },
+    {
+      "name": "database",
+      "cli": "claude chat",
+      "config": "core/database.md",
+      "alias": "db,database,2",
+      "title": "🗄️ 数据库专家",
+      "description": "数据库设计和优化专家"
+    },
+    {
+      "name": "devops",
+      "cli": "codex chat",
+      "config": "core/devops.md",
+      "alias": "ops,devops,3",
+      "title": "🚀 DevOps专家",
+      "description": "CI/CD 和自动化专家"
+    },
+    {
+      "name": "tester",
+      "cli": "codex chat",
+      "config": "quality/tester.md",
+      "alias": "test,tester,4",
+      "title": "🧪 测试专家",
+      "description": "自动化测试专家"
+    },
+    {
+      "name": "reviewer",
+      "cli": "codex chat",
+      "config": "quality/reviewer.md",
+      "alias": "review,rv,reviewer,5",
+      "title": "🔍 代码审查员",
+      "description": "代码质量审查专家"
+    }
+  ],
+  "config": {
+    "session_name": "swarm",
+    "window_name": "dev-team",
+    "layout": "tiled",
+    "log_enabled": true,
+    "startup_wait": 3,
+    "config_send_delay": 2
+  },
+  "metadata": {
+    "author": "tmux-swarm-dev",
+    "purpose": "Web 开发完整流程",
+    "use_cases": [
+      "全栈 Web 应用开发",
+      "需要数据库设计的项目",
+      "需要 CI/CD 的项目",
+      "需要全面测试的项目"
+    ],
+    "team_composition": {
+      "core_dev": ["frontend", "backend", "database", "devops"],
+      "quality": ["tester", "reviewer"]
+    }
+  }
+}
