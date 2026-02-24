@@ -31,29 +31,68 @@
 - jq
 - 至少一个 AI CLI（[Claude Code](https://github.com/anthropics/claude-code)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[Codex](https://github.com/openai/codex) 等）
 
-### 启动蜂群
+### 通用 CLI（推荐）
+
+`swarm-cli.sh` 是通用主控入口，任何终端都能使用：
 
 ```bash
-# 最小团队（3 角色：frontend + backend + reviewer）
-./scripts/swarm-start.sh --project /path/to/your/project
+# 启动蜂群（交互式选择 profile）
+./scripts/swarm-cli.sh start ~/my-app
 
-# 指定 profile
-./scripts/swarm-start.sh --project /path/to/your/project --profile web-dev
+# 启动蜂群（指定 profile）
+./scripts/swarm-cli.sh start ~/my-app web-dev
 
-# 后台启动
-./scripts/swarm-start.sh --project /path/to/your/project --hidden
+# 查看蜂群状态（含角色、收件箱、任务、事件）
+./scripts/swarm-cli.sh status
+
+# 派发任务给 supervisor（自动编排）
+./scripts/swarm-cli.sh task 实现用户注册功能
+
+# 派发任务给指定角色
+./scripts/swarm-cli.sh task backend 实现登录 API
+
+# 查看收件箱和任务队列
+./scripts/swarm-cli.sh task
+
+# 动态加入/移除角色（交互式选择）
+./scripts/swarm-cli.sh join
+./scripts/swarm-cli.sh leave
+
+# 透传消息系统命令
+./scripts/swarm-cli.sh msg send reviewer "请 review PR #42"
+./scripts/swarm-cli.sh msg broadcast "v1 接口已定稿"
+
+# 停止蜂群（可选清理数据）
+./scripts/swarm-cli.sh stop
+./scripts/swarm-cli.sh stop --clean
 ```
 
-### 查看状态
+每个子命令支持 `--help` 查看详细用法：`./scripts/swarm-cli.sh start --help`
+
+### Claude Code 用户
+
+如果你使用 Claude Code 作为主控，可以直接用 slash command（底层逻辑相同）：
+
+- `/swarm-start` — 启动蜂群
+- `/swarm-stop` — 停止蜂群
+- `/swarm-status` — 查看状态
+- `/swarm-task` — 派发任务
+- `/swarm-join` — 加入角色
+- `/swarm-leave` — 移除角色
+
+### 底层脚本
+
+也可以直接调用底层脚本：
 
 ```bash
+# 启动
+./scripts/swarm-start.sh --project /path/to/your/project --profile minimal --hidden
+
+# 状态
 ./scripts/swarm-status.sh
-```
 
-### 停止蜂群
-
-```bash
-./scripts/swarm-stop.sh
+# 停止
+./scripts/swarm-stop.sh --force
 ```
 
 ## 消息系统
@@ -98,6 +137,7 @@ swarm-msg.sh task take <task-id>
 ```
 swarmesh/
 ├── scripts/                 # 核心脚本
+│   ├── swarm-cli.sh         # 通用主控入口（整合所有子命令）
 │   ├── swarm-start.sh       # 启动蜂群
 │   ├── swarm-stop.sh        # 停止蜂群
 │   ├── swarm-msg.sh         # CLI 间消息通讯
