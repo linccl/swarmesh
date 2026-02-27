@@ -494,6 +494,67 @@ cmd_mark_read() {
 }
 
 # =============================================================================
+# 子命令: cleanup (清理过期消息和已完成任务)
+# =============================================================================
+
+cmd_cleanup() {
+    local ttl=3600
+    local dry_run=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ttl)     ttl="$2"; shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
+            -*) die "cleanup: 未知选项 '$1'" ;;
+            *)  die "cleanup: 多余参数 '$1'" ;;
+        esac
+    done
+
+    local now
+    now=$(date +%s)
+    local cleaned_msgs=0 cleaned_tasks=0
+
+    # 清理 outbox/ 中超过 TTL 的已读消息
+    shopt -s nullglob
+    for role_dir in "$OUTBOX_DIR"/*/; do
+        [[ -d "$role_dir" ]] || continue
+        for f in "$role_dir"*.json; do
+            [[ -f "$f" ]] || continue
+            local file_mtime
+            file_mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo "0")
+            if [[ $(( now - file_mtime )) -ge $ttl ]]; then
+                if [[ "$dry_run" == true ]]; then
+                    echo "[dry-run] 删除已发消息: $f"
+                else
+                    rm -f "$f"
+                fi
+                ((cleaned_msgs++)) || true
+            fi
+        done
+    done
+
+    # 清理 completed/ 中超过 TTL 的已完成任务
+    for f in "$TASKS_DIR/completed/"*.json; do
+        [[ -f "$f" ]] || continue
+        local file_mtime
+        file_mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo "0")
+        if [[ $(( now - file_mtime )) -ge $ttl ]]; then
+            if [[ "$dry_run" == true ]]; then
+                echo "[dry-run] 删除已完成任务: $f"
+            else
+                rm -f "$f"
+            fi
+            ((cleaned_tasks++)) || true
+        fi
+    done
+    shopt -u nullglob
+
+    local mode_label=""
+    [[ "$dry_run" == true ]] && mode_label=" (dry-run)"
+    info "清理完成${mode_label}: 消息 $cleaned_msgs 条, 任务 $cleaned_tasks 个 (TTL=${ttl}s)"
+}
+
+# =============================================================================
 # 帮助信息
 # =============================================================================
 
@@ -524,6 +585,7 @@ swarm-msg.sh - CLI-to-CLI 自主消息 & 任务队列工具
   set-verify '<json>' --role <name>    设置角色级验证命令（质量门按角色执行）
   recover-tasks                        恢复卡在 processing 的任务（认领者已离线）
   set-limit [N]                        查看/设置 CLI 数量上限 (0=不限制)
+  cleanup [--ttl <秒>] [--dry-run]    清理过期已读消息和已完成任务
 
 publish 选项:
   --assign|-a <role>           指派给特定角色（只有该角色能认领，通知也只推给该角色）
@@ -667,6 +729,9 @@ main() {
             ;;
         set-limit)
             cmd_set_limit "${1:-}"
+            ;;
+        cleanup)
+            cmd_cleanup "$@"
             ;;
         help|--help|-h)
             show_help
