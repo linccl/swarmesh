@@ -146,7 +146,8 @@ WORKTREE_DIR="$PROJECT_DIR/.swarm-worktrees"
 
 log_info "初始化运行时环境..."
 
-mkdir -p "$RUNTIME_DIR" "$LOGS_DIR" "$TASKS_DIR"/{pending,processing,completed,failed,blocked,groups}
+mkdir -p "$RUNTIME_DIR" "$LOGS_DIR" "$TASKS_DIR"/{pending,processing,completed,failed,blocked,groups} \
+    "$RUNTIME_DIR/stories" "$RUNTIME_DIR/gate-logs"
 
 # 初始化消息目录
 MESSAGES_DIR="$RUNTIME_DIR/messages"
@@ -179,6 +180,25 @@ rm -f "$LOGS_DIR"/*.log
 log_success "运行时环境初始化完成"
 
 # =============================================================================
+# 扫描项目结构
+# =============================================================================
+
+PROJECT_INFO_FILE="$RUNTIME_DIR/project-info.json"
+if [[ -x "$SCRIPTS_DIR/swarm-scan.sh" ]]; then
+    log_info "扫描项目技术栈..."
+    "$SCRIPTS_DIR/swarm-scan.sh" "$PROJECT_DIR" "$PROJECT_INFO_FILE" 2>&1 | while IFS= read -r line; do
+        log_info "  $line"
+    done
+
+    if [[ -f "$PROJECT_INFO_FILE" ]]; then
+        key_file_count=$(jq '.key_files | length' "$PROJECT_INFO_FILE" 2>/dev/null || echo 0)
+        log_info "收集到 $key_file_count 个关键配置文件，LLM 角色将自行分析技术栈"
+    fi
+else
+    log_warn "swarm-scan.sh 不可用，跳过项目扫描"
+fi
+
+# =============================================================================
 # 读取和解析 Profile 配置
 # =============================================================================
 
@@ -194,8 +214,16 @@ ROLES_JSON=$(echo "$PROFILE_JSON" | jq -c '.roles // []')
 HAS_SUPERVISOR=$(echo "$ROLES_JSON" | jq '[.[] | select(.name == "supervisor")] | length')
 if [[ "$HAS_SUPERVISOR" -eq 0 ]]; then
     log_info "自动注入 supervisor 角色（编排者）"
-    SUPERVISOR_ENTRY='{"name":"supervisor","cli":"claude chat","config":"management/supervisor.md","alias":"sup,supervisor","title":"督查组","description":"蜂群编排者，负责任务拆解、角色调度和进度监控"}'
+    SUPERVISOR_ENTRY='{"name":"supervisor","cli":"claude chat","config":"management/supervisor.md","alias":"sup,supervisor","title":"编排者","description":"蜂群编排者，负责任务拆解、角色调度和进度监控"}'
     ROLES_JSON=$(echo "$ROLES_JSON" | jq --argjson sup "$SUPERVISOR_ENTRY" '. + [$sup]')
+fi
+
+# 自动注入 inspector（督查员）——质量门守护者，必须存在
+HAS_INSPECTOR=$(echo "$ROLES_JSON" | jq '[.[] | select(.name == "inspector")] | length')
+if [[ "$HAS_INSPECTOR" -eq 0 ]]; then
+    log_info "自动注入 inspector 角色（督查员）"
+    INSPECTOR_ENTRY='{"name":"inspector","cli":"claude chat","config":"management/inspector.md","alias":"insp,inspector","title":"督查员","description":"督查员，负责质量门配置、任务验收和产出质量把关"}'
+    ROLES_JSON=$(echo "$ROLES_JSON" | jq --argjson insp "$INSPECTOR_ENTRY" '. + [$insp]')
 fi
 
 ROLES_COUNT=$(echo "$ROLES_JSON" | jq 'length')
@@ -313,36 +341,8 @@ for ((i=0; i<ROLES_COUNT; i++)); do
             TEAM_INFO+=$'\n'
         done
 
-        INIT_MSG="请读取你的角色配置文件: $CONFIG_FILE 并确认你已理解角色定义。
-
-## 并行开发
-你在独立的 git worktree 中工作，分支: $ROLE_BRANCH
-你的代码修改不会与其他角色冲突。完成后由人类决定合并。
-
-## 当前团队成员
-${TEAM_INFO}
-注意: 只与上述团队成员沟通。如果任务需要的角色不在团队中,你需要自行承担该部分职责。
-你可以随时执行 swarm-msg.sh list-roles 查看最新在线角色。
-
-## Swarm 协作工具
-消息（点对点）:
-- 发送消息: swarm-msg.sh send <角色名> \"消息内容\"
-- 回复消息: swarm-msg.sh reply <消息ID> \"回复内容\"
-- 查看收件箱: swarm-msg.sh read
-- 等待消息: swarm-msg.sh wait --timeout 60
-- 查看在线角色: swarm-msg.sh list-roles
-- 广播消息: swarm-msg.sh broadcast \"消息内容\"
-
-任务队列（中心队列，任何角色可认领）:
-- 发布任务: swarm-msg.sh publish <类型> \"标题\" --description \"详情\"
-- 查看待认领: swarm-msg.sh list-tasks
-- 认领任务: swarm-msg.sh claim <任务ID>
-- 完成任务: swarm-msg.sh complete-task <任务ID> \"结果\"
-
-开发完成后你的代码会自动 commit 到分支。如需审核,执行:
-  swarm-msg.sh publish review \"审核标题\" --description \"变更说明\"
-
-当你判断任务涉及其他角色的职责时,主动用 swarm-msg.sh send 联系他们。收到消息后请及时处理并回复。"
+        # 使用共享函数构建初始化消息（与 swarm-join.sh 统一）
+        INIT_MSG=$(build_init_message "$CONFIG_FILE" "$ROLE_BRANCH" "$TEAM_INFO")
 
         INIT_TMP=$(mktemp "${RUNTIME_DIR}/.init-XXXXXX.txt")
         printf '%s' "$INIT_MSG" > "$INIT_TMP"

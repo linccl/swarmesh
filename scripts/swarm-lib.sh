@@ -111,8 +111,24 @@ build_init_message() {
     local role_branch="$2"
     local team_info="$3"
 
+    # 构建项目信息段（如果扫描结果存在）
+    local project_info_section=""
+    local project_info_file="$RUNTIME_DIR/project-info.json"
+    if [[ -f "$project_info_file" ]]; then
+        local key_files_list
+        key_files_list=$(jq -r '.key_files[]?.path' "$project_info_file" 2>/dev/null | head -20)
+        if [[ -n "$key_files_list" ]]; then
+            project_info_section="
+## 项目信息
+项目已扫描，关键配置文件:
+$key_files_list
+详细内容请读取: $project_info_file"
+        fi
+    fi
+
     cat <<INIT_EOF
 请读取你的角色配置文件: $config_file 并确认你已理解角色定义。
+${project_info_section}
 
 ## 并行开发
 你在独立的 git worktree 中工作，分支: $role_branch
@@ -232,6 +248,32 @@ state_json_update() {
 }
 
 # =============================================================================
+# macOS 兼容: timeout polyfill
+# =============================================================================
+
+if ! command -v timeout &>/dev/null; then
+    # polyfill: 超时返回 124（与 GNU coreutils timeout 一致），
+    # 正常结束返回命令本身的 exit code
+    timeout() {
+        local duration="$1"; shift
+        ( "$@" ) &
+        local cmd_pid=$!
+        ( sleep "$duration" 2>/dev/null; kill "$cmd_pid" 2>/dev/null ) &
+        local timer_pid=$!
+        wait "$cmd_pid" 2>/dev/null
+        local exit_code=$?
+        # 如果 timer 仍在运行，说明命令自己退出了（未超时）
+        if kill "$timer_pid" 2>/dev/null; then
+            wait "$timer_pid" 2>/dev/null
+            return $exit_code
+        fi
+        # timer 已结束（kill 返回非 0），说明是超时触发的 kill
+        wait "$timer_pid" 2>/dev/null
+        return 124
+    }
+fi
+
+# =============================================================================
 # 事件发射函数
 # =============================================================================
 
@@ -298,13 +340,29 @@ _build_swarm_context() {
         done < <(jq -r '.panes[] | "\(.role)|\(.alias // "")|\(.branch // "")"' "$state_file" 2>/dev/null)
     fi
 
+    # 项目信息引用（原始事实由 LLM 自行解读）
+    local tech_stack_section=""
+    local project_info="$RUNTIME_DIR/project-info.json"
+    if [[ -f "$project_info" ]]; then
+        local key_files_list
+        key_files_list=$(jq -r '[.key_files[]?.path] | join(", ")' "$project_info" 2>/dev/null)
+        if [[ -n "$key_files_list" ]]; then
+            tech_stack_section="
+## 项目信息
+项目已扫描，关键配置文件: ${key_files_list}
+详情: cat $project_info
+请自行分析技术栈，发布任务时用 --verify 指定质量门验证命令。
+"
+        fi
+    fi
+
     cat <<EOF
 $SWARM_CONTEXT_START
 # Swarm 蜂群协作上下文 (自动生成，勿手动编辑)
 
 ## 你的身份
 通过环境变量确认: echo \$SWARM_ROLE
-
+${tech_stack_section}
 ## 并行开发模式
 每个角色在独立的 git worktree 中工作，拥有独立分支。
 你的代码修改不会与其他角色冲突。完成后由人类决定合并。

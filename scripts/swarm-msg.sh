@@ -49,6 +49,7 @@ source "${SCRIPT_DIR}/swarm-lib.sh"
 
 die() { echo "[ERROR] $*" >&2; exit 1; }
 info() { echo "[swarm-msg] $*" >&2; }
+warn() { echo "[WARN] $*" >&2; }
 
 # 生成消息 ID
 gen_msg_id() {
@@ -718,6 +719,9 @@ _check_group_completion() {
 
         emit_event "group.completed" "$from_role" "group_id=$group_id" "title=$group_title"
 
+        # 标记 Story 为已完成
+        _story_mark_completed "$group_id"
+
         # 双通道通知主控
         local notify_id="sys-group-done-$(date +%s)-${group_id}"
         mkdir -p "${INBOX_DIR}/${from_role}"
@@ -738,6 +742,372 @@ _check_group_completion() {
             "[任务组完成] $group_title ($completed/$total 全部完成)" 2>/dev/null || true
 
         info "任务组全部完成: $group_id ($group_title)"
+    fi
+}
+
+# =============================================================================
+# Story 文件管理（任务上下文载体）
+#
+# 设计：数据用 JSON 存储（可靠读写），展示时用 jq 渲染为 markdown。
+# =============================================================================
+
+STORIES_DIR="${STORIES_DIR:-$RUNTIME_DIR/stories}"
+
+# 原子更新 story JSON（flock 保护并发写入）
+# 用法: _story_update <group_id> '<jq_filter>' [--argjson k v ...]
+_story_update() {
+    local group_id="$1"; shift
+    local story_file="$STORIES_DIR/$group_id.json"
+    [[ -f "$story_file" ]] || return 0
+
+    local lock_file="${story_file}.lock"
+    local tmp_file="${story_file}.tmp"
+
+    (
+        flock -x 200
+        jq "$@" "$story_file" > "$tmp_file" 2>/dev/null && mv "$tmp_file" "$story_file"
+    ) 200>"$lock_file"
+    rm -f "$tmp_file" 2>/dev/null || true
+}
+
+# 创建 Story
+# 参数: $1=group_id, $2=title, $3=from(创建者)
+_create_story() {
+    local group_id="$1" title="$2" from="$3"
+    local story_file="$STORIES_DIR/$group_id.json"
+    local now
+    now=$(date '+%Y-%m-%d %H:%M:%S')
+
+    mkdir -p "$STORIES_DIR"
+
+    jq -n \
+        --arg id "$group_id" \
+        --arg title "$title" \
+        --arg from "$from" \
+        --arg created_at "$now" \
+        '{
+            id: $id,
+            title: $title,
+            from: $from,
+            created_at: $created_at,
+            status: "active",
+            tasks: [],
+            verifications: [],
+            timeline: [($created_at + " 任务组创建 by " + $from)]
+        }' > "$story_file"
+}
+
+# 向 Story 追加子任务
+# 参数: $1=group_id, $2=task_id, $3=title, $4=type, $5=assigned_to, $6=branch
+_story_add_task() {
+    local group_id="$1" task_id="$2" title="$3" type="${4:-}" assigned_to="${5:-}" branch="${6:-}"
+    local now
+    now=$(date '+%Y-%m-%d %H:%M:%S')
+
+    local timeline_msg="$now $task_id 发布"
+    [[ -n "$assigned_to" ]] && timeline_msg+=" → $assigned_to"
+
+    _story_update "$group_id" \
+        '.tasks += [$t] | .timeline += [$msg]' \
+        --argjson t "$(jq -n \
+            --arg id "$task_id" \
+            --arg title "$title" \
+            --arg type "$type" \
+            --arg assigned_to "$assigned_to" \
+            --arg branch "$branch" \
+            --arg status "pending" \
+            '{id:$id, title:$title, type:$type, assigned_to:$assigned_to, branch:$branch, status:$status, result:null}')" \
+        --arg msg "$timeline_msg"
+}
+
+# 更新 Story 中的子任务状态
+# 参数: $1=task_id, $2=status(processing/completed), $3=info(可选)
+_story_update_task() {
+    local task_id="$1" new_status="$2" info="${3:-}"
+
+    # 查找任务所属 group_id
+    local group_id=""
+    local task_file=""
+    for d in processing completed pending blocked failed; do
+        [[ -f "$TASKS_DIR/$d/$task_id.json" ]] && task_file="$TASKS_DIR/$d/$task_id.json" && break
+    done
+    [[ -n "$task_file" ]] && group_id=$(jq -r '.group_id // ""' "$task_file" 2>/dev/null)
+    [[ -n "$group_id" ]] || return 0
+
+    local now
+    now=$(date '+%Y-%m-%d %H:%M:%S')
+
+    _story_update "$group_id" \
+        '(.tasks[] | select(.id == $tid)) |= (.status = $s | .result = (if $r != "" then $r else .result end))
+         | .timeline += [$msg]' \
+        --arg tid "$task_id" \
+        --arg s "$new_status" \
+        --arg r "$info" \
+        --arg msg "$now $task_id $new_status"
+}
+
+# 向 Story 追加验收记录
+# 参数: $1=group_id, $2=task_id, $3=result(通过/失败), $4=checker
+_story_add_verification() {
+    local group_id="$1" task_id="$2" result="$3" checker="${4:-自动}"
+    local now
+    now=$(date '+%Y-%m-%d %H:%M:%S')
+
+    _story_update "$group_id" \
+        '.verifications += [$v]' \
+        --argjson v "$(jq -n \
+            --arg time "$now" \
+            --arg task "$task_id" \
+            --arg result "$result" \
+            --arg checker "$checker" \
+            '{time:$time, task:$task, result:$result, checker:$checker}')"
+}
+
+# 标记 Story 为已完成
+# 参数: $1=group_id
+_story_mark_completed() {
+    local group_id="$1"
+    local now
+    now=$(date '+%Y-%m-%d %H:%M:%S')
+
+    _story_update "$group_id" \
+        '.status = "completed" | .timeline += [$msg]' \
+        --arg msg "$now 任务组全部完成"
+}
+
+# 渲染 Story JSON 为 markdown（只读展示用）
+_story_render_markdown() {
+    local group_id="$1"
+    local story_file="$STORIES_DIR/$group_id.json"
+    [[ -f "$story_file" ]] || { echo "Story 不存在: $group_id"; return 1; }
+
+    jq -r '
+        "# \(.title)\n" +
+        "> 任务组 ID: \(.id)\n" +
+        "> 创建者: \(.from)\n" +
+        "> 创建时间: \(.created_at)\n" +
+        "> 状态: \(.status)\n\n" +
+        "## 子任务\n\n" +
+        (if (.tasks | length) == 0 then "（暂无子任务）\n"
+         else (.tasks | map(
+            "### - [\(if .status == "completed" then "x" else " " end)] \(.title) (\(.id))\n" +
+            (if .type != "" then "- **类型**: \(.type)\n" else "" end) +
+            (if .assigned_to != "" then "- **角色**: \(.assigned_to)\n" else "" end) +
+            "- **状态**: \(.status)\n" +
+            (if .branch != "" then "- **分支**: \(.branch)\n" else "" end) +
+            (if .result then "- **结果**: \(.result)\n" else "" end)
+         ) | join("\n"))
+         end) + "\n" +
+        "## 验收记录\n\n" +
+        "| 时间 | 任务 | 结果 | 检查者 |\n" +
+        "|------|------|------|--------|\n" +
+        (.verifications | map("| \(.time) | \(.task) | \(.result) | \(.checker) |") | join("\n")) +
+        "\n\n## 进度时间线\n\n" +
+        (.timeline | map("- \(.)") | join("\n"))
+    ' "$story_file"
+}
+
+# =============================================================================
+# 质量门（Quality Gate）
+#
+# 设计理念：
+#   脚本只负责"执行"验证命令，不负责"决定"用什么命令。
+#   验证命令的来源（优先级从高到低）：
+#     1. 任务级: publish --verify '{"build":"go build ./..."}' (LLM 发布任务时指定)
+#     2. 项目级: .swarm/verify.json (用户或 LLM 创建)
+#     3. 运行时: runtime/project-info.json 的 verify_commands (LLM 写入)
+#   如果三层都没有指定验证命令 → 跳过质量门
+# =============================================================================
+
+GATE_LOGS_DIR="${GATE_LOGS_DIR:-$RUNTIME_DIR/gate-logs}"
+
+# 不需要质量门检查的任务类型（可通过环境变量覆盖）
+SKIP_GATE_TYPES="${SKIP_GATE_TYPES:-review design architecture audit document plan}"
+
+# 解析验证命令（三层合并，无硬编码默认值）
+# 参数: $1=task_id, $2=role
+_resolve_verify_commands() {
+    local task_id="$1"
+    local role="${2:-}"
+    local result="{}"
+
+    # 层 1（最低优先级）: runtime/project-info.json 的 verify_commands（按角色查找）
+    local project_info="$RUNTIME_DIR/project-info.json"
+    if [[ -f "$project_info" && -n "$role" ]]; then
+        local runtime_cmds
+        runtime_cmds=$(jq --arg role "$role" '.verify_commands[$role] // {}' "$project_info" 2>/dev/null)
+        [[ "$runtime_cmds" != "{}" && -n "$runtime_cmds" ]] && result="$runtime_cmds"
+    fi
+
+    # 层 2: 项目级 .swarm/verify.json（覆盖层 1 的同名命令）
+    local project_dir
+    project_dir=$(jq -r '.project // ""' "$STATE_FILE" 2>/dev/null)
+    if [[ -n "$project_dir" ]]; then
+        local user_verify="$project_dir/.swarm/verify.json"
+        if [[ -f "$user_verify" ]]; then
+            local user_cmds
+            user_cmds=$(jq '. // {}' "$user_verify" 2>/dev/null)
+            result=$(jq -n --argjson a "$result" --argjson b "$user_cmds" '$a * $b')
+        fi
+    fi
+
+    # 层 3（最高优先级）: 任务 JSON 的 verify 字段
+    local task_file=""
+    for d in processing completed pending; do
+        [[ -f "$TASKS_DIR/$d/$task_id.json" ]] && task_file="$TASKS_DIR/$d/$task_id.json" && break
+    done
+    if [[ -n "$task_file" ]]; then
+        local task_verify
+        task_verify=$(jq -r '.verify // ""' "$task_file" 2>/dev/null)
+        if [[ -n "$task_verify" && "$task_verify" != "null" && "$task_verify" != "" ]]; then
+            if echo "$task_verify" | jq -e 'type == "object"' &>/dev/null; then
+                result=$(jq -n --argjson a "$result" --argjson b "$task_verify" '$a * $b')
+            fi
+        fi
+    fi
+
+    echo "$result"
+}
+
+# 执行质量门
+# 参数: $1=task_id, $2=role
+# 返回: 0=通过, 1=失败（已回退任务）
+_run_quality_gate() {
+    local task_id="$1" role="$2"
+
+    # 检查任务类型是否需要跳过
+    local task_type=""
+    for d in processing completed pending; do
+        if [[ -f "$TASKS_DIR/$d/$task_id.json" ]]; then
+            task_type=$(jq -r '.type // ""' "$TASKS_DIR/$d/$task_id.json" 2>/dev/null)
+            break
+        fi
+    done
+    for skip_type in $SKIP_GATE_TYPES; do
+        if [[ "$task_type" == "$skip_type" ]]; then
+            return 0
+        fi
+    done
+
+    # 获取工蜂的 worktree 路径
+    local worktree=""
+    worktree=$(jq -r --arg role "$role" '.panes[] | select(.role == $role) | .worktree // ""' "$STATE_FILE" 2>/dev/null)
+    if [[ -z "$worktree" || ! -d "$worktree" ]]; then
+        info "[质量门] 无法获取 $role 的 worktree，跳过检查"
+        return 0
+    fi
+
+    # 解析验证命令（不依赖 worktree 内容，全部由 LLM 或配置文件决定）
+    local verify_json
+    verify_json=$(_resolve_verify_commands "$task_id" "$role")
+
+    # 检查是否有验证命令
+    local cmd_count
+    cmd_count=$(echo "$verify_json" | jq 'length' 2>/dev/null)
+    if [[ "$cmd_count" -eq 0 || -z "$cmd_count" ]]; then
+        info "[质量门] 无验证命令，跳过"
+        return 0
+    fi
+
+    mkdir -p "$GATE_LOGS_DIR"
+    local log_file="$GATE_LOGS_DIR/$task_id.log"
+    local all_passed=true
+    local skip_count=0
+    local skip_names=""
+    local gate_start
+    gate_start=$(date '+%Y-%m-%d %H:%M:%S')
+
+    {
+        echo "========================================"
+        echo "质量门检查: $task_id"
+        echo "角色: $role"
+        echo "Worktree: $worktree"
+        echo "开始时间: $gate_start"
+        echo "========================================"
+        echo ""
+    } > "$log_file"
+
+    # 逐项执行验证命令
+    while IFS=$'\t' read -r check_name check_cmd; do
+        [[ -z "$check_name" || -z "$check_cmd" ]] && continue
+
+        {
+            echo "--- [$check_name] $check_cmd ---"
+        } >> "$log_file"
+
+        local exit_code=0
+        # 在 worktree 目录下执行，超时 120 秒
+        if timeout 120 bash -c "cd '$worktree' && $check_cmd" >> "$log_file" 2>&1; then
+            echo "[PASS] $check_name" >> "$log_file"
+            info "[质量门] $check_name: 通过"
+        else
+            exit_code=$?
+            # 区分 "命令不存在"(127) 和 "检查失败"
+            if [[ $exit_code -eq 127 ]]; then
+                echo "[SKIP] $check_name (命令不存在, exit=$exit_code)" >> "$log_file"
+                warn "[质量门] $check_name: 命令不存在，跳过（环境可能缺少依赖）"
+                skip_count=$((skip_count + 1))
+                skip_names+="$check_name "
+            else
+                echo "[FAIL] $check_name (exit=$exit_code)" >> "$log_file"
+                info "[质量门] $check_name: 失败 (exit=$exit_code)"
+                all_passed=false
+            fi
+        fi
+        echo "" >> "$log_file"
+    done < <(echo "$verify_json" | jq -r 'to_entries[] | "\(.key)\t\(.value)"')
+
+    {
+        echo "========================================"
+        echo "结果: $([ "$all_passed" = true ] && echo "全部通过" || echo "有检查失败")"
+        echo "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "========================================"
+    } >> "$log_file"
+
+    # 查找任务所属 group（用于 story 验收记录）
+    local group_id=""
+    local group_task_file=""
+    for d in processing completed pending blocked failed; do
+        [[ -f "$TASKS_DIR/$d/$task_id.json" ]] && group_task_file="$TASKS_DIR/$d/$task_id.json" && break
+    done
+    [[ -n "$group_task_file" ]] && group_id=$(jq -r '.group_id // ""' "$group_task_file" 2>/dev/null)
+
+    # 有命令被跳过（exit 127），通知 inspector 环境可能缺依赖
+    if [[ $skip_count -gt 0 ]]; then
+        warn "[质量门] $skip_count 个检查因命令不存在被跳过: $skip_names"
+        echo "WARNING: $skip_count 个检查被跳过 (命令不存在): $skip_names" >> "$log_file"
+        # 写入 inspector 收件箱
+        local warn_id="sys-gate-$(date +%s)-${RANDOM}"
+        mkdir -p "${INBOX_DIR}/inspector"
+        jq -n \
+            --arg id "$warn_id" \
+            --arg content "质量门警告: 任务 $task_id 有 $skip_count 个检查因命令不存在被跳过（${skip_names}）。请检查 worktree 环境是否缺少依赖，或调整 set-verify 配置。" \
+            --arg timestamp "$(get_timestamp)" \
+            '{id:$id, from:"system", to:"inspector", content:$content, timestamp:$timestamp, status:"pending", reply_to:"", priority:"high"}' \
+            > "${INBOX_DIR}/inspector/${warn_id}.json" 2>/dev/null || true
+    fi
+
+    if [[ "$all_passed" == true ]]; then
+        emit_event "gate.passed" "$role" "task_id=$task_id"
+        [[ -n "$group_id" ]] && _story_add_verification "$group_id" "$task_id" "Gate 通过$([ $skip_count -gt 0 ] && echo " ($skip_count 项跳过)")" "自动"
+        return 0
+    else
+        emit_event "gate.failed" "$role" "task_id=$task_id"
+        [[ -n "$group_id" ]] && _story_add_verification "$group_id" "$task_id" "Gate 失败" "自动"
+
+        # 任务保持在 processing（无需回退，本来就没移走）
+        # 推送失败日志给工蜂
+        local role_pane
+        role_pane=$(jq -r --arg role "$role" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
+        if [[ -n "$role_pane" ]]; then
+            local fail_msg="[质量门失败] 任务 $task_id 未通过自动检查，仍在 processing 状态。"
+            fail_msg+=$'\n'"查看详情: cat $log_file"
+            fail_msg+=$'\n'"修复后重新执行: swarm-msg.sh complete-task $task_id \"修复说明\""
+            push_to_pane "$role_pane" "$fail_msg" 2>/dev/null || true
+        fi
+
+        info "[质量门] 任务 $task_id 未通过检查，保持 processing"
+        return 1
     fi
 }
 
@@ -771,6 +1141,10 @@ cmd_create_group() {
         }' > "$TASKS_DIR/groups/$group_id.json"
 
     emit_event "group.created" "$my_role" "group_id=$group_id" "title=$title"
+
+    # 创建 Story 文件
+    _create_story "$group_id" "$title" "$my_role"
+
     info "任务组已创建: $group_id ($title)"
     echo "$group_id"
 }
@@ -784,7 +1158,7 @@ cmd_publish() {
     local title="$2"
     shift 2
 
-    local description="" priority="normal" group_id="" depends_on="" assign_to="" explicit_branch=""
+    local description="" priority="normal" group_id="" depends_on="" assign_to="" explicit_branch="" verify=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --description|-d) description="$2"; shift 2 ;;
@@ -793,6 +1167,7 @@ cmd_publish() {
             --depends)        depends_on="$2"; shift 2 ;;
             --assign|-a)      assign_to="$2"; shift 2 ;;
             --branch|-b)      explicit_branch="$2"; shift 2 ;;
+            --verify|-V)      verify="$2"; shift 2 ;;
             -*) die "publish: 未知选项 '$1' (使用 swarm-msg.sh help 查看帮助)" ;;
             *)  die "publish: 多余参数 '$1'" ;;
         esac
@@ -833,6 +1208,16 @@ cmd_publish() {
     local target_status="pending"
     [[ "$is_blocked" == true ]] && target_dir="blocked" && target_status="blocked"
 
+    # 解析 verify 参数为 JSON（必须是 JSON 对象，如 '{"test":"go test ./..."}'）
+    local verify_json="null"
+    if [[ -n "$verify" ]]; then
+        if echo "$verify" | jq -e 'type == "object"' &>/dev/null; then
+            verify_json="$verify"
+        else
+            die "publish: --verify 参数必须是 JSON 对象，如 '{\"test\":\"go test ./...\"}'"
+        fi
+    fi
+
     mkdir -p "$TASKS_DIR/$target_dir"
     jq -n \
         --arg id "$task_id" \
@@ -849,6 +1234,7 @@ cmd_publish() {
         --argjson depends_on "$depends_json" \
         --argjson blocked "$is_blocked" \
         --arg status "$target_status" \
+        --argjson verify "$verify_json" \
         '{
             id: $id,
             type: $type,
@@ -867,7 +1253,8 @@ cmd_publish() {
             priority: $priority,
             group_id: $group_id,
             depends_on: $depends_on,
-            blocked: $blocked
+            blocked: $blocked,
+            verify: $verify
         }' > "$TASKS_DIR/$target_dir/$task_id.json"
 
     # 如果属于某个 group，追加到 group 的任务列表
@@ -879,6 +1266,9 @@ cmd_publish() {
                 '.tasks += [$tid] | .total_count = (.tasks | length)' \
                 "$group_file" > "$tmp" && mv "$tmp" "$group_file"
         fi
+
+        # 向 Story 追加子任务
+        _story_add_task "$group_id" "$task_id" "$title" "$type" "$assign_to" "$branch"
     fi
 
     # 发射事件
@@ -1028,6 +1418,9 @@ cmd_claim() {
 
     emit_event "task.claimed" "$my_role" "task_id=$task_id"
 
+    # 更新 Story 中的任务状态
+    _story_update_task "$task_id" "processing"
+
     # 通知发布者
     local from_role from_pane
     from_role=$(jq -r '.from' "$TASKS_DIR/processing/$task_id.json")
@@ -1073,7 +1466,13 @@ cmd_complete_task() {
     local task_file="$TASKS_DIR/processing/$task_id.json"
     [[ -f "$task_file" ]] || die "任务不在处理中: $task_id"
 
-    # 完成: processing → completed
+    # === 质量门（在 processing 阶段执行，通过后才移到 completed） ===
+    if ! _run_quality_gate "$task_id" "$my_role"; then
+        # Gate 失败，任务保持 processing，通知工蜂修复
+        return 0
+    fi
+
+    # Gate 通过（或无需检查），正式完成: processing → completed
     local completed_at
     completed_at=$(date '+%Y-%m-%d %H:%M:%S')
 
@@ -1085,7 +1484,7 @@ cmd_complete_task() {
 
     emit_event "task.completed_by_queue" "$my_role" "task_id=$task_id"
 
-    # 通知发布者（结果通过消息发送，确保可靠送达）
+    # 通知发布者（Gate 已通过，此通知可信）
     local from_role
     from_role=$(jq -r '.from' "$TASKS_DIR/completed/$task_id.json")
     local task_title
@@ -1110,6 +1509,9 @@ cmd_complete_task() {
         "[任务完成] $my_role 完成了任务 $task_id: $result" 2>/dev/null || true
 
     info "任务已完成: $task_id"
+
+    # 更新 Story 中的任务状态
+    _story_update_task "$task_id" "completed" "$result"
 
     # 自动解除依赖此任务的阻塞任务
     _check_and_unblock "$task_id"
@@ -1264,6 +1666,53 @@ cmd_recover_tasks() {
 }
 
 # =============================================================================
+# 子命令: set-verify (设置项目级验证命令)
+# =============================================================================
+
+cmd_set_verify() {
+    local verify_json=""
+    local target_role=""
+
+    # 解析参数
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --role|-r) target_role="$2"; shift 2 ;;
+            -*) die "set-verify: 未知选项 '$1'" ;;
+            *)
+                [[ -z "$verify_json" ]] && verify_json="$1" && shift || die "set-verify: 多余参数 '$1'"
+                ;;
+        esac
+    done
+
+    [[ -n "$verify_json" ]] || die "set-verify: 缺少 JSON 参数"
+    [[ -n "$target_role" ]] || die "set-verify: 必须指定 --role <角色名>"
+
+    # 验证输入是合法的 JSON 对象
+    if ! echo "$verify_json" | jq -e 'type == "object"' &>/dev/null; then
+        die "set-verify: 参数必须是 JSON 对象，如 '{\"build\":\"go build ./...\"}'"
+    fi
+
+    local project_info="$RUNTIME_DIR/project-info.json"
+
+    if [[ -f "$project_info" ]]; then
+        local tmp="${project_info}.tmp"
+        jq --arg role "$target_role" --argjson cmds "$verify_json" '
+            .verify_commands[$role] = ((.verify_commands[$role] // {}) * $cmds)
+        ' "$project_info" > "$tmp" && mv "$tmp" "$project_info"
+    else
+        mkdir -p "$RUNTIME_DIR"
+        jq -n --arg role "$target_role" --argjson cmds "$verify_json" \
+            '{scanned_at: "", project_dir: "", file_tree: [], key_files: [], user_verify: {}, verify_commands: {($role): $cmds}, context_summary: ""}' \
+            > "$project_info"
+    fi
+
+    echo "验证命令已更新 (角色: $target_role):"
+    jq '.verify_commands' "$project_info"
+
+    emit_event "config.verify_updated" "${SWARM_ROLE:-human}" "role=$target_role commands=$(echo "$verify_json" | jq -c '.')"
+}
+
+# =============================================================================
 # 子命令: set-limit
 # =============================================================================
 
@@ -1329,6 +1778,8 @@ swarm-msg.sh - CLI-to-CLI 自主消息 & 任务队列工具
   claim <task-id>                      认领一个待处理任务
   complete-task <task-id> "<result>"   完成任务并反馈结果
   group-status [group-id]              查看任务组进度
+  story-view <group-id>                查看任务组 Story（渲染为 markdown）
+  set-verify '<json>' --role <name>    设置角色级验证命令（质量门按角色执行）
   recover-tasks                        恢复卡在 processing 的任务（认领者已离线）
   set-limit [N]                        查看/设置 CLI 数量上限 (0=不限制)
 
@@ -1339,6 +1790,7 @@ publish 选项:
   --group|-g <group-id>        关联到任务组
   --depends <id1,id2,...>      依赖的任务 ID（逗号分隔，阻塞直到依赖完成）
   --branch|-b <branch>         指定关联分支（覆盖自动检测，支持逗号分隔多分支）
+  --verify|-V <json>           任务级验证命令（JSON 对象，如 '{"test":"go test ./..."}'）
 
 list-tasks 选项:
   --type|-t <type>             按类型过滤 (如 review, develop)
@@ -1384,6 +1836,14 @@ wait 选项:
   T4=$(swarm-msg.sh publish review "审核全部代码" -g $G --assign reviewer --depends $T1,$T2,$T3)
   swarm-msg.sh group-status $G
   swarm-msg.sh list-tasks --group $G --all
+
+  # 质量门验证命令（由 inspector 按角色配置）
+  swarm-msg.sh set-verify '{"build":"cd backend && go build ./..."}' --role backend
+  swarm-msg.sh set-verify '{"build":"npm run build","test":"npm test"}' --role frontend
+  # 或发任务时逐个指定
+  swarm-msg.sh publish develop "实现 API" --verify '{"build":"go build ./...","test":"go test ./..."}'
+  # 查看任务组 Story
+  swarm-msg.sh story-view $G
 
   # CLI 预算管理（主控使用）
   SWARM_ROLE=human swarm-msg.sh set-limit         # 查看当前上限
@@ -1452,8 +1912,16 @@ main() {
         group-status)
             cmd_group_status "${1:-}"
             ;;
+        story-view)
+            [[ $# -ge 1 ]] || die "用法: swarm-msg.sh story-view <group-id>"
+            _story_render_markdown "$1"
+            ;;
         recover-tasks)
             cmd_recover_tasks
+            ;;
+        set-verify)
+            [[ $# -ge 1 ]] || die "用法: swarm-msg.sh set-verify '<json>' --role <角色名>"
+            cmd_set_verify "$@"
             ;;
         set-limit)
             cmd_set_limit "${1:-}"

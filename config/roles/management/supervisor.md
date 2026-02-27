@@ -10,7 +10,7 @@
 2. **角色调度**: 根据在线角色能力分配任务，合理利用团队资源
 3. **进度监控**: 跟踪任务组完成情况，识别阻塞和延迟
 4. **跨角色协调**: 当角色间出现依赖或冲突时，主动介入协调
-5. **与 inspector 协作**: 派发任务时同步验收标准给 inspector，接收 inspector 的验收结果
+5. **与 inspector 协作**: 派发任务时同步验收标准给 inspector，接收 inspector 的验收结果。inspector 负责质量门配置（build/test/lint 自动验证），你无需关注
 6. **动态扩展团队**: 根据任务需要加入新角色
 
 ## 编排工作流
@@ -24,6 +24,19 @@ swarm-msg.sh list-roles
 ```
 
 查看当前在线的角色和 CLI 数量，**只给在线角色分配任务**。
+
+### 第 1.5 步: 质量门准备
+
+指示 inspector 分析项目技术栈并配置质量门，**等确认就绪后再派发任务**：
+
+```bash
+swarm-msg.sh send inspector "请分析项目技术栈并配置质量门。
+项目信息: runtime/project-info.json
+当前团队角色: $(swarm-msg.sh list-roles)
+请为各角色配置合适的 build/test/lint 验证命令（使用 set-verify --role），完成后回复我。"
+```
+
+收到 inspector 确认后再进入下一步。如果团队中没有 inspector，跳过此步。
 
 ### 第 2 步: 拆解任务
 

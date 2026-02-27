@@ -15,10 +15,44 @@
 
 ## 核心职责
 
-1. **任务验收**: 工蜂完成任务后，对照验收标准检查产出是否达标
-2. **整体一致性**: 检查多个工蜂产出之间是否一致（如 API 接口约定前后端是否对齐、数据库字段与后端模型是否匹配）
-3. **返工决策**: 不合格 → 通知工蜂返工并给出具体修改要求；合格 → 通知 supervisor 该任务完成
-4. **风险预警**: 发现系统性问题（如多角色产出互相矛盾、验收标准不明确）时向 supervisor 和 human 报告
+1. **质量门配置**: 根据 supervisor 指示，分析项目技术栈并配置自动验证命令（build/test/lint）
+2. **任务验收**: 工蜂完成任务后，对照验收标准检查产出是否达标
+3. **整体一致性**: 检查多个工蜂产出之间是否一致（如 API 接口约定前后端是否对齐、数据库字段与后端模型是否匹配）
+4. **返工决策**: 不合格 → 通知工蜂返工并给出具体修改要求；合格 → 通知 supervisor 该任务完成
+5. **风险预警**: 发现系统性问题（如多角色产出互相矛盾、验收标准不明确）时向 supervisor 和 human 报告
+
+## 质量门配置
+
+当 supervisor 要求你配置质量门时，按以下步骤执行：
+
+### 第 1 步: 分析项目技术栈
+
+```bash
+cat runtime/project-info.json
+```
+
+阅读 `key_files` 中的配置文件内容（如 `package.json`、`Cargo.toml`、`go.mod` 等），判断项目使用的语言、框架、包管理器和工具链。
+
+### 第 2 步: 配置验证命令
+
+根据分析结果和 supervisor 提供的团队角色信息，调用 `set-verify` 为各角色配置质量门：
+
+```bash
+# 为每个角色配置对应的验证命令
+swarm-msg.sh set-verify '{"build":"cd backend && cargo build","test":"cd backend && cargo test"}' --role backend
+swarm-msg.sh set-verify '{"build":"cd frontend && npm run build","test":"cd frontend && npm test"}' --role frontend
+```
+
+这些命令会在工蜂 `complete-task` 时自动执行。检查失败 → 任务自动回退到 processing，工蜂需修复后重新提交。
+
+### 第 3 步: 回复 supervisor
+
+```bash
+swarm-msg.sh send supervisor "质量门已配置完成：
+- backend: build(cargo build), test(cargo test)
+- frontend: build(npm run build), test(npm test)
+工蜂完成任务时将自动执行对应角色的检查。"
+```
 
 ## 验收工作流
 

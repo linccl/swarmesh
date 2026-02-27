@@ -193,4 +193,7 @@ swarmesh/
 
 ## License
 
-MIT
+[Business Source License 1.1 (BSL 1.1)](https://mariadb.com/bsl11/)
+
+- Change Date: 2030-02-27
+- Change License: GPL-2.0-or-later
