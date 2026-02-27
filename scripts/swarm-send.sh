@@ -29,40 +29,7 @@ STATE_FILE="${STATE_FILE:-$RUNTIME_DIR/state.json}"
 # 加载共享事件库
 source "${SCRIPT_DIR}/swarm-lib.sh"
 
-# =============================================================================
-# 工具函数
-# =============================================================================
-
-# 日志输出
-log_info() {
-    echo "[INFO] $*" >&2
-}
-
-log_error() {
-    echo "[ERROR] $*" >&2
-}
-
-log_success() {
-    echo "[SUCCESS] $*" >&2
-}
-
-# 致命错误退出
-die() {
-    log_error "$*"
-    exit 1
-}
-
-# 检查命令是否存在
-check_command() {
-    command -v "$1" &>/dev/null || die "需要安装 $1"
-}
-
-# 获取当前时间戳
-get_timestamp() {
-    date +"%Y-%m-%d %H:%M:%S"
-}
-
-# 获取 Unix 时间戳
+# 获取 Unix 时间戳（swarm-lib.sh 未提供此函数）
 get_unix_timestamp() {
     date +%s
 }

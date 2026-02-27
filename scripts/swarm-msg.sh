@@ -47,18 +47,12 @@ source "${SCRIPT_DIR}/swarm-lib.sh"
 # 工具函数
 # =============================================================================
 
-die() { echo "[ERROR] $*" >&2; exit 1; }
 info() { echo "[swarm-msg] $*" >&2; }
 warn() { echo "[WARN] $*" >&2; }
 
 # 生成消息 ID
 gen_msg_id() {
     echo "msg-$(date +%s%N 2>/dev/null || date +%s)-$$-${RANDOM}${RANDOM}"
-}
-
-# 获取当前时间戳
-get_timestamp() {
-    date "+%Y-%m-%d %H:%M:%S"
 }
 
 # =============================================================================
