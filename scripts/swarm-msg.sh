@@ -619,13 +619,11 @@ _check_and_unblock() {
             info "任务已解除阻塞: $tid"
 
             # 通知：新任务可认领（包含完整描述，尊重 assigned_to）
-            local t_title t_desc t_type t_from t_branch t_assign
-            t_title=$(jq -r '.title' "$TASKS_DIR/pending/$tid.json")
+            local t_meta t_title t_type t_from t_branch t_assign t_desc
+            t_meta=$(jq -r '[.title, .type, .from, (.branch // ""), (.assigned_to // "")] | @tsv' \
+                "$TASKS_DIR/pending/$tid.json")
+            IFS=$'\t' read -r t_title t_type t_from t_branch t_assign <<< "$t_meta"
             t_desc=$(jq -r '.description // ""' "$TASKS_DIR/pending/$tid.json")
-            t_type=$(jq -r '.type' "$TASKS_DIR/pending/$tid.json")
-            t_from=$(jq -r '.from' "$TASKS_DIR/pending/$tid.json")
-            t_branch=$(jq -r '.branch // ""' "$TASKS_DIR/pending/$tid.json")
-            t_assign=$(jq -r '.assigned_to // ""' "$TASKS_DIR/pending/$tid.json")
 
             local notify_msg="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             notify_msg+=$'\n'"[任务解锁] $t_type: $t_title"
