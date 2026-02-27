@@ -183,7 +183,12 @@ swarmesh/
 │   ├── swarm-detect.sh      # CLI 状态检测
 │   ├── swarm-events.sh      # 事件系统
 │   ├── swarm-workflow.sh    # 工作流引擎
-│   └── swarm-lib.sh         # 共享函数库
+│   ├── swarm-lib.sh         # 共享函数库
+│   └── lib/                 # swarm-msg 拆分模块
+│       ├── msg-story.sh     # Story 文件
+│       ├── msg-quality-gate.sh  # 质量门
+│       ├── msg-task-queue.sh    # 任务队列
+│       └── msg-task-watchdog.sh # 任务看门狗
 ├── config/
 │   ├── profiles/            # 团队配置预设
 │   │   ├── minimal.json     # 3 角色最小团队
