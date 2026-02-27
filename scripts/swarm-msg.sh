@@ -325,53 +325,54 @@ cmd_wait() {
 
     info "等待新消息... (超时: ${timeout}s${from_filter:+, 来自: $from_filter})"
 
-    # 使用 tail -f events.jsonl 零轮询等待 message.sent/message.replied/message.broadcast 事件
     local start_time
     start_time=$(date +%s)
 
-    # 记录 events.jsonl 当前行数作为起始位置
-    local start_lines=0
-    [[ -f "$EVENTS_LOG" ]] && start_lines=$(wc -l < "$EVENTS_LOG" | tr -d ' ')
+    # 确保 events.jsonl 存在
+    touch "$EVENTS_LOG"
+
+    # 使用 tail -f 事件驱动，零 CPU 轮询
+    local tail_pid=""
+    exec 3< <(tail -f "$EVENTS_LOG" 2>/dev/null)
+    tail_pid=$!
+    trap "kill $tail_pid 2>/dev/null; exec 3<&-" RETURN
 
     while true; do
-        local now
-        now=$(date +%s)
-        local elapsed=$(( now - start_time ))
-        if [[ $elapsed -ge $timeout ]]; then
+        local remaining=$(( timeout - ($(date +%s) - start_time) ))
+        if [[ $remaining -le 0 ]]; then
             info "等待超时 (${timeout}s)"
             return 1
         fi
 
-        local remaining=$(( timeout - elapsed ))
+        local line=""
+        if IFS= read -t "$remaining" -r line <&3; then
+            # 过滤 message.sent/replied/broadcast 事件
+            local event_type
+            event_type=$(echo "$line" | jq -r '.type // ""' 2>/dev/null) || continue
+            case "$event_type" in
+                message.sent|message.replied|message.broadcast) ;;
+                *) continue ;;
+            esac
 
-        # tail -f + timeout: 读取新行
-        local new_event=""
-        new_event=$(tail -n +$(( start_lines + 1 )) "$EVENTS_LOG" 2>/dev/null \
-            | grep -E '"message\.(sent|replied|broadcast)"' \
-            | jq -r --arg to "$my_role" 'select(.data.to == $to or .type == "message.broadcast")' \
-            | head -1) || true
-
-        if [[ -n "$new_event" ]]; then
-            local msg_from msg_id
-            msg_from=$(echo "$new_event" | jq -r '.role // ""')
-            msg_id=$(echo "$new_event" | jq -r '.data.msg_id // ""')
+            # 检查目标是否为当前角色
+            local event_to
+            event_to=$(echo "$line" | jq -r '.data.to // ""' 2>/dev/null)
+            if [[ "$event_type" != "message.broadcast" && "$event_to" != "$my_role" ]]; then
+                continue
+            fi
 
             # 应用来源过滤
+            local msg_from msg_id
+            msg_from=$(echo "$line" | jq -r '.role // ""' 2>/dev/null)
+            msg_id=$(echo "$line" | jq -r '.data.msg_id // ""' 2>/dev/null)
             if [[ -n "$from_filter" && "$msg_from" != "$from_filter" ]]; then
-                start_lines=$(wc -l < "$EVENTS_LOG" | tr -d ' ')
-                sleep 0.5
                 continue
             fi
 
             info "收到新消息: 来自 $msg_from ($msg_id)"
-            # 输出消息内容
             cmd_read
             return 0
         fi
-
-        # 更新起始行数并短暂等待
-        [[ -f "$EVENTS_LOG" ]] && start_lines=$(wc -l < "$EVENTS_LOG" | tr -d ' ')
-        sleep 1
     done
 }
 
