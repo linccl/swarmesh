@@ -662,14 +662,24 @@ _inject_to_file() {
         printf '%s\n' "$content" > "$file"
     elif grep -q "$SWARM_CONTEXT_START" "$file" 2>/dev/null; then
         # 已有标记，替换标记之间的内容
-        local tmp
+        local tmp new_file
         tmp=$(mktemp "${RUNTIME_DIR}/.ctx-XXXXXX")
-        awk -v start="$SWARM_CONTEXT_START" -v end="$SWARM_CONTEXT_END" -v new="$content" '
-            $0 == start { skip=1; print new; next }
+        new_file=$(mktemp "${RUNTIME_DIR}/.ctx-new-XXXXXX")
+        printf '%s' "$content" > "$new_file"
+
+        # macOS awk 对 -v 传入多行字符串兼容性较差，改为从临时文件读取新内容
+        awk -v start="$SWARM_CONTEXT_START" -v end="$SWARM_CONTEXT_END" -v new_file="$new_file" '
+            $0 == start {
+                skip=1
+                while ((getline line < new_file) > 0) print line
+                close(new_file)
+                next
+            }
             $0 == end   { skip=0; next }
             !skip       { print }
         ' "$file" > "$tmp"
         mv "$tmp" "$file"
+        rm -f "$new_file"
     else
         # 文件存在但无标记，追加到末尾
         printf '\n%s\n' "$content" >> "$file"
