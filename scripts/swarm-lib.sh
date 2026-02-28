@@ -52,7 +52,9 @@ _swarm_save_env_config() {
     _SWARM_ENV_SNAPSHOT=()
     local var
     while IFS= read -r var; do
-        [[ -n "${!var+set}" ]] && _SWARM_ENV_SNAPSHOT+=("${var}=${!var}")
+        if [[ -n "${!var+set}" ]]; then
+            _SWARM_ENV_SNAPSHOT+=("${var}=${!var}")
+        fi
     done < <(grep -oE '\$\{[A-Z_]+:=' "$defaults" | sed 's/\${//;s/:=//')
 }
 declare -a _SWARM_ENV_SNAPSHOT=()
@@ -227,7 +229,7 @@ ${team_info}
 - 发送消息: swarm-msg.sh send <角色名> "消息内容"
 - 回复消息: swarm-msg.sh reply <消息ID> "回复内容"
 - 查看收件箱: swarm-msg.sh read
-- 等待消息: swarm-msg.sh wait --timeout 60
+- 等待消息: swarm-msg.sh wait --timeout 6000
 - 查看在线角色: swarm-msg.sh list-roles
 - 广播消息: swarm-msg.sh broadcast "消息内容"
 
@@ -250,7 +252,7 @@ send_init_to_pane() {
     local init_msg="$2"
 
     local init_tmp
-    init_tmp=$(mktemp "${RUNTIME_DIR}/.init-XXXXXX.txt")
+    init_tmp=$(mktemp "${RUNTIME_DIR}/.init-XXXXXX")
     printf '%s' "$init_msg" > "$init_tmp"
     tmux load-buffer "$init_tmp"
     tmux paste-buffer -t "${SESSION_NAME}:${pane_target}"
@@ -298,7 +300,7 @@ notify_all_roles() {
 
         # 通道 2: paste-buffer 尽力即时推送
         local notify_tmp
-        notify_tmp=$(mktemp "${RUNTIME_DIR}/.notify-XXXXXX.txt")
+        notify_tmp=$(mktemp "${RUNTIME_DIR}/.notify-XXXXXX")
         printf '%s' "$pane_content" > "$notify_tmp"
         tmux load-buffer "$notify_tmp"
         tmux paste-buffer -t "${SESSION_NAME}:${role_pane}" 2>/dev/null || true
@@ -308,6 +310,83 @@ notify_all_roles() {
 
     done < <(jq -r '.panes[] | "\(.role)|\(.pane)"' "$state_file" 2>/dev/null)
 }
+
+# =============================================================================
+# macOS 兼容: flock polyfill
+# =============================================================================
+
+if ! command -v flock &>/dev/null 2>&1; then
+    flock() {
+        local mode="exclusive"
+        local nonblock="false"
+
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -x) mode="exclusive"; shift ;;
+                -s) mode="shared"; shift ;;
+                -u) mode="unlock"; shift ;;
+                -n) nonblock="true"; shift ;;
+                --) shift; break ;;
+                -*) echo "flock(polyfill): unsupported option: $1" >&2; return 1 ;;
+                *) break ;;
+            esac
+        done
+
+        local fd="${1:-}"
+        [[ "$fd" =~ ^[0-9]+$ ]] || { echo "flock(polyfill): invalid fd: ${fd:-<empty>}" >&2; return 1; }
+
+        if command -v python3 &>/dev/null 2>&1; then
+            python3 - "$fd" "$mode" "$nonblock" <<'PY'
+import fcntl
+import sys
+
+fd = int(sys.argv[1])
+mode = sys.argv[2]
+nonblock = sys.argv[3].lower() == "true"
+
+flag = {
+    "exclusive": fcntl.LOCK_EX,
+    "shared": fcntl.LOCK_SH,
+    "unlock": fcntl.LOCK_UN,
+}.get(mode)
+
+if flag is None:
+    raise SystemExit(1)
+
+if nonblock:
+    flag |= fcntl.LOCK_NB
+
+try:
+    fcntl.flock(fd, flag)
+except BlockingIOError:
+    raise SystemExit(1)
+except OSError as e:
+    print(f"flock(polyfill): {e}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+            return $?
+        fi
+
+        if command -v perl &>/dev/null 2>&1; then
+            perl -e '
+use strict;
+use warnings;
+use Fcntl qw(:flock);
+my ($fd, $mode, $nb) = @ARGV;
+my %m = (exclusive => LOCK_EX, shared => LOCK_SH, unlock => LOCK_UN);
+die "bad mode\n" if !exists $m{$mode};
+my $flag = $m{$mode};
+$flag |= LOCK_NB if ($nb && $nb eq "true");
+open(my $fh, ">&=$fd") or die "open fd $fd failed: $!\n";
+flock($fh, $flag) or die "flock failed: $!\n";
+' "$fd" "$mode" "$nonblock"
+            return $?
+        fi
+
+        echo "flock(polyfill): missing python3/perl, please install flock(1)" >&2
+        return 127
+    }
+fi
 
 # =============================================================================
 # state.json 原子更新（flock 文件锁）
@@ -320,7 +399,7 @@ state_json_update() {
     local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
     local lock_file="${state_file}.lock"
     local tmp_file
-    tmp_file=$(mktemp "${RUNTIME_DIR}/.state-update-XXXXXX.json")
+    tmp_file=$(mktemp "${RUNTIME_DIR}/.state-update-XXXXXX")
 
     (
         flock -x 200
@@ -335,6 +414,9 @@ state_json_update() {
 # =============================================================================
 
 if ! command -v timeout &>/dev/null; then
+    if command -v gtimeout &>/dev/null; then
+        timeout() { gtimeout "$@"; }
+    else
     # polyfill: 超时返回 124（与 GNU coreutils timeout 一致），
     # 正常结束返回命令本身的 exit code
     timeout() {
@@ -354,6 +436,7 @@ if ! command -v timeout &>/dev/null; then
         wait "$timer_pid" 2>/dev/null
         return 124
     }
+    fi
 fi
 
 # =============================================================================
@@ -505,7 +588,7 @@ ${team_info:-（暂无其他成员）}
 | swarm-msg.sh send <role> "msg" | 发消息给指定角色 |
 | swarm-msg.sh reply <id> "msg" | 回复消息 |
 | swarm-msg.sh read | 查看收件箱 |
-| swarm-msg.sh wait --timeout 60 | 等待新消息 |
+| swarm-msg.sh wait --timeout 6000 | 等待新消息 |
 | swarm-msg.sh list-roles | 查看在线角色 |
 | swarm-msg.sh broadcast "msg" | 广播给所有人 |
 
@@ -580,7 +663,7 @@ _inject_to_file() {
     elif grep -q "$SWARM_CONTEXT_START" "$file" 2>/dev/null; then
         # 已有标记，替换标记之间的内容
         local tmp
-        tmp=$(mktemp "${RUNTIME_DIR}/.ctx-XXXXXX.md")
+        tmp=$(mktemp "${RUNTIME_DIR}/.ctx-XXXXXX")
         awk -v start="$SWARM_CONTEXT_START" -v end="$SWARM_CONTEXT_END" -v new="$content" '
             $0 == start { skip=1; print new; next }
             $0 == end   { skip=0; next }
@@ -607,7 +690,7 @@ cleanup_swarm_context() {
             [[ -f "$file" ]] || continue
             if grep -q "$SWARM_CONTEXT_START" "$file" 2>/dev/null; then
                 local tmp
-                tmp=$(mktemp "${RUNTIME_DIR:-.}/.ctx-clean-XXXXXX.md")
+                tmp=$(mktemp "${RUNTIME_DIR:-.}/.ctx-clean-XXXXXX")
                 awk -v start="$SWARM_CONTEXT_START" -v end="$SWARM_CONTEXT_END" '
                     $0 == start { skip=1; next }
                     $0 == end   { skip=0; next }
@@ -756,6 +839,6 @@ start_pane_watcher() {
                 esac
             fi
         done
-    ) &
+    ) >/dev/null &
     echo $!
 }

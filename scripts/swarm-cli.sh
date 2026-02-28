@@ -291,7 +291,7 @@ cmd_status() {
 # =============================================================================
 
 cmd_task() {
-    local target="" content="" wait_timeout=600 poll_interval=15
+    local target="" content="" wait_timeout=6000 poll_interval=15
 
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         echo "用法: swarm-cli.sh task [选项] [任务描述]"
@@ -305,7 +305,7 @@ cmd_task() {
         echo ""
         echo "选项:"
         echo "  --no-wait           发送后不等待结果"
-        echo "  --timeout <秒>      等待超时（默认 600）"
+        echo "  --timeout <秒>      等待超时（默认 6000）"
         echo "  --poll <秒>         轮询间隔（默认 15）"
         return 0
     fi
@@ -322,7 +322,7 @@ cmd_task() {
                 ;;
             --timeout)
                 shift
-                wait_timeout="${1:-600}"
+                wait_timeout="${1:-6000}"
                 shift
                 ;;
             --poll)

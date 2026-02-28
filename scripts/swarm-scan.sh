@@ -18,6 +18,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
 RUNTIME_DIR="${RUNTIME_DIR:-$SWARM_ROOT/runtime}"
+CONFIG_DIR="${CONFIG_DIR:-$SWARM_ROOT/config}"
 
 # =============================================================================
 # 配置
@@ -50,6 +51,12 @@ MAX_SNIPPET_LINES="${MAX_SNIPPET_LINES:-50}"
 
 log_info()  { echo "[SCAN] $*" >&2; }
 die()       { echo "[SCAN-ERROR] $*" >&2; exit 1; }
+
+get_timestamp() {
+    # 兼容 defaults.conf 的统一时间戳格式；未加载时回退到常用格式
+    [[ -f "$CONFIG_DIR/defaults.conf" ]] && source "$CONFIG_DIR/defaults.conf"
+    date "+${LOG_TIMESTAMP_FORMAT:-%Y-%m-%d %H:%M:%S}"
+}
 
 # =============================================================================
 # 收集函数

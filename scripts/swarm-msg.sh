@@ -9,7 +9,7 @@
 #   swarm-msg.sh send <to> "<content>"               发送消息
 #   swarm-msg.sh reply <msg-id> "<content>"          回复消息
 #   swarm-msg.sh read                                读取收件箱未读消息
-#   swarm-msg.sh wait [--from <role>] [--timeout 60] 等待新消息
+#   swarm-msg.sh wait [--from <role>] [--timeout 6000] 等待新消息
 #   swarm-msg.sh list-roles                          列出所有在线角色
 #   swarm-msg.sh broadcast "<content>"               广播消息
 #   swarm-msg.sh mark-read [msg-id|--all]            标记消息已读
@@ -109,7 +109,8 @@ push_to_pane() {
 
     local buf_name="msg-$$-$RANDOM"
     local tmp_file
-    tmp_file=$(mktemp "${RUNTIME_DIR}/.msg-push-XXXXXX.txt")
+    # BSD mktemp (macOS) requires the template to end with XXXXXX.
+    tmp_file=$(mktemp "${RUNTIME_DIR}/.msg-push-XXXXXX")
     trap "rm -f '$tmp_file'" RETURN
     printf '%s' "$notification" > "$tmp_file"
 
@@ -317,7 +318,7 @@ cmd_read() {
 
 cmd_wait() {
     local from_filter=""
-    local timeout=60
+    local timeout=6000
 
     while [[ $# -gt 0 ]]; do
         case "$1" in

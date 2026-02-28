@@ -542,7 +542,7 @@ cmd_claim() {
         if ! mv "$TASKS_DIR/processing/$task_id.json" "$task_file" 2>/dev/null; then
             info "[WARNING] 任务 $task_id 回退 pending 失败，可能需要手动恢复或使用 recover-tasks"
         fi
-        die "此任务已指派给 $assigned_to，你($my_role)无法认领"
+        die "此任务已指派给 ${assigned_to}，你(${my_role})无法认领"
     fi
 
     # 更新字段

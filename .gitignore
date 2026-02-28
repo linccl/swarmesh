@@ -19,3 +19,4 @@ fifo-test/
 
 # IDE / 工具缓存
 .serena/
+.swarm-worktrees/

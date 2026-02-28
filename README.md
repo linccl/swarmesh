@@ -2,6 +2,14 @@
 
 基于 tmux 的多 AI CLI 蜂群协作框架。在一个 tmux session 中编排多个 AI CLI 实例（Claude Code、Gemini CLI、Codex 等），让它们通过消息系统自主协作完成复杂任务。
 
+## 本仓库变更点（linccl 版本）
+
+- 新增 `codex-only` profile：提供 `config/profiles/codex-only.json`，仅使用 Codex CLI 的最小团队配置（含 supervisor/inspector），适合“本机只装 Codex/统一 CLI 行为”的场景
+- 默认等待时间调整：将 `swarm-cli.sh task` 与 `swarm-msg.sh wait` 的默认等待超时统一为 `6000s`，减少长任务被误判超时的情况
+- macOS 兼容性增强：修正 BSD `mktemp` 模板用法，并在缺少 `flock`/`timeout` 时提供 polyfill（优先使用 `gtimeout`），保证状态文件更新与等待逻辑可用
+- 扫描日志时间戳统一：`swarm-scan.sh` 支持读取 `config/defaults.conf` 的时间戳格式（`LOG_TIMESTAMP_FORMAT`），便于统一日志展示
+- worktree 目录忽略：新增 `.swarm-worktrees/` 到 `.gitignore`，避免 worktree 目录污染工作区状态
+
 ## 核心思路
 
 ```
@@ -222,6 +230,7 @@ swarmesh/
 | Profile | 角色数 | 适用场景 |
 |---------|--------|---------|
 | `minimal` | 3 | 快速验证、小功能开发 |
+| `codex-only` | 5 | 仅使用 Codex CLI 的最小团队（含 supervisor/inspector） |
 | `web-dev` | 7 | Web 应用开发 |
 | `full-stack` | 13 | 大型项目、企业级开发 |
 
