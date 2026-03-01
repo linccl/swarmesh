@@ -440,6 +440,28 @@ if ! command -v timeout &>/dev/null; then
 fi
 
 # =============================================================================
+# macOS 兼容: flock polyfill
+# =============================================================================
+
+if ! command -v flock &>/dev/null; then
+    # macOS 不自带 flock（属于 util-linux）。
+    # 完整的 fd 级 flock 在纯 shell 中无法可靠模拟（需要对已打开的 fd 加锁），
+    # 蜂群场景中并发写入频率低（每个角色间隔数秒以上），降级为 no-op 是最安全的做法。
+    # 如需强锁，可安装: brew install util-linux
+    flock() {
+        local mode="" fd=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -x|-s|-u) mode="$1"; shift ;;
+                *)        fd="$1"; shift ;;
+            esac
+        done
+        # 降级为无操作
+        :
+    }
+fi
+
+# =============================================================================
 # 事件发射函数
 # =============================================================================
 
@@ -662,24 +684,17 @@ _inject_to_file() {
         printf '%s\n' "$content" > "$file"
     elif grep -q "$SWARM_CONTEXT_START" "$file" 2>/dev/null; then
         # 已有标记，替换标记之间的内容
-        local tmp new_file
+        local tmp content_tmp
         tmp=$(mktemp "${RUNTIME_DIR}/.ctx-XXXXXX")
-        new_file=$(mktemp "${RUNTIME_DIR}/.ctx-new-XXXXXX")
-        printf '%s' "$content" > "$new_file"
-
-        # macOS awk 对 -v 传入多行字符串兼容性较差，改为从临时文件读取新内容
-        awk -v start="$SWARM_CONTEXT_START" -v end="$SWARM_CONTEXT_END" -v new_file="$new_file" '
-            $0 == start {
-                skip=1
-                while ((getline line < new_file) > 0) print line
-                close(new_file)
-                next
-            }
+        content_tmp=$(mktemp "${RUNTIME_DIR}/.ctx-inject-XXXXXX")
+        printf '%s\n' "$content" > "$content_tmp"
+        awk -v start="$SWARM_CONTEXT_START" -v end="$SWARM_CONTEXT_END" -v cfile="$content_tmp" '
+            $0 == start { skip=1; while((getline line < cfile) > 0) print line; close(cfile); next }
             $0 == end   { skip=0; next }
             !skip       { print }
         ' "$file" > "$tmp"
+        rm -f "$content_tmp"
         mv "$tmp" "$file"
-        rm -f "$new_file"
     else
         # 文件存在但无标记，追加到末尾
         printf '\n%s\n' "$content" >> "$file"

@@ -109,7 +109,6 @@ push_to_pane() {
 
     local buf_name="msg-$$-$RANDOM"
     local tmp_file
-    # BSD mktemp (macOS) requires the template to end with XXXXXX.
     tmp_file=$(mktemp "${RUNTIME_DIR}/.msg-push-XXXXXX")
     trap "rm -f '$tmp_file'" RETURN
     printf '%s' "$notification" > "$tmp_file"
