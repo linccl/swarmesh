@@ -140,6 +140,13 @@ mkdir -p "$MESSAGES_DIR/inbox" "$MESSAGES_DIR/outbox"
 mkdir -p "$MESSAGES_DIR/inbox/human" "$MESSAGES_DIR/outbox/human"
 
 # 清理旧 worktree（如果有残留）
+# 处理仓库搬迁/复制导致的残留 worktree 记录（指向旧路径，目录已不存在）
+while IFS= read -r wt_path; do
+    [[ "$wt_path" == *"/.swarm-worktrees/"* ]] || continue
+    [[ -d "$wt_path" ]] && continue
+    git -C "$PROJECT_DIR" worktree remove --force "$wt_path" 2>/dev/null || true
+done < <(git -C "$PROJECT_DIR" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+
 if [[ -d "$WORKTREE_DIR" ]]; then
     log_info "清理旧 worktree..."
     for wt in "$WORKTREE_DIR"/*/; do
