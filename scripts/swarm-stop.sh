@@ -45,8 +45,7 @@ readonly SESSION_NAME="${SWARM_SESSION:-${DEFAULT_SESSION_NAME}}"
 # 加载共享事件库
 source "${SCRIPT_DIR}/swarm-lib.sh"
 
-# 时间格式配置
-readonly TIMESTAMP_FORMAT="%Y-%m-%d %H:%M:%S"
+# 时间格式配置（使用 defaults.conf 统一定义的 LOG_TIMESTAMP_FORMAT）
 readonly ARCHIVE_DATE_FORMAT="%Y%m%d_%H%M%S"
 
 # 默认选项
@@ -118,7 +117,7 @@ get_runtime_duration() {
 
     local start_epoch end_epoch
     # macOS: date -j -f, Linux: date -d
-    start_epoch=$(date -j -f "$TIMESTAMP_FORMAT" "$start_time" +%s 2>/dev/null \
+    start_epoch=$(date -j -f "$LOG_TIMESTAMP_FORMAT" "$start_time" +%s 2>/dev/null \
         || date -d "$start_time" +%s 2>/dev/null \
         || echo "0")
     end_epoch=$(date +%s)
@@ -257,7 +256,7 @@ save_final_state() {
     log_info "保存最终状态..."
 
     local stop_time
-    stop_time=$(date +"$TIMESTAMP_FORMAT")
+    stop_time=$(date +"$LOG_TIMESTAMP_FORMAT")
 
     local duration_seconds
     duration_seconds=$(get_runtime_duration)

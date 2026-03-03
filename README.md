@@ -1,5 +1,357 @@
 # Swarmesh
 
+[English](#english) | [中文](#中文)
+
+---
+
+<a id="english"></a>
+
+## English
+
+A tmux-based multi-AI CLI swarm collaboration framework. Orchestrate multiple AI CLI instances (Claude Code, Gemini CLI, Codex, etc.) within a single tmux session, enabling autonomous collaboration through a messaging system to tackle complex tasks.
+
+### Core Concept
+
+```
+You (human)               swarm-start.sh
+   │                         │
+   │  --profile minimal      │
+   └────────────────────────►│
+                             │
+                    ┌────────┼────────┐
+                    ▼        ▼        ▼
+               ┌────────┐┌────────┐┌────────┐
+               │frontend││backend ││reviewer│  ← tmux pane
+               │Gemini  ││Claude  ││Codex   │  ← different AI CLIs
+               └───┬────┘└───┬────┘└───┬────┘
+                   │         │         │
+                   └────►inbox/outbox◄─┘  ← file-based messaging
+                         + paste-buffer   ← instant notification
+```
+
+Each role runs in an isolated tmux pane with its own role configuration, inbox, and optional git worktree. Roles communicate autonomously via `swarm-msg.sh` — no human relay needed.
+
+### Quick Start
+
+#### Dependencies
+
+- tmux
+- jq
+- At least one AI CLI ([Claude Code](https://github.com/anthropics/claude-code), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Codex](https://github.com/openai/codex), etc.)
+
+#### Universal CLI (Recommended)
+
+`swarm-cli.sh` is the universal control entry point, usable from any terminal:
+
+```bash
+# Start swarm (interactive profile selection)
+./scripts/swarm-cli.sh start ~/my-app
+
+# Start swarm (specify profile)
+./scripts/swarm-cli.sh start ~/my-app web-dev
+
+# Check swarm status (roles, inboxes, tasks, events)
+./scripts/swarm-cli.sh status
+
+# Dispatch task to supervisor (auto-orchestration)
+./scripts/swarm-cli.sh task "Implement user registration"
+
+# Dispatch task to a specific role
+./scripts/swarm-cli.sh task backend "Implement login API"
+
+# View inbox and task queue
+./scripts/swarm-cli.sh task
+
+# Dynamically add/remove roles (interactive selection)
+./scripts/swarm-cli.sh join
+./scripts/swarm-cli.sh leave
+
+# Pass-through messaging commands
+./scripts/swarm-cli.sh msg send reviewer "Please review PR #42"
+./scripts/swarm-cli.sh msg broadcast "v1 API finalized"
+
+# Stop swarm (optional data cleanup)
+./scripts/swarm-cli.sh stop
+./scripts/swarm-cli.sh stop --clean
+```
+
+Each subcommand supports `--help` for detailed usage: `./scripts/swarm-cli.sh start --help`
+
+#### Claude Code Users
+
+If you use Claude Code as your controller, you can use slash commands directly (same underlying logic):
+
+- `/swarm-start` — Start swarm
+- `/swarm-stop` — Stop swarm
+- `/swarm-status` — View status
+- `/swarm-task` — Dispatch task
+- `/swarm-join` — Add role
+- `/swarm-leave` — Remove role
+
+#### Low-level Scripts
+
+You can also call the underlying scripts directly:
+
+```bash
+# Start
+./scripts/swarm-start.sh --project /path/to/your/project --profile minimal --hidden
+
+# Status
+./scripts/swarm-status.sh
+
+# Stop
+./scripts/swarm-stop.sh --force
+```
+
+### Messaging System
+
+Roles communicate via `swarm-msg.sh`, called directly within each role's pane:
+
+```bash
+# Send message
+swarm-msg.sh send backend "Please design the auth API"
+
+# Broadcast to all roles
+swarm-msg.sh broadcast "v1 API spec finalized, please review"
+
+# Check inbox
+swarm-msg.sh read
+
+# Reply to message
+swarm-msg.sh reply <msg-id> "Got it, starting now"
+
+# List team members
+swarm-msg.sh list-roles
+
+# Wait for new messages (zero-polling, blocks until message arrives)
+swarm-msg.sh wait --timeout 60
+
+# Mark messages as read
+swarm-msg.sh mark-read <msg-id>
+swarm-msg.sh mark-read --all
+
+# Create task group
+swarm-msg.sh create-group "User auth module"
+
+# Publish task (type: develop/review/design/test/...)
+swarm-msg.sh publish develop "Implement login page" --assign frontend
+
+# List tasks
+swarm-msg.sh list-tasks
+
+# Claim task
+swarm-msg.sh claim <task-id>
+
+# Complete task (triggers quality gate)
+swarm-msg.sh complete-task <task-id> "Implemented and tested"
+
+# View task group status
+swarm-msg.sh group-status <group-id>
+```
+
+Messages are persisted via the file system (inbox/outbox) and instantly pushed to target panes using tmux paste-buffer.
+
+### Dynamic Scaling
+
+```bash
+# Add new role at runtime
+./scripts/swarm-join.sh --role security --cli "claude chat" --config quality/security.md
+
+# Remove role
+./scripts/swarm-leave.sh database --reason "Database design complete"
+```
+
+### Quality Assurance
+
+#### Project Scanning
+
+On startup, the target project structure is automatically scanned, collecting key config files (`package.json`, `go.mod`, `Cargo.toml`, etc.) into `runtime/project-info.json`. Scripts only collect raw facts; LLM roles interpret the tech stack themselves.
+
+#### Story Files
+
+Each task group auto-generates a Story file (`runtime/stories/<group-id>.json`) recording sub-task status, acceptance records, and progress timeline. Data is stored in JSON and rendered as markdown for display:
+
+```bash
+swarm-msg.sh story-view <group-id>
+```
+
+#### Quality Gates
+
+When a worker calls `complete-task`, verification commands (build/test/lint) run automatically. If checks fail, the task stays in processing state — the worker must fix issues and resubmit.
+
+Verification command priority (low → high):
+
+1. **Runtime**: `runtime/project-info.json` `verify_commands` (configured by inspector via `set-verify`)
+2. **Project-level**: `.swarm/verify.json` (user-created)
+3. **Task-level**: `publish --verify '{"test":"go test ./..."}'` (specified at publish time)
+
+```bash
+# Inspector configures verification by role
+swarm-msg.sh set-verify '{"build":"go build ./...","test":"go test ./..."}' --role backend
+swarm-msg.sh set-verify '{"build":"npm run build","test":"npm test"}' --role frontend
+
+# Or specify at task publish time
+swarm-msg.sh publish develop "Implement API" --assign backend --verify '{"build":"go build ./..."}'
+```
+
+#### Subtask System
+
+Complex tasks can be decomposed into subtasks with dependency management and multi-level nesting:
+
+```bash
+# Split a task into subtasks
+swarm-msg.sh split-task <parent-task-id> \
+  --subtask "Design API schema" --assign architect \
+  --subtask "Implement endpoints" --assign backend --depends 0
+
+# Expand a subtask into finer-grained subtasks (flattened to same level)
+swarm-msg.sh expand-subtask <subtask-id> \
+  --subtask "Write unit tests" --assign backend \
+  --subtask "Write integration tests" --assign tester
+
+# Reset split (keeps completed subtasks, cancels pending ones)
+swarm-msg.sh re-split <parent-task-id>
+```
+
+Related configuration: `SUBTASK_MAX_DEPTH` (max nesting depth), `SUBTASK_MAX_COUNT` (max subtasks per parent), `SUBTASK_STALL_TTL` (stall detection threshold).
+
+#### Task Retry & Escalation
+
+Workers can report failures (auto-retry with exponential backoff) or escalate tasks to the supervisor:
+
+```bash
+# Report task failure (auto-retry with exponential backoff)
+swarm-msg.sh fail-task <task-id> "Build failed: missing dependency"
+
+# Escalate complex task to supervisor for re-splitting
+swarm-msg.sh escalate-task <task-id> "Involves 3 independent modules, suggest splitting"
+
+# Recover stuck tasks (assigned to offline workers)
+swarm-msg.sh recover-tasks
+```
+
+Related configuration: `TASK_MAX_RETRIES` (max retries, 0 = fail immediately), `TASK_RETRY_BASE_DELAY` (base delay in seconds, actual delay = 2^retry_count * base), `ESCALATE_STALL_TTL` (escalation timeout).
+
+#### System Maintenance
+
+```bash
+# Clean up expired messages, completed tasks, and gate logs
+swarm-msg.sh cleanup --ttl 3600 --gate-logs
+
+# View/set CLI instance limit
+swarm-msg.sh set-limit        # View current limit
+swarm-msg.sh set-limit 20     # Set limit to 20
+swarm-msg.sh set-limit 0      # Remove limit
+```
+
+### Configuration Reference
+
+All parameters are centralized in `config/defaults.conf` with 3-tier priority: env vars > project-level `.swarm/swarm.conf` > defaults.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `LOG_TIMESTAMP_FORMAT` | `%Y-%m-%d %H:%M:%S` | Unified timestamp format |
+| `LOG_MAX_SIZE` | 10485760 | Max log file size in bytes (10MB) |
+| `LOG_ROTATE_INTERVAL` | 300 | Log rotation check interval (seconds) |
+| `LOG_RETENTION_TTL` | 604800 | Log max retention time (seconds, 7 days) |
+| `GATE_TIMEOUT` | 120 | Quality gate check timeout per command (seconds) |
+| `GATE_LOG_TTL` | 86400 | Quality gate log retention (seconds) |
+| `SKIP_GATE_TYPES` | `review design architecture audit document plan` | Task types that skip quality gates |
+| `WATCHDOG_INTERVAL` | 60 | Task watchdog patrol interval (seconds) |
+| `TASK_PROCESSING_TTL` | 21600 | Max task processing duration (seconds, 0 = disable) |
+| `TASK_MAX_RETRIES` | 3 | Max retry count (0 = fail immediately) |
+| `TASK_RETRY_BASE_DELAY` | 60 | Retry base delay in seconds (actual: 2^retry * base) |
+| `SUBTASK_MAX_DEPTH` | 3 | Max subtask nesting depth (0 = disable splitting) |
+| `SUBTASK_MAX_COUNT` | 10 | Max subtasks per parent task |
+| `SUBTASK_STALL_TTL` | 7200 | Subtask group stall detection threshold (seconds) |
+| `ESCALATE_STALL_TTL` | 3600 | Escalated task unhandled timeout (seconds) |
+| `CLEANUP_TTL` | 3600 | Expired message/task TTL (seconds) |
+| `PANES_PER_WINDOW` | 2 | Tmux panes per window |
+
+### Project Structure
+
+```
+swarmesh/
+├── scripts/                 # Core scripts
+│   ├── swarm-cli.sh         # Universal control entry (all subcommands)
+│   ├── swarm-start.sh       # Start swarm
+│   ├── swarm-stop.sh        # Stop swarm
+│   ├── swarm-msg.sh         # Inter-CLI messaging
+│   ├── swarm-scan.sh        # Project structure scanner
+│   ├── swarm-join.sh        # Dynamically add role
+│   ├── swarm-leave.sh       # Dynamically remove role
+│   ├── swarm-status.sh      # Status viewer
+│   ├── swarm-relay.sh       # Message relay (human → role)
+│   ├── swarm-send.sh        # External message sender
+│   ├── swarm-read.sh        # External message reader
+│   ├── swarm-detect.sh      # CLI status detection
+│   ├── swarm-events.sh      # Event system
+│   ├── swarm-workflow.sh    # Workflow engine
+│   ├── swarm-lib.sh         # Shared function library
+│   └── lib/                 # swarm-msg submodules
+│       ├── msg-story.sh     # Story files
+│       ├── msg-quality-gate.sh  # Quality gates
+│       ├── msg-task-queue.sh    # Task queue
+│       └── msg-task-watchdog.sh # Task watchdog
+├── config/
+│   ├── defaults.conf        # Framework defaults (logging/gates/watchdog/tmux)
+│   ├── profiles/            # Team profile presets
+│   │   ├── minimal.json     # 3-role minimal team
+│   │   ├── web-dev.json     # 7-role web dev team
+│   │   └── full-stack.json  # 13-role full team
+│   ├── roles/               # Role system prompts
+│   │   ├── core/            # Core dev (frontend, backend, database, devops)
+│   │   ├── quality/         # QA (tester, reviewer, security, performance)
+│   │   └── management/      # Management (supervisor, architect, auditor, inspector, ui-designer)
+│   └── cli-routing.json     # CLI routing config
+├── workflows/               # Predefined workflows
+│   ├── quick-task.json
+│   ├── feature-complete.json
+│   └── relay-chain.json
+└── runtime/                 # Runtime data (gitignored)
+    ├── state.json           # Swarm state
+    ├── project-info.json    # Project scan results
+    ├── logs/                # Role logs
+    ├── messages/            # inbox/outbox
+    ├── tasks/               # Task state machine
+    ├── pipes/               # FIFO pipes (instant notification)
+    ├── stories/             # Task group Story files
+    ├── workflows/           # Workflow runtime state
+    ├── gate-logs/           # Quality gate check logs
+    └── results/             # Task results
+```
+
+### Profile Presets
+
+| Profile | Roles | Use Case |
+|---------|-------|----------|
+| `minimal` | 3 | Quick validation, small features |
+| `web-dev` | 7 | Web application development |
+| `full-stack` | 13 | Large projects, enterprise-level |
+
+Supports mixing different AI CLIs — frontend uses Gemini, backend uses Claude, reviewer uses Codex within the same swarm, each leveraging their strengths.
+
+### Design Principles
+
+- **Pure Bash + filesystem**: No extra dependencies, runs on any machine with tmux
+- **CLI-agnostic**: Not tied to any specific AI CLI, switch via profile config
+- **Role autonomy**: Roles collaborate autonomously via messaging, no human relay needed
+- **Git worktree isolation**: Each role can work on an independent branch, avoiding conflicts
+- **Configurable, not hardcoded**: All parameters centralized in `config/defaults.conf`, supporting 3-tier priority override (env vars > project-level `.swarm/swarm.conf` > defaults)
+
+### License
+
+[Business Source License 1.1 (BSL 1.1)](https://mariadb.com/bsl11/)
+
+- Change Date: 2030-02-27
+- Change License: GPL-2.0-or-later
+
+---
+
+<a id="中文"></a>
+
+## 中文
+
 基于 tmux 的多 AI CLI 蜂群协作框架。在一个 tmux session 中编排多个 AI CLI 实例（Claude Code、Gemini CLI、Codex 等），让它们通过消息系统自主协作完成复杂任务。
 
 ## 本仓库变更点（linccl 版本）
@@ -10,7 +362,7 @@
 - 扫描日志时间戳统一：`swarm-scan.sh` 支持读取 `config/defaults.conf` 的时间戳格式（`LOG_TIMESTAMP_FORMAT`），便于统一日志展示
 - worktree 目录忽略：新增 `.swarm-worktrees/` 到 `.gitignore`，避免 worktree 目录污染工作区状态
 
-## 核心思路
+### 核心思路
 
 ```
 你（人类）                swarm-start.sh
@@ -31,15 +383,15 @@
 
 每个角色运行在独立 tmux pane 中，拥有自己的角色配置、收件箱和可选的 git worktree。角色之间通过 `swarm-msg.sh` 自主通讯，无需人类中转。
 
-## 快速开始
+### 快速开始
 
-### 依赖
+#### 依赖
 
 - tmux
 - jq
 - 至少一个 AI CLI（[Claude Code](https://github.com/anthropics/claude-code)、[Gemini CLI](https://github.com/google-gemini/gemini-cli)、[Codex](https://github.com/openai/codex) 等）
 
-### 通用 CLI（推荐）
+#### 通用 CLI（推荐）
 
 `swarm-cli.sh` 是通用主控入口，任何终端都能使用：
 
@@ -77,7 +429,7 @@
 
 每个子命令支持 `--help` 查看详细用法：`./scripts/swarm-cli.sh start --help`
 
-### Claude Code 用户
+#### Claude Code 用户
 
 如果你使用 Claude Code 作为主控，可以直接用 slash command（底层逻辑相同）：
 
@@ -88,7 +440,7 @@
 - `/swarm-join` — 加入角色
 - `/swarm-leave` — 移除角色
 
-### 底层脚本
+#### 底层脚本
 
 也可以直接调用底层脚本：
 
@@ -103,7 +455,7 @@
 ./scripts/swarm-stop.sh --force
 ```
 
-## 消息系统
+### 消息系统
 
 角色之间通过 `swarm-msg.sh` 通讯，每个角色在自己的 pane 内直接调用：
 
@@ -115,7 +467,7 @@ swarm-msg.sh send backend "请设计用户认证 API"
 swarm-msg.sh broadcast "v1 API 接口已定稿，请查收"
 
 # 查看收件箱
-swarm-msg.sh inbox
+swarm-msg.sh read
 
 # 回复消息
 swarm-msg.sh reply <msg-id> "收到，开始实现"
@@ -123,14 +475,35 @@ swarm-msg.sh reply <msg-id> "收到，开始实现"
 # 查看团队成员
 swarm-msg.sh list-roles
 
-# 创建/领取任务
-swarm-msg.sh task create "实现登录页面" --assign frontend
-swarm-msg.sh task take <task-id>
+# 等待新消息（零轮询，阻塞直到有新消息）
+swarm-msg.sh wait --timeout 60
+
+# 标记消息已读
+swarm-msg.sh mark-read <msg-id>
+swarm-msg.sh mark-read --all
+
+# 创建任务组
+swarm-msg.sh create-group "用户认证模块"
+
+# 发布任务（type: develop/review/design/test/...）
+swarm-msg.sh publish develop "实现登录页面" --assign frontend
+
+# 查看任务列表
+swarm-msg.sh list-tasks
+
+# 领取任务
+swarm-msg.sh claim <task-id>
+
+# 完成任务（触发质量门检查）
+swarm-msg.sh complete-task <task-id> "已实现并测试通过"
+
+# 查看任务组状态
+swarm-msg.sh group-status <group-id>
 ```
 
 消息通过文件系统（inbox/outbox）持久化，同时用 tmux paste-buffer 即时推送通知到目标 pane。
 
-## 动态扩缩容
+### 动态扩缩容
 
 ```bash
 # 运行中加入新角色
@@ -140,13 +513,13 @@ swarm-msg.sh task take <task-id>
 ./scripts/swarm-leave.sh database --reason "数据库设计已完成"
 ```
 
-## 质量保障
+### 质量保障
 
-### 项目扫描
+#### 项目扫描
 
 启动时自动扫描目标项目结构，收集关键配置文件（`package.json`、`go.mod`、`Cargo.toml` 等）信息到 `runtime/project-info.json`。脚本只收集原始事实，LLM 角色自行解读技术栈。
 
-### Story 文件
+#### Story 文件
 
 每个任务组自动生成 Story 文件（`runtime/stories/<group-id>.json`），记录子任务状态、验收记录和进度时间线。数据用 JSON 存储，展示时渲染为 markdown：
 
@@ -154,7 +527,7 @@ swarm-msg.sh task take <task-id>
 swarm-msg.sh story-view <group-id>
 ```
 
-### 质量门
+#### 质量门
 
 工蜂 `complete-task` 时自动执行验证命令（build/test/lint），检查失败则任务保持 processing，工蜂需修复后重新提交。
 
@@ -169,10 +542,84 @@ swarm-msg.sh set-verify '{"build":"go build ./...","test":"go test ./..."}' --ro
 swarm-msg.sh set-verify '{"build":"npm run build","test":"npm test"}' --role frontend
 
 # 或发布任务时指定
-swarm-msg.sh publish develop "实现 API" --verify '{"build":"go build ./..."}'
+swarm-msg.sh publish develop "实现 API" --assign backend --verify '{"build":"go build ./..."}'
 ```
 
-## 项目结构
+#### 子任务拆分
+
+复杂任务可拆分为子任务，支持依赖管理和多层嵌套：
+
+```bash
+# 拆分任务为子任务
+swarm-msg.sh split-task <parent-task-id> \
+  --subtask "设计 API schema" --assign architect \
+  --subtask "实现接口" --assign backend --depends 0
+
+# 展开子任务为更细粒度的子任务（打平到同层）
+swarm-msg.sh expand-subtask <subtask-id> \
+  --subtask "编写单元测试" --assign backend \
+  --subtask "编写集成测试" --assign tester
+
+# 重置拆分（保留已完成子任务，取消未完成的）
+swarm-msg.sh re-split <parent-task-id>
+```
+
+相关配置：`SUBTASK_MAX_DEPTH`（最大嵌套深度）、`SUBTASK_MAX_COUNT`（单个父任务最大子任务数）、`SUBTASK_STALL_TTL`（子任务组停滞检测阈值）。
+
+#### 任务重试与上报
+
+工蜂可报告任务失败（自动指数退避重试）或上报任务给 supervisor：
+
+```bash
+# 报告任务失败（自动指数退避重试）
+swarm-msg.sh fail-task <task-id> "构建失败：缺少依赖"
+
+# 上报复杂任务给 supervisor 重新拆分
+swarm-msg.sh escalate-task <task-id> "需求涉及 3 个独立模块，建议拆分"
+
+# 恢复卡在 processing 的任务（认领者已离线）
+swarm-msg.sh recover-tasks
+```
+
+相关配置：`TASK_MAX_RETRIES`（最大重试次数，0=不重试直接失败）、`TASK_RETRY_BASE_DELAY`（重试基础延迟秒数，实际延迟 = 2^重试次数 × 基础值）、`ESCALATE_STALL_TTL`（上报任务未处理超时阈值）。
+
+#### 系统维护
+
+```bash
+# 清理过期消息、已完成任务和质量门日志
+swarm-msg.sh cleanup --ttl 3600 --gate-logs
+
+# 查看/设置 CLI 数量上限
+swarm-msg.sh set-limit        # 查看当前上限
+swarm-msg.sh set-limit 20     # 设置上限为 20
+swarm-msg.sh set-limit 0      # 取消上限
+```
+
+### 配置参考
+
+所有参数集中定义在 `config/defaults.conf`，支持三层优先级：环境变量 > 项目级 `.swarm/swarm.conf` > 默认值。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `LOG_TIMESTAMP_FORMAT` | `%Y-%m-%d %H:%M:%S` | 统一时间戳格式 |
+| `LOG_MAX_SIZE` | 10485760 | 单文件最大字节（10MB） |
+| `LOG_ROTATE_INTERVAL` | 300 | 日志轮转检查间隔（秒） |
+| `LOG_RETENTION_TTL` | 604800 | 日志最大保留时间（秒，7 天） |
+| `GATE_TIMEOUT` | 120 | 质量门单条命令超时（秒） |
+| `GATE_LOG_TTL` | 86400 | 质量门日志保留时间（秒） |
+| `SKIP_GATE_TYPES` | `review design architecture audit document plan` | 跳过质量门检查的任务类型 |
+| `WATCHDOG_INTERVAL` | 60 | 任务看门狗巡检间隔（秒） |
+| `TASK_PROCESSING_TTL` | 21600 | 任务最大处理时长（秒，0=禁用） |
+| `TASK_MAX_RETRIES` | 3 | 最大重试次数（0=不重试直接失败） |
+| `TASK_RETRY_BASE_DELAY` | 60 | 重试基础延迟（秒，实际: 2^重试次数 × 基础值） |
+| `SUBTASK_MAX_DEPTH` | 3 | 子任务最大嵌套深度（0=禁止拆分） |
+| `SUBTASK_MAX_COUNT` | 10 | 单个父任务最大子任务数 |
+| `SUBTASK_STALL_TTL` | 7200 | 子任务组停滞检测阈值（秒） |
+| `ESCALATE_STALL_TTL` | 3600 | 上报任务未处理超时阈值（秒） |
+| `CLEANUP_TTL` | 3600 | 过期消息/任务 TTL（秒） |
+| `PANES_PER_WINDOW` | 2 | 每窗口 pane 数 |
+
+### 项目结构
 
 ```
 swarmesh/
@@ -225,7 +672,7 @@ swarmesh/
     └── results/             # 任务结果
 ```
 
-## Profile 预设
+### Profile 预设
 
 | Profile | 角色数 | 适用场景 |
 |---------|--------|---------|
@@ -236,7 +683,7 @@ swarmesh/
 
 支持混合不同 AI CLI —— 同一蜂群中 frontend 用 Gemini、backend 用 Claude、reviewer 用 Codex，各取所长。
 
-## 设计原则
+### 设计原则
 
 - **纯 Bash + 文件系统**：无额外依赖，任何有 tmux 的机器都能跑
 - **CLI 无关**：不绑定特定 AI CLI，通过 profile 配置切换
@@ -244,7 +691,7 @@ swarmesh/
 - **Git worktree 隔离**：每个角色可在独立分支上工作，避免冲突
 - **可配置不硬编码**：所有参数集中定义在 `config/defaults.conf`，支持三层优先级覆盖（环境变量 > 项目级 `.swarm/swarm.conf` > 默认值）
 
-## License
+### License
 
 [Business Source License 1.1 (BSL 1.1)](https://mariadb.com/bsl11/)
 

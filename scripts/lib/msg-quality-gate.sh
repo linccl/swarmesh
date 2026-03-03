@@ -132,8 +132,8 @@ _run_quality_gate() {
         } >> "$log_file"
 
         local exit_code=0
-        # 在 worktree 目录下执行
-        if timeout "$GATE_TIMEOUT" bash -c "cd '$worktree' && $check_cmd" >> "$log_file" 2>&1; then
+        # 在 worktree 目录下执行（使用 env -C 或 subshell cd 避免路径注入）
+        if timeout "$GATE_TIMEOUT" bash -c 'cd -- "$1" && eval "$2"' _ "$worktree" "$check_cmd" >> "$log_file" 2>&1; then
             echo "[$(get_timestamp)] [PASS] $check_name" >> "$log_file"
             info "[质量门] $check_name: 通过"
         else
