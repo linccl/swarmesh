@@ -45,6 +45,7 @@ JSON_OUTPUT=false
 # 工具函数
 # ============================================================================
 
+# 覆盖 swarm-lib.sh 的 die(): 本脚本约定 exit 2 = 错误（区别于 exit 1 = 超时）
 die() { echo "[ERROR] $*" >&2; exit 2; }
 
 log() { [[ "$JSON_OUTPUT" == "false" ]] && echo "[detect] $*" >&2 || true; }
