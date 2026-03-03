@@ -545,7 +545,7 @@ cmd_cleanup() {
     for f in "$TASKS_DIR/completed/"*.json; do
         [[ -f "$f" ]] || continue
         local file_mtime
-        file_mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo "0")
+        file_mtime=$(_file_mtime "$f")
         if [[ $(( now - file_mtime )) -ge $ttl ]]; then
             if [[ "$dry_run" == true ]]; then
                 echo "[dry-run] 删除已完成任务: $f"

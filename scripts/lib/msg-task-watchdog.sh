@@ -108,8 +108,8 @@ _watchdog_recover_task() {
         # 计算退避延迟（使用 WATCHDOG_INTERVAL 作为基础，避免快速翻车循环）
         local delay=$(( (1 << new_count) * ${TASK_RETRY_BASE_DELAY:-60} ))
         local retry_after
-        retry_after=$(date -v+${delay}S '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
-            || date -d "+${delay} seconds" '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+        retry_after=$(date -v+${delay}S "+$LOG_TIMESTAMP_FORMAT" 2>/dev/null \
+            || date -d "+${delay} seconds" "+$LOG_TIMESTAMP_FORMAT" 2>/dev/null \
             || echo "")
 
         mkdir -p "$TASKS_DIR/pending"

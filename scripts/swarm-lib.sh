@@ -341,7 +341,7 @@ if ! command -v timeout &>/dev/null; then
         local duration="$1"; shift
         ( "$@" ) &
         local cmd_pid=$!
-        ( sleep "$duration" 2>/dev/null; kill "$cmd_pid" 2>/dev/null ) &
+        ( sleep "$duration" 2>/dev/null && kill "$cmd_pid" 2>/dev/null ) &
         local timer_pid=$!
         wait "$cmd_pid" 2>/dev/null
         local exit_code=$?
@@ -432,8 +432,10 @@ if ! command -v flock &>/dev/null; then
         # 写入持锁进程 PID（$BASHPID 为 subshell 实际 PID，$$ 为父进程 PID）
         echo "${BASHPID:-$$}" > "$lock_dir/pid" 2>/dev/null
 
-        # subshell 退出自动释放
-        trap "rm -f '$lock_dir/pid' 2>/dev/null; rmdir '$lock_dir' 2>/dev/null" EXIT
+        # subshell 退出自动释放（链式保留调用者已有的 EXIT trap）
+        local _prev_exit_trap
+        _prev_exit_trap=$(trap -p EXIT | sed "s/^trap -- '//;s/' EXIT$//")
+        trap "rm -f '$lock_dir/pid' 2>/dev/null; rmdir '$lock_dir' 2>/dev/null; ${_prev_exit_trap:-:}" EXIT
 
         return 0
     }

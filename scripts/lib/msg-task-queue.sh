@@ -872,10 +872,16 @@ cmd_complete_task() {
     completed_at=$(get_timestamp)
 
     mkdir -p "$TASKS_DIR/completed"
-    jq --arg result "$result" --arg at "$completed_at" \
+    local ctmp="$TASKS_DIR/processing/${task_id}.json.tmp"
+    if jq --arg result "$result" --arg at "$completed_at" \
         '.status = "completed" | .result = $result | .completed_at = $at' \
-        "$task_file" > "$TASKS_DIR/completed/$task_id.json"
-    rm -f "$task_file"
+        "$task_file" > "$ctmp" 2>/dev/null; then
+        mv "$ctmp" "$TASKS_DIR/completed/$task_id.json"
+        rm -f "$task_file"
+    else
+        rm -f "$ctmp"
+        die "complete-task: jq 处理失败: $task_id"
+    fi
 
     emit_event "task.completed_by_queue" "$my_role" "task_id=$task_id"
 
@@ -1357,7 +1363,7 @@ cmd_split_task() {
     subtasks_json=$(printf '%s\n' "${all_subtask_ids[@]}" | jq -R '.' | jq -s '.')
     local ptmp="$parent_file.tmp"
     jq --argjson subtasks "$subtasks_json" \
-        '.subtasks = $subtasks | .split_status = "split"' \
+        '.subtasks = $subtasks | .split_status = "split" | .escalated = null' \
         "$parent_file" > "$ptmp" && mv "$ptmp" "$parent_file"
 
     # 发射事件

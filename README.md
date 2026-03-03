@@ -115,7 +115,7 @@ swarm-msg.sh send backend "Please design the auth API"
 swarm-msg.sh broadcast "v1 API spec finalized, please review"
 
 # Check inbox
-swarm-msg.sh inbox
+swarm-msg.sh read
 
 # Reply to message
 swarm-msg.sh reply <msg-id> "Got it, starting now"
@@ -123,9 +123,30 @@ swarm-msg.sh reply <msg-id> "Got it, starting now"
 # List team members
 swarm-msg.sh list-roles
 
-# Create/claim tasks
-swarm-msg.sh task create "Implement login page" --assign frontend
-swarm-msg.sh task take <task-id>
+# Wait for new messages (zero-polling, blocks until message arrives)
+swarm-msg.sh wait --timeout 60
+
+# Mark messages as read
+swarm-msg.sh mark-read <msg-id>
+swarm-msg.sh mark-read --all
+
+# Create task group
+swarm-msg.sh create-group "User auth module"
+
+# Publish task (type: develop/review/design/test/...)
+swarm-msg.sh publish develop "Implement login page" --assign frontend
+
+# List tasks
+swarm-msg.sh list-tasks
+
+# Claim task
+swarm-msg.sh claim <task-id>
+
+# Complete task (triggers quality gate)
+swarm-msg.sh complete-task <task-id> "Implemented and tested"
+
+# View task group status
+swarm-msg.sh group-status <group-id>
 ```
 
 Messages are persisted via the file system (inbox/outbox) and instantly pushed to target panes using tmux paste-buffer.
@@ -172,6 +193,80 @@ swarm-msg.sh set-verify '{"build":"npm run build","test":"npm test"}' --role fro
 # Or specify at task publish time
 swarm-msg.sh publish develop "Implement API" --assign backend --verify '{"build":"go build ./..."}'
 ```
+
+#### Subtask System
+
+Complex tasks can be decomposed into subtasks with dependency management and multi-level nesting:
+
+```bash
+# Split a task into subtasks
+swarm-msg.sh split-task <parent-task-id> \
+  --subtask "Design API schema" --assign architect \
+  --subtask "Implement endpoints" --assign backend --depends 0
+
+# Expand a subtask into finer-grained subtasks (flattened to same level)
+swarm-msg.sh expand-subtask <subtask-id> \
+  --subtask "Write unit tests" --assign backend \
+  --subtask "Write integration tests" --assign tester
+
+# Reset split (keeps completed subtasks, cancels pending ones)
+swarm-msg.sh re-split <parent-task-id>
+```
+
+Related configuration: `SUBTASK_MAX_DEPTH` (max nesting depth), `SUBTASK_MAX_COUNT` (max subtasks per parent), `SUBTASK_STALL_TTL` (stall detection threshold).
+
+#### Task Retry & Escalation
+
+Workers can report failures (auto-retry with exponential backoff) or escalate tasks to the supervisor:
+
+```bash
+# Report task failure (auto-retry with exponential backoff)
+swarm-msg.sh fail-task <task-id> "Build failed: missing dependency"
+
+# Escalate complex task to supervisor for re-splitting
+swarm-msg.sh escalate-task <task-id> "Involves 3 independent modules, suggest splitting"
+
+# Recover stuck tasks (assigned to offline workers)
+swarm-msg.sh recover-tasks
+```
+
+Related configuration: `TASK_MAX_RETRIES` (max retries, 0 = fail immediately), `TASK_RETRY_BASE_DELAY` (base delay in seconds, actual delay = 2^retry_count * base), `ESCALATE_STALL_TTL` (escalation timeout).
+
+#### System Maintenance
+
+```bash
+# Clean up expired messages, completed tasks, and gate logs
+swarm-msg.sh cleanup --ttl 3600 --gate-logs
+
+# View/set CLI instance limit
+swarm-msg.sh set-limit        # View current limit
+swarm-msg.sh set-limit 20     # Set limit to 20
+swarm-msg.sh set-limit 0      # Remove limit
+```
+
+### Configuration Reference
+
+All parameters are centralized in `config/defaults.conf` with 3-tier priority: env vars > project-level `.swarm/swarm.conf` > defaults.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `LOG_TIMESTAMP_FORMAT` | `%Y-%m-%d %H:%M:%S` | Unified timestamp format |
+| `LOG_MAX_SIZE` | 10485760 | Max log file size in bytes (10MB) |
+| `LOG_ROTATE_INTERVAL` | 300 | Log rotation check interval (seconds) |
+| `LOG_RETENTION_TTL` | 604800 | Log max retention time (seconds, 7 days) |
+| `GATE_TIMEOUT` | 120 | Quality gate check timeout per command (seconds) |
+| `GATE_LOG_TTL` | 86400 | Quality gate log retention (seconds) |
+| `SKIP_GATE_TYPES` | `review design architecture audit document plan` | Task types that skip quality gates |
+| `WATCHDOG_INTERVAL` | 60 | Task watchdog patrol interval (seconds) |
+| `TASK_PROCESSING_TTL` | 21600 | Max task processing duration (seconds, 0 = disable) |
+| `TASK_MAX_RETRIES` | 3 | Max retry count (0 = fail immediately) |
+| `TASK_RETRY_BASE_DELAY` | 60 | Retry base delay in seconds (actual: 2^retry * base) |
+| `SUBTASK_MAX_DEPTH` | 3 | Max subtask nesting depth (0 = disable splitting) |
+| `SUBTASK_MAX_COUNT` | 10 | Max subtasks per parent task |
+| `SUBTASK_STALL_TTL` | 7200 | Subtask group stall detection threshold (seconds) |
+| `ESCALATE_STALL_TTL` | 3600 | Escalated task unhandled timeout (seconds) |
+| `CLEANUP_TTL` | 3600 | Expired message/task TTL (seconds) |
+| `PANES_PER_WINDOW` | 2 | Tmux panes per window |
 
 ### Project Structure
 
@@ -364,7 +459,7 @@ swarm-msg.sh send backend "请设计用户认证 API"
 swarm-msg.sh broadcast "v1 API 接口已定稿，请查收"
 
 # 查看收件箱
-swarm-msg.sh inbox
+swarm-msg.sh read
 
 # 回复消息
 swarm-msg.sh reply <msg-id> "收到，开始实现"
@@ -372,9 +467,30 @@ swarm-msg.sh reply <msg-id> "收到，开始实现"
 # 查看团队成员
 swarm-msg.sh list-roles
 
-# 创建/领取任务
-swarm-msg.sh task create "实现登录页面" --assign frontend
-swarm-msg.sh task take <task-id>
+# 等待新消息（零轮询，阻塞直到有新消息）
+swarm-msg.sh wait --timeout 60
+
+# 标记消息已读
+swarm-msg.sh mark-read <msg-id>
+swarm-msg.sh mark-read --all
+
+# 创建任务组
+swarm-msg.sh create-group "用户认证模块"
+
+# 发布任务（type: develop/review/design/test/...）
+swarm-msg.sh publish develop "实现登录页面" --assign frontend
+
+# 查看任务列表
+swarm-msg.sh list-tasks
+
+# 领取任务
+swarm-msg.sh claim <task-id>
+
+# 完成任务（触发质量门检查）
+swarm-msg.sh complete-task <task-id> "已实现并测试通过"
+
+# 查看任务组状态
+swarm-msg.sh group-status <group-id>
 ```
 
 消息通过文件系统（inbox/outbox）持久化，同时用 tmux paste-buffer 即时推送通知到目标 pane。
@@ -420,6 +536,80 @@ swarm-msg.sh set-verify '{"build":"npm run build","test":"npm test"}' --role fro
 # 或发布任务时指定
 swarm-msg.sh publish develop "实现 API" --assign backend --verify '{"build":"go build ./..."}'
 ```
+
+#### 子任务拆分
+
+复杂任务可拆分为子任务，支持依赖管理和多层嵌套：
+
+```bash
+# 拆分任务为子任务
+swarm-msg.sh split-task <parent-task-id> \
+  --subtask "设计 API schema" --assign architect \
+  --subtask "实现接口" --assign backend --depends 0
+
+# 展开子任务为更细粒度的子任务（打平到同层）
+swarm-msg.sh expand-subtask <subtask-id> \
+  --subtask "编写单元测试" --assign backend \
+  --subtask "编写集成测试" --assign tester
+
+# 重置拆分（保留已完成子任务，取消未完成的）
+swarm-msg.sh re-split <parent-task-id>
+```
+
+相关配置：`SUBTASK_MAX_DEPTH`（最大嵌套深度）、`SUBTASK_MAX_COUNT`（单个父任务最大子任务数）、`SUBTASK_STALL_TTL`（子任务组停滞检测阈值）。
+
+#### 任务重试与上报
+
+工蜂可报告任务失败（自动指数退避重试）或上报任务给 supervisor：
+
+```bash
+# 报告任务失败（自动指数退避重试）
+swarm-msg.sh fail-task <task-id> "构建失败：缺少依赖"
+
+# 上报复杂任务给 supervisor 重新拆分
+swarm-msg.sh escalate-task <task-id> "需求涉及 3 个独立模块，建议拆分"
+
+# 恢复卡在 processing 的任务（认领者已离线）
+swarm-msg.sh recover-tasks
+```
+
+相关配置：`TASK_MAX_RETRIES`（最大重试次数，0=不重试直接失败）、`TASK_RETRY_BASE_DELAY`（重试基础延迟秒数，实际延迟 = 2^重试次数 × 基础值）、`ESCALATE_STALL_TTL`（上报任务未处理超时阈值）。
+
+#### 系统维护
+
+```bash
+# 清理过期消息、已完成任务和质量门日志
+swarm-msg.sh cleanup --ttl 3600 --gate-logs
+
+# 查看/设置 CLI 数量上限
+swarm-msg.sh set-limit        # 查看当前上限
+swarm-msg.sh set-limit 20     # 设置上限为 20
+swarm-msg.sh set-limit 0      # 取消上限
+```
+
+### 配置参考
+
+所有参数集中定义在 `config/defaults.conf`，支持三层优先级：环境变量 > 项目级 `.swarm/swarm.conf` > 默认值。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `LOG_TIMESTAMP_FORMAT` | `%Y-%m-%d %H:%M:%S` | 统一时间戳格式 |
+| `LOG_MAX_SIZE` | 10485760 | 单文件最大字节（10MB） |
+| `LOG_ROTATE_INTERVAL` | 300 | 日志轮转检查间隔（秒） |
+| `LOG_RETENTION_TTL` | 604800 | 日志最大保留时间（秒，7 天） |
+| `GATE_TIMEOUT` | 120 | 质量门单条命令超时（秒） |
+| `GATE_LOG_TTL` | 86400 | 质量门日志保留时间（秒） |
+| `SKIP_GATE_TYPES` | `review design architecture audit document plan` | 跳过质量门检查的任务类型 |
+| `WATCHDOG_INTERVAL` | 60 | 任务看门狗巡检间隔（秒） |
+| `TASK_PROCESSING_TTL` | 21600 | 任务最大处理时长（秒，0=禁用） |
+| `TASK_MAX_RETRIES` | 3 | 最大重试次数（0=不重试直接失败） |
+| `TASK_RETRY_BASE_DELAY` | 60 | 重试基础延迟（秒，实际: 2^重试次数 × 基础值） |
+| `SUBTASK_MAX_DEPTH` | 3 | 子任务最大嵌套深度（0=禁止拆分） |
+| `SUBTASK_MAX_COUNT` | 10 | 单个父任务最大子任务数 |
+| `SUBTASK_STALL_TTL` | 7200 | 子任务组停滞检测阈值（秒） |
+| `ESCALATE_STALL_TTL` | 3600 | 上报任务未处理超时阈值（秒） |
+| `CLEANUP_TTL` | 3600 | 过期消息/任务 TTL（秒） |
+| `PANES_PER_WINDOW` | 2 | 每窗口 pane 数 |
 
 ### 项目结构
 

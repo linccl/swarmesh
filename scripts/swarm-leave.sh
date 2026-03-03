@@ -154,11 +154,11 @@ state_json_update \
     --arg role "$ROLE_NAME"
 log_info "state.json 已更新"
 
-# 4. 刷新所有角色的持久上下文（团队成员变化了）
+# 5. 刷新所有角色的持久上下文（团队成员变化了）
 log_info "刷新持久上下文..."
 refresh_all_contexts "$STATE_FILE"
 
-# 5. 归档该角色的消息到 outbox
+# 6. 归档该角色的消息到 outbox
 if [[ -d "$MESSAGES_DIR/inbox/$ROLE_NAME" ]]; then
     mkdir -p "$MESSAGES_DIR/outbox/$ROLE_NAME"
     for f in "$MESSAGES_DIR/inbox/$ROLE_NAME"/*.json; do
@@ -168,12 +168,12 @@ if [[ -d "$MESSAGES_DIR/inbox/$ROLE_NAME" ]]; then
     log_info "收件箱消息已归档"
 fi
 
-# 5. 通知其他角色（使用共享双通道通知函数）
+# 7. 通知其他角色（使用共享双通道通知函数）
 notify_all_roles "leave" \
     "角色 $ROLE_NAME 已离开蜂群。${REASON:+原因: $REASON。}该角色的职责需要由其他成员承担，执行 swarm-msg.sh list-roles 查看当前团队。" \
     "[Swarm 系统通知] $ROLE_NAME 已离开蜂群。${REASON:+原因: $REASON。}执行 swarm-msg.sh list-roles 查看当前团队。"
 
-# 6. 发射事件
+# 8. 发射事件
 emit_event "role.left" "$ROLE_NAME" "reason=${REASON:-manual}" "pane=$PANE_TARGET"
 
 # =============================================================================
