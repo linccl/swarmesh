@@ -280,11 +280,32 @@ save_final_state() {
 EOF
 )
 
-    # 如果已有状态文件，合并信息
+    # 收集 processing 中的孤儿任务 ID 列表（用于 resume 恢复）
+    local processing_tasks="[]"
+    if [[ -d "$TASKS_DIR/processing" ]]; then
+        processing_tasks=$(find "$TASKS_DIR/processing" -name "*.json" -type f -exec basename {} .json \; \
+            | jq -R -s 'split("\n") | map(select(length > 0))')
+    fi
+
+    # 合并停止信息到已有状态（保留 panes、project 等启动信息）
     if [[ -f "$STATE_FILE" ]]; then
-        local merged_state
-        merged_state=$(echo "$state_json" | jq -s '(input // {}) * .[0]' "$STATE_FILE" 2>/dev/null || echo "$state_json")
-        echo "$merged_state" > "$STATE_FILE"
+        jq \
+            --arg stop_time "$stop_time" \
+            --argjson duration "${duration_seconds:-0}" \
+            --argjson completed "${completed_tasks:-0}" \
+            --argjson pending "${pending_tasks:-0}" \
+            --argjson orphan_tasks "$processing_tasks" \
+            '. + {
+                stop_time: $stop_time,
+                duration_seconds: $duration,
+                tasks: { completed: $completed, pending: $pending },
+                status: "stopped",
+                resume: {
+                    orphan_tasks: $orphan_tasks,
+                    resumable: true
+                }
+            }' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE" \
+            || log_warn "状态合并失败，保留原始状态文件"
     else
         echo "$state_json" > "$STATE_FILE"
     fi
@@ -529,6 +550,38 @@ main() {
 
     # 清理 watcher 进程（在 kill session 之前，避免 watcher 访问已销毁的 pane）
     cleanup_watchers
+
+    # 为所有实例执行最终 auto_commit 并生成恢复摘要（非强制停止时）
+    if [[ "$FORCE_STOP" != "true" && -f "$STATE_FILE" ]]; then
+        # 步骤 A.0: 捕获所有 pane 最后输出（必须在 kill session 前，pane 还活着时）
+        log_info "捕获 CLI 最后输出..."
+        mkdir -p "${RESUME_SUMMARY_DIR:-$RUNTIME_DIR/resume}"
+        while IFS='|' read -r inst pane; do
+            [[ -n "$inst" && -n "$pane" ]] || continue
+            local output_file="${RESUME_SUMMARY_DIR:-$RUNTIME_DIR/resume}/${inst}.pane-output"
+            tmux capture-pane -t "$SESSION_NAME:$pane" -p -S -200 2>/dev/null \
+                | sed '/^[[:space:]]*$/d' \
+                | tail -"${RESUME_PANE_LINES:-50}" \
+                > "$output_file" || true
+        done < <(jq -r '.panes[] | "\(.instance)|\(.pane)"' "$STATE_FILE" 2>/dev/null)
+        log_success "CLI 输出已捕获"
+
+        # 步骤 A: 为所有实例执行最终 auto_commit（确保停止前的代码不丢失）
+        log_info "为所有实例执行最终代码提交..."
+        local commit_count=0
+        while IFS='|' read -r inst wt; do
+            [[ -n "$inst" && -n "$wt" && -d "$wt" ]] || continue
+            if auto_commit_worktree "$inst" "$wt"; then
+                ((commit_count++)) || true
+            fi
+        done < <(jq -r '.panes[] | "\(.instance)|\(.worktree // "")"' "$STATE_FILE" 2>/dev/null)
+        [[ $commit_count -gt 0 ]] && log_success "$commit_count 个实例的代码已提交"
+
+        # 步骤 B: 为所有实例生成恢复摘要
+        log_info "生成恢复摘要..."
+        save_all_resume_summaries "$STATE_FILE"
+        log_success "恢复摘要已生成到 ${RESUME_SUMMARY_DIR:-$RUNTIME_DIR/resume}/"
+    fi
 
     # 保存最终状态
     save_final_state

@@ -208,11 +208,8 @@ ${response}"
     tmp_file=$(mktemp "${SWARM_ROOT}/runtime/.relay-XXXXXX")
     echo "$message" > "$tmp_file"
 
-    # 使用 tmux load-buffer + paste-buffer 发送长消息
-    tmux load-buffer "$tmp_file"
-    tmux paste-buffer -t "${SESSION_NAME}:${to_pane}"
-    sleep 0.5
-    tmux send-keys -t "${SESSION_NAME}:${to_pane}" Enter
+    # 使用原子发送（flock 保护 paste-buffer + Enter 序列）
+    _pane_locked_paste_enter "$to_pane" "$tmp_file"
 
     rm -f "$tmp_file"
 

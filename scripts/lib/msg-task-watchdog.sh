@@ -201,11 +201,10 @@ _watchdog_check_one_task() {
 
     [[ -n "$tid" && -n "$claimed_by" ]] || return 0
 
-    # --- 检测 1: pane 存活检测 ---
+    # --- 检测 1: pane 存活检测 ---（claimed_by 存储的是 instance）
     local pane_target=""
     if [[ -f "$STATE_FILE" ]]; then
-        pane_target=$(jq -r --arg role "$claimed_by" \
-            '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
+        pane_target=$(_resolve_pane_by_id "$claimed_by")
     fi
 
     local pane_alive=true

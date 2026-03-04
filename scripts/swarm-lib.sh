@@ -144,39 +144,94 @@ gen_unique_id() {
     echo "${prefix}-$(date +%s%N 2>/dev/null || date +%s)-$$-${RANDOM}"
 }
 
-# 解析角色名/别名到 pane 映射
-# 输出: pane_target|role_name
-resolve_role_to_pane() {
+# 生成实例名（首实例 instance==role，后续 role-2, role-3, ...）
+generate_instance_name() {
+    local role="$1" state_file="$2"
+    local existing_count
+    existing_count=$(jq -r --arg role "$role" '[.panes[] | select(.role == $role)] | length' "$state_file" 2>/dev/null)
+    if [[ "$existing_count" -eq 0 ]]; then
+        echo "$role"
+    else
+        local max_num
+        max_num=$(jq -r --arg role "$role" '
+            [.panes[] | select(.role == $role) | .instance |
+             if test("-[0-9]+$") then (split("-") | last | tonumber) else 1 end
+            ] | max // 1
+        ' "$state_file" 2>/dev/null)
+        echo "${role}-$((max_num + 1))"
+    fi
+}
+
+# 通用 pane 查找: 先精确匹配 instance，再回退 role
+# 输出: pane target（单行）
+_resolve_pane_by_id() {
+    local id="$1"
+    local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
+    jq -r --arg q "$id" '
+        (.panes[] | select(.instance == $q) | .pane) //
+        (.panes[] | select(.role == $q) | .pane) //
+        empty
+    ' "$state_file" 2>/dev/null | head -1
+}
+
+# 按角色查找全部实例
+# 输出: 每行 pane|instance
+resolve_role_to_all_panes() {
     local role="$1"
+    local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
+    jq -r --arg q "$role" '
+        .panes[] | select(.role == $q) | "\(.pane)|\(.instance)"
+    ' "$state_file" 2>/dev/null
+}
+
+# 解析角色名/别名/实例名到 pane 映射
+# 输出: pane_target|instance_name
+resolve_role_to_pane() {
+    local query="$1"
     local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
     [[ -f "$state_file" ]] || die "state.json 不存在，蜂群未启动？"
 
     local result
-    result=$(jq -r --arg q "$role" '
-        .panes[] |
-        select(.role == $q or (.alias // "" | split(",") | map(gsub("^\\s+|\\s+$"; "")) | index($q) != null)) |
-        "\(.pane)|\(.role)"
+    # 优先精确匹配 instance
+    result=$(jq -r --arg q "$query" '
+        .panes[] | select(.instance == $q) | "\(.pane)|\(.instance)"
     ' "$state_file" 2>/dev/null | head -1)
 
-    [[ -n "$result" ]] || die "找不到角色: $role (使用 swarm-msg.sh list-roles 查看在线角色)"
+    # 回退到 role/alias 匹配
+    if [[ -z "$result" ]]; then
+        result=$(jq -r --arg q "$query" '
+            .panes[] |
+            select(.role == $q or (.alias // "" | split(",") | map(gsub("^\\s+|\\s+$"; "")) | index($q) != null)) |
+            "\(.pane)|\(.instance)"
+        ' "$state_file" 2>/dev/null | head -1)
+    fi
+
+    [[ -n "$result" ]] || die "找不到角色/实例: $query (使用 swarm-msg.sh list-roles 查看在线角色)"
     echo "$result"
 }
 
-# 解析角色名/别名到完整映射（供 relay/detect 使用）
-# 输出: pane_target|role_name|cli_command|log_file
+# 解析角色名/别名/实例名到完整映射（供 relay/detect 使用）
+# 输出: pane_target|instance_name|cli_command|log_file
 resolve_role_full() {
-    local role="$1"
+    local query="$1"
     local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
     [[ -f "$state_file" ]] || die "state.json 不存在，蜂群未启动？"
 
     local result
-    result=$(jq -r --arg q "$role" '
-        .panes[] |
-        select(.role == $q or (.alias // "" | split(",") | map(gsub("^\\s+|\\s+$"; "")) | index($q) != null)) |
-        "\(.pane)|\(.role)|\(.cli)|\(.log)"
+    # 优先精确匹配 instance
+    result=$(jq -r --arg q "$query" '
+        .panes[] | select(.instance == $q) | "\(.pane)|\(.instance)|\(.cli)|\(.log)"
     ' "$state_file" 2>/dev/null | head -1)
 
-    [[ -n "$result" ]] || die "找不到角色: $role"
+    if [[ -z "$result" ]]; then
+        result=$(jq -r --arg q "$query" '
+            .panes[] |
+            select(.role == $q or (.alias // "" | split(",") | map(gsub("^\\s+|\\s+$"; "")) | index($q) != null)) |
+            "\(.pane)|\(.instance)|\(.cli)|\(.log)"
+        ' "$state_file" 2>/dev/null | head -1)
+    fi
+
+    [[ -n "$result" ]] || die "找不到角色/实例: $query"
     echo "$result"
 }
 
@@ -244,6 +299,259 @@ ${team_info}
 INIT_EOF
 }
 
+# =============================================================================
+# 恢复摘要生成（swarm-stop.sh 和 swarm-start.sh 共用）
+# =============================================================================
+
+# 生成单个实例的工作摘要
+# 参数:
+#   $1 - 实例名 (如 frontend, backend-2)
+#   $2 - 分支名 (如 swarm/frontend)
+#   $3 - 项目目录
+#   $4 - 输出文件路径
+generate_instance_resume_summary() {
+    local instance="$1" branch="$2" project_dir="$3" output_file="$4"
+
+    mkdir -p "$(dirname "$output_file")"
+
+    {
+        echo "# 恢复摘要: $instance"
+        echo "生成时间: $(get_timestamp)"
+        echo "分支: $branch"
+        echo ""
+
+        # Git 提交历史（该分支相对于 main/HEAD 的新提交）
+        echo "## 最近提交"
+        local main_branch
+        main_branch=$(git -C "$project_dir" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+            | sed 's|refs/remotes/origin/||')
+        if [[ -z "$main_branch" ]]; then
+            for candidate in main master; do
+                if git -C "$project_dir" show-ref --verify --quiet "refs/heads/$candidate" 2>/dev/null; then
+                    main_branch="$candidate"; break
+                fi
+            done
+            main_branch="${main_branch:-main}"
+        fi
+        if git -C "$project_dir" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+            local commits
+            commits=$(git -C "$project_dir" log "$branch" --not "$main_branch" \
+                --oneline --no-decorate -n "${RESUME_SUMMARY_MAX_COMMITS:-20}" 2>/dev/null)
+            if [[ -n "$commits" ]]; then
+                echo '```'
+                echo "$commits"
+                echo '```'
+            else
+                echo "（无新提交）"
+            fi
+        else
+            echo "（分支 $branch 不存在）"
+        fi
+        echo ""
+
+        # 已完成的任务
+        echo "## 已完成任务"
+        local completed_count=0
+        if [[ -d "$TASKS_DIR/completed" ]]; then
+            local task_file
+            for task_file in "$TASKS_DIR/completed/"*.json; do
+                [[ -f "$task_file" ]] || continue
+                local claimed_by
+                claimed_by=$(jq -r '.claimed_by // ""' "$task_file" 2>/dev/null)
+                if [[ "$claimed_by" == "$instance" ]]; then
+                    ((completed_count++)) || true
+                    [[ $completed_count -le ${RESUME_SUMMARY_MAX_TASKS:-10} ]] || continue
+                    local title result
+                    title=$(jq -r '.title // .id // "unknown"' "$task_file" 2>/dev/null)
+                    result=$(jq -r '.result // "" | if length > 100 then .[:100] + "..." else . end' "$task_file" 2>/dev/null)
+                    echo "- [完成] $title"
+                    [[ -n "$result" ]] && echo "  结果: $result"
+                fi
+            done
+        fi
+        [[ $completed_count -eq 0 ]] && echo "（无）"
+        echo ""
+
+        # 未完成的任务（processing + pending 中 claimed_by 匹配）
+        echo "## 未完成任务"
+        local pending_count=0
+        for status_dir in "$TASKS_DIR/processing" "$TASKS_DIR/pending"; do
+            [[ -d "$status_dir" ]] || continue
+            local task_file
+            for task_file in "$status_dir/"*.json; do
+                [[ -f "$task_file" ]] || continue
+                local claimed_by
+                claimed_by=$(jq -r '.claimed_by // ""' "$task_file" 2>/dev/null)
+                if [[ "$claimed_by" == "$instance" ]]; then
+                    ((pending_count++)) || true
+                    [[ $pending_count -le ${RESUME_SUMMARY_MAX_TASKS:-10} ]] || continue
+                    local title task_id task_status
+                    title=$(jq -r '.title // .id // "unknown"' "$task_file" 2>/dev/null)
+                    task_id=$(basename "$task_file" .json)
+                    task_status=$(jq -r '.status // "unknown"' "$task_file" 2>/dev/null)
+                    echo "- [$task_status] $title (ID: $task_id)"
+                fi
+            done
+        done
+        [[ $pending_count -eq 0 ]] && echo "（无）"
+        echo ""
+
+        # 最后 CLI 输出（stop 时捕获的 pane 内容）
+        echo "## 最后 CLI 输出"
+        local pane_output_file="${RESUME_SUMMARY_DIR:-$RUNTIME_DIR/resume}/${instance}.pane-output"
+        if [[ -f "$pane_output_file" && -s "$pane_output_file" ]]; then
+            echo '```'
+            cat "$pane_output_file"
+            echo '```'
+        else
+            echo "（无）"
+        fi
+        echo ""
+
+        # 最近消息记录（inbox + outbox）
+        echo "## 最近消息"
+        local msg_count=0
+        local max_msgs="${RESUME_SUMMARY_MAX_MESSAGES:-10}"
+        local all_msgs=()
+        for dir in "$MESSAGES_DIR/inbox/$instance" "$MESSAGES_DIR/outbox/$instance"; do
+            [[ -d "$dir" ]] || continue
+            for msg_file in "$dir/"*.json; do
+                [[ -f "$msg_file" ]] || continue
+                all_msgs+=("$msg_file")
+            done
+        done
+        if [[ ${#all_msgs[@]} -gt 0 ]]; then
+            local sorted_msgs
+            sorted_msgs=$(for mf in "${all_msgs[@]}"; do
+                echo "$(_file_mtime "$mf") $mf"
+            done | sort -rn | head -"$max_msgs" | awk '{print $2}')
+            while IFS= read -r mf; do
+                [[ -n "$mf" ]] || continue
+                local from to content ts
+                from=$(jq -r '.from // ""' "$mf" 2>/dev/null)
+                to=$(jq -r '.to // ""' "$mf" 2>/dev/null)
+                content=$(jq -r '.content // "" | if length > 200 then .[:200] + "..." else . end' "$mf" 2>/dev/null)
+                ts=$(jq -r '.timestamp // ""' "$mf" 2>/dev/null)
+                echo "- [$ts] $from → $to: $content"
+                ((msg_count++)) || true
+            done <<< "$sorted_msgs"
+        fi
+        [[ $msg_count -eq 0 ]] && echo "（无）"
+        echo ""
+
+        # 最后提交变更
+        echo "## 最后提交变更"
+        if git -C "$project_dir" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+            local last_stat
+            last_stat=$(git -C "$project_dir" log "$branch" -1 --stat --oneline 2>/dev/null)
+            if [[ -n "$last_stat" ]]; then
+                echo '```'
+                echo "$last_stat"
+                echo '```'
+            else
+                echo "（无提交）"
+            fi
+        else
+            echo "（分支不存在）"
+        fi
+
+    } > "$output_file"
+}
+
+# 为所有实例生成恢复摘要
+# 参数:
+#   $1 - state.json 路径
+save_all_resume_summaries() {
+    local state_file="${1:-$STATE_FILE}"
+    [[ -f "$state_file" ]] || return 0
+
+    local project_dir
+    project_dir=$(jq -r '.project // ""' "$state_file" 2>/dev/null)
+    [[ -n "$project_dir" && -d "$project_dir" ]] || return 0
+
+    mkdir -p "${RESUME_SUMMARY_DIR:-$RUNTIME_DIR/resume}"
+
+    while IFS='|' read -r inst branch; do
+        [[ -n "$inst" ]] || continue
+        # 兜底：state.json 无 branch 字段（旧版本）
+        [[ -n "$branch" && "$branch" != "null" ]] || branch="swarm/$inst"
+        generate_instance_resume_summary \
+            "$inst" "$branch" "$project_dir" \
+            "${RESUME_SUMMARY_DIR:-$RUNTIME_DIR/resume}/${inst}.md"
+    done < <(jq -r '.panes[] | "\(.instance // .role)|\(.branch // "")"' "$state_file" 2>/dev/null)
+}
+
+# 构建恢复初始化消息（在标准 init 消息基础上附加恢复上下文）
+# 参数:
+#   $1 - 配置文件路径
+#   $2 - 角色分支名
+#   $3 - 团队成员信息
+#   $4 - 恢复摘要文件路径（可选，不存在则降级为标准消息）
+build_resume_init_message() {
+    local config_file="$1"
+    local role_branch="$2"
+    local team_info="$3"
+    local resume_file="${4:-}"
+
+    # 获取基础 init 消息
+    local base_msg
+    base_msg=$(build_init_message "$config_file" "$role_branch" "$team_info")
+
+    # 如果没有恢复摘要文件，降级为标准 init 消息
+    if [[ -z "$resume_file" || ! -f "$resume_file" ]]; then
+        echo "$base_msg"
+        return 0
+    fi
+
+    # 附加恢复上下文
+    local resume_content
+    resume_content=$(cat "$resume_file")
+
+    cat <<RESUME_EOF
+$base_msg
+
+## 恢复上下文（重要）
+这是一次会话恢复。你之前的工作上下文如下：
+
+$resume_content
+
+### 恢复行动指南
+1. 先检查你的分支状态: git status && git log --oneline -5
+2. 查看是否有未完成的任务: swarm-msg.sh list-tasks
+3. 如果有上次未完成的工作，继续完成
+4. 如果所有工作已完成，认领新任务或等待 supervisor 分配
+5. 恢复后立即向 supervisor 报告你的状态
+RESUME_EOF
+}
+
+# =============================================================================
+# Pane 级原子发送: flock 保护 paste-buffer + Enter 序列
+# 防止并发发送同一 pane 时消息交错（命名 buffer + 互斥锁）
+# =============================================================================
+# 参数:
+#   $1 - pane target (如 0.1)
+#   $2 - 要发送的临时文件路径
+_pane_locked_paste_enter() {
+    local pane_target="$1"
+    local content_file="$2"
+    local buf_name="pane-$$-$RANDOM"
+
+    # 锁文件按 pane 目标命名（. 替换为 - 避免路径问题）
+    local lock_file="${RUNTIME_DIR}/.pane-send-lock-${pane_target//./-}"
+
+    (
+        exec 9>"$lock_file"
+        flock -x 9
+        # 真 flock: 子 shell 退出时 fd 关闭自动释放锁
+        # macOS mkdir polyfill: 加锁时已自动注册 EXIT trap 清理，无需额外处理
+
+        tmux load-buffer -b "$buf_name" "$content_file"
+        tmux paste-buffer -b "$buf_name" -t "${SESSION_NAME}:${pane_target}" -d
+        sleep "${PASTE_DELAY:-0.3}"
+        tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
+    )
+}
+
 # 通过 tmux paste-buffer 发送初始化消息到 pane
 send_init_to_pane() {
     local pane_target="$1"
@@ -252,10 +560,7 @@ send_init_to_pane() {
     local init_tmp
     init_tmp=$(mktemp "${RUNTIME_DIR}/.init-XXXXXX")
     printf '%s' "$init_msg" > "$init_tmp"
-    tmux load-buffer "$init_tmp"
-    tmux paste-buffer -t "${SESSION_NAME}:${pane_target}"
-    sleep 0.3
-    tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
+    _pane_locked_paste_enter "$pane_target" "$init_tmp"
     rm -f "$init_tmp"
     sleep 1
 }
@@ -274,39 +579,36 @@ notify_all_roles() {
     local category="$1"
     local inbox_content="$2"
     local pane_content="$3"
-    local exclude_role="${4:-}"
+    local exclude="${4:-}"
     local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
 
-    while IFS='|' read -r role_name role_pane; do
-        [[ -z "$role_name" ]] && continue
-        [[ "$role_name" == "$exclude_role" ]] && continue
+    while IFS='|' read -r inst_name inst_pane; do
+        [[ -z "$inst_name" ]] && continue
+        [[ "$inst_name" == "$exclude" ]] && continue
 
         # 通道 1: 写入收件箱（可靠持久）
         local notify_id
         notify_id="sys-${category}-$(date +%s)-${RANDOM}"
-        mkdir -p "${MESSAGES_DIR}/inbox/${role_name}"
+        mkdir -p "${MESSAGES_DIR}/inbox/${inst_name}"
         jq -n \
             --arg id "$notify_id" \
             --arg from "system" \
-            --arg to "$role_name" \
+            --arg to "$inst_name" \
             --arg content "$inbox_content" \
             --arg timestamp "$(get_timestamp)" \
             --arg status "pending" \
             --arg priority "high" \
             '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-            > "${MESSAGES_DIR}/inbox/${role_name}/${notify_id}.json"
+            > "${MESSAGES_DIR}/inbox/${inst_name}/${notify_id}.json"
 
-        # 通道 2: paste-buffer 尽力即时推送
+        # 通道 2: paste-buffer 尽力即时推送（原子发送）
         local notify_tmp
         notify_tmp=$(mktemp "${RUNTIME_DIR}/.notify-XXXXXX")
         printf '%s' "$pane_content" > "$notify_tmp"
-        tmux load-buffer "$notify_tmp"
-        tmux paste-buffer -t "${SESSION_NAME}:${role_pane}" 2>/dev/null || true
-        sleep 0.3
-        tmux send-keys -t "${SESSION_NAME}:${role_pane}" Enter 2>/dev/null || true
+        _pane_locked_paste_enter "$inst_pane" "$notify_tmp" 2>/dev/null || true
         rm -f "$notify_tmp"
 
-    done < <(jq -r '.panes[] | "\(.role)|\(.pane)"' "$state_file" 2>/dev/null)
+    done < <(jq -r '.panes[] | "\(.instance)|\(.pane)"' "$state_file" 2>/dev/null)
 }
 
 # =============================================================================
@@ -539,12 +841,13 @@ _build_swarm_context() {
     # 构建团队成员列表
     local team_info=""
     if [[ -f "$state_file" ]]; then
-        while IFS='|' read -r r_name r_alias r_branch; do
-            team_info+="- $r_name"
+        while IFS='|' read -r r_instance r_role r_alias r_branch; do
+            team_info+="- $r_instance"
+            [[ -n "$r_role" && "$r_role" != "$r_instance" ]] && team_info+=" (角色: $r_role)"
             [[ -n "$r_alias" && "$r_alias" != "" ]] && team_info+=" ($r_alias)"
             [[ -n "$r_branch" && "$r_branch" != "" ]] && team_info+=" [branch: $r_branch]"
             team_info+=$'\n'
-        done < <(jq -r '.panes[] | "\(.role)|\(.alias // "")|\(.branch // "")"' "$state_file" 2>/dev/null)
+        done < <(jq -r '.panes[] | "\(.instance)|\(.role)|\(.alias // "")|\(.branch // "")"' "$state_file" 2>/dev/null)
     fi
 
     # 项目信息引用（原始事实由 LLM 自行解读）
@@ -617,6 +920,16 @@ ${team_info:-（暂无其他成员）}
 4. 审核角色从队列 claim 任务，用 git diff 审核分支代码
 5. 任务完成后用 complete-task 反馈，依赖此任务的阻塞任务会自动解锁
 6. 任务组全部完成时，发布者会自动收到通知
+
+### 任务完成检测机制（重要）
+系统通过两个渠道判断你的任务是否完成：
+1. **主渠道**: 你调用 swarm-msg.sh complete-task 主动报告完成
+2. **自动检测**: 系统监控你的 CLI 提示符——当 CLI 显示输入提示符且持续无新输出时，系统自动判定任务完成，并触发代码自动 commit + 通知 supervisor
+
+注意事项：
+- 避免在代码或输出中打印与 CLI 提示符相似的字符（如 ❯、›、单独的 > 行），以免系统误判任务完成
+- 如果 CLI 卡住（长时间无响应也无提示符），执行 swarm-msg.sh fail-task 通知 supervisor
+- 每次任务完成后，推荐使用 complete-task 明确报告，而非仅依赖自动检测
 $SWARM_CONTEXT_END
 EOF
 }
@@ -728,7 +1041,7 @@ refresh_all_contexts() {
 #   $1 - 角色名
 #   $2 - worktree 路径
 auto_commit_worktree() {
-    local role="$1" worktree="$2"
+    local instance="$1" worktree="$2"
     [[ -n "$worktree" && -d "$worktree" ]] || return 0
 
     # 检查是否有变更（工作区 + 暂存区 + 未跟踪文件）
@@ -756,9 +1069,9 @@ auto_commit_worktree() {
     file_count=$(echo -e "${summary}" | grep -c '[^[:space:]]' 2>/dev/null || echo "0")
 
     git -C "$worktree" add -A 2>/dev/null || return 0
-    git -C "$worktree" commit -m "swarm($role): 任务完成自动提交 ($file_count 个文件变更)" 2>/dev/null || return 0
+    git -C "$worktree" commit -m "swarm($instance): 任务完成自动提交 ($file_count 个文件变更)" 2>/dev/null || return 0
 
-    emit_event "git.auto_commit" "$role" "worktree=$worktree" "files=$file_count"
+    emit_event "git.auto_commit" "$instance" "worktree=$worktree" "files=$file_count"
 }
 
 # =============================================================================
@@ -768,8 +1081,7 @@ auto_commit_worktree() {
 # CLI 提示符模式（Claude: ❯  Gemini: >  Codex: ›）
 PROMPT_PATTERNS="${PROMPT_PATTERNS:-❯|›|^[[:space:]]*>[[:space:]]*$|Type your message|context left}"
 
-# 静默阈值（秒）- 多久没输出算完成
-SILENCE_THRESHOLD="${SILENCE_THRESHOLD:-5}"
+# 静默阈值（秒）- 多久没输出算完成（由 config/defaults.conf 统一定义）
 
 # 检查 pane 最后几行是否包含 CLI 提示符
 # 注意: tmux pane 底部可能有大量空行，需过滤后再检查
@@ -782,6 +1094,62 @@ check_prompt() {
         | tail -5)
 
     echo "$last_lines" | grep -qE "$PROMPT_PATTERNS"
+}
+
+# =============================================================================
+# 任务完成自动通知 supervisor
+# =============================================================================
+
+# 当角色完成任务时，自动通知 supervisor 可分配新任务
+# 双通道: inbox（可靠持久）+ paste-buffer（即时推送）
+_notify_supervisor_completion() {
+    local instance="$1"
+
+    # supervisor 自身不需要通知
+    [[ "$instance" == "supervisor" ]] && return 0
+
+    local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
+    local messages_dir="${RUNTIME_DIR}/messages"
+
+    # 查找 supervisor 的 pane
+    local sup_pane
+    sup_pane=$(_resolve_pane_by_id "supervisor")
+    [[ -z "$sup_pane" || "$sup_pane" == "null" ]] && return 0
+
+    # 通道 1: 写入 supervisor 收件箱（supervisor 首实例 instance==role）
+    local notify_id="completion-${instance}-$(date +%s)-${RANDOM}"
+    mkdir -p "${messages_dir}/inbox/supervisor"
+    jq -n \
+        --arg id "$notify_id" \
+        --arg from "system" \
+        --arg to "supervisor" \
+        --arg content "[任务完成] 实例 ${instance} 已完成当前任务，可分配新工作。" \
+        --arg timestamp "$(get_timestamp)" \
+        --arg status "pending" \
+        --arg priority "normal" \
+        '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
+        > "${messages_dir}/inbox/supervisor/${notify_id}.json"
+
+    # 通道 2: paste-buffer 即时推送（尽力而为）
+    local notify_tmp
+    notify_tmp=$(mktemp "${RUNTIME_DIR}/.watcher-notify-XXXXXX")
+    printf '%s' "[系统通知] 实例 ${instance} 已完成任务，可分配新工作。" > "$notify_tmp"
+    _pane_locked_paste_enter "$sup_pane" "$notify_tmp" 2>/dev/null || true
+    rm -f "$notify_tmp"
+}
+
+# 通知 inspector 某角色已停滞
+_notify_inspector_stall() {
+    local instance="$1" elapsed="$2"
+    local inspector_pane
+    inspector_pane=$(_resolve_pane_by_id "inspector") || return 0
+    [[ -z "$inspector_pane" || "$inspector_pane" == "null" ]] && return 0
+    local msg="[STALL] 实例 $instance 已停滞 ${elapsed}s 无输出，请检查"
+    local tmp
+    tmp=$(mktemp "${RUNTIME_DIR}/.stall-XXXXXX")
+    printf '%s' "$msg" > "$tmp"
+    _pane_locked_paste_enter "$inspector_pane" "$tmp" 2>/dev/null || true
+    rm -f "$tmp"
 }
 
 # =============================================================================
@@ -805,10 +1173,11 @@ check_prompt() {
 #
 # 输出: watcher 进程的 PID (stdout)
 start_pane_watcher() {
-    local role="$1" log_file="$2" pane="$3" worktree="${4:-}"
+    local instance="$1" log_file="$2" pane="$3" worktree="${4:-}"
 
     (
         local state="init"
+        local active_since=0
 
         # 等待日志文件出现
         while [[ ! -f "$log_file" ]]; do sleep 0.5; done
@@ -821,6 +1190,7 @@ start_pane_watcher() {
                 # 有新输出
                 if [[ "$state" == "idle" ]]; then
                     state="active"
+                    active_since=$(date +%s)
                 fi
                 # init 和 active 状态下继续消费输出
             else
@@ -836,11 +1206,28 @@ start_pane_watcher() {
                         # 任务完成？检查提示符
                         if check_prompt "$pane"; then
                             # 自动提交 worktree 中的变更
-                            auto_commit_worktree "$role" "$worktree"
-                            emit_event "task.completed" "$role" "pane=$pane" "detected_by=watcher"
+                            auto_commit_worktree "$instance" "$worktree"
+                            emit_event "task.completed" "$instance" "pane=$pane" "detected_by=watcher"
+                            # 自动通知 supervisor 可分配新任务
+                            _notify_supervisor_completion "$instance"
                             state="idle"
+                            active_since=0
+                        else
+                            # stall 检测：active 状态下持续无输出且未完成
+                            # active_since == 0 的防御：init → 静默超时的边界情况
+                            if [[ "$active_since" -eq 0 ]]; then
+                                active_since=$(date +%s)
+                            else
+                                local now elapsed
+                                now=$(date +%s)
+                                elapsed=$((now - active_since))
+                                if [[ "$elapsed" -ge "${STALL_THRESHOLD:-1800}" ]]; then
+                                    emit_event "task.stalled" "$instance" "pane=$pane" "elapsed=${elapsed}s"
+                                    _notify_inspector_stall "$instance" "$elapsed"
+                                    active_since=$now  # 重置，避免重复通知
+                                fi
+                            fi
                         fi
-                        # 未找到提示符 → CLI 仍在思考（输出暂停），保持 active
                         ;;
                     # idle 状态下忽略静默超时
                 esac

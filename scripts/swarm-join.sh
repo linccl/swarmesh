@@ -141,9 +141,21 @@ if [[ "$MAX_CLI" -gt 0 ]]; then
     log_info "CLI 数量: $CURRENT_CLI_COUNT/$MAX_CLI"
 fi
 
-# 角色名不能重复（同角色多实例跳过此检查）
-EXISTING=$(jq -r --arg role "$ROLE" '.panes[] | select(.role == $role) | .role' "$STATE_FILE" 2>/dev/null || true)
-[[ -z "$EXISTING" ]] || die "角色 '$ROLE' 已存在，不能重复加入"
+# Join 级互斥锁: 防止并发 join 生成重复实例名
+# 保护范围: 实例名生成 → 资源创建 → state.json 写入
+JOIN_LOCK_FILE="${RUNTIME_DIR}/.swarm-join.lock"
+exec 201>"$JOIN_LOCK_FILE"
+flock -x 201
+
+# 生成实例名（首实例 instance==role，后续 role-2, role-3, ...）
+INSTANCE=$(generate_instance_name "$ROLE" "$STATE_FILE")
+
+# 管理角色不允许多实例
+if [[ "$ROLE" == "supervisor" || "$ROLE" == "inspector" ]] && [[ "$INSTANCE" != "$ROLE" ]]; then
+    die "管理角色 '$ROLE' 不支持多实例"
+fi
+
+log_info "实例名: $INSTANCE (角色: $ROLE)"
 
 # 配置文件检查
 CONFIG_FILE="$CONFIG_DIR/roles/$CONFIG_PATH"
@@ -201,7 +213,7 @@ else
     if [[ "$PLACED" == false ]]; then
         # 所有窗口都满了，新建窗口
         log_info "所有窗口已满，创建新窗口..."
-        tmux new-window -t "$SESSION_NAME" -n "ext-${ROLE}"
+        tmux new-window -t "$SESSION_NAME" -n "ext-${INSTANCE}"
         WINDOW_IDX=$(tmux list-windows -t "$SESSION_NAME" -F '#{window_index}' | tail -1)
         PANE_TARGET="${WINDOW_IDX}.0"
     fi
@@ -223,8 +235,8 @@ WORKTREE_DIR=$(jq -r '.worktree_dir // ""' "$STATE_FILE" 2>/dev/null)
 [[ -n "$WORKTREE_DIR" ]] || WORKTREE_DIR="$PROJECT_DIR/.swarm-worktrees"
 
 # 创建角色的 git worktree（独立工作目录 + 独立分支）
-ROLE_BRANCH="swarm/$ROLE"
-ROLE_WORKTREE="$WORKTREE_DIR/$ROLE"
+ROLE_BRANCH="swarm/$INSTANCE"
+ROLE_WORKTREE="$WORKTREE_DIR/$INSTANCE"
 mkdir -p "$WORKTREE_DIR"
 if git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/heads/$ROLE_BRANCH" 2>/dev/null; then
     git -C "$PROJECT_DIR" worktree add "$ROLE_WORKTREE" "$ROLE_BRANCH"
@@ -234,7 +246,7 @@ fi
 log_info "Worktree: $ROLE_WORKTREE (branch: $ROLE_BRANCH)"
 
 # 在角色的 worktree 目录启动 CLI
-tmux send-keys -t "$SESSION_NAME:$PANE_TARGET" "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && $CLI_CMD" C-m
+tmux send-keys -t "$SESSION_NAME:$PANE_TARGET" "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && $CLI_CMD" C-m
 
 sleep "$CLI_STARTUP_WAIT"
 
@@ -242,7 +254,7 @@ sleep "$CLI_STARTUP_WAIT"
 # 初始化消息目录
 # =============================================================================
 
-mkdir -p "$MESSAGES_DIR/inbox/$ROLE" "$MESSAGES_DIR/outbox/$ROLE"
+mkdir -p "$MESSAGES_DIR/inbox/$INSTANCE" "$MESSAGES_DIR/outbox/$INSTANCE"
 
 # =============================================================================
 # 发送初始化消息
@@ -252,11 +264,12 @@ log_info "发送初始化消息..."
 
 # 构建当前团队成员信息（从 state.json 读取现有角色）
 TEAM_INFO=""
-while IFS='|' read -r r_name r_alias; do
-    TEAM_INFO+="  - $r_name"
+while IFS='|' read -r r_instance r_role r_alias; do
+    TEAM_INFO+="  - $r_instance"
+    [[ "$r_instance" != "$r_role" ]] && TEAM_INFO+=" (角色: $r_role)"
     [[ -n "$r_alias" && "$r_alias" != "" ]] && TEAM_INFO+=" ($r_alias)"
     TEAM_INFO+=$'\n'
-done < <(jq -r '.panes[] | "\(.role)|\(.alias // "")"' "$STATE_FILE")
+done < <(jq -r '.panes[] | "\(.instance // .role)|\(.role)|\(.alias // "")"' "$STATE_FILE")
 
 # 使用共享函数构建并发送初始化消息
 INIT_MSG=$(build_init_message "$CONFIG_FILE" "$ROLE_BRANCH" "$TEAM_INFO")
@@ -266,10 +279,10 @@ send_init_to_pane "$PANE_TARGET" "$INIT_MSG"
 # 启用日志 + Watcher
 # =============================================================================
 
-LOG_FILE="$LOGS_DIR/${ROLE}.log"
+LOG_FILE="$LOGS_DIR/${INSTANCE}.log"
 tmux pipe-pane -t "$SESSION_NAME:$PANE_TARGET" -o "$(_pipe_pane_cmd "$LOG_FILE")"
 
-WATCHER_PID=$(start_pane_watcher "$ROLE" "$LOG_FILE" "$PANE_TARGET" "$ROLE_WORKTREE")
+WATCHER_PID=$(start_pane_watcher "$INSTANCE" "$LOG_FILE" "$PANE_TARGET" "$ROLE_WORKTREE")
 log_info "Watcher PID: $WATCHER_PID"
 
 # =============================================================================
@@ -280,6 +293,7 @@ log_info "更新 state.json..."
 
 NEW_PANE_JSON=$(jq -n \
     --arg role "$ROLE" \
+    --arg instance "$INSTANCE" \
     --arg pane "$PANE_TARGET" \
     --arg cli "$CLI_CMD" \
     --arg config "$CONFIG_PATH" \
@@ -290,6 +304,7 @@ NEW_PANE_JSON=$(jq -n \
     --arg branch "$ROLE_BRANCH" \
     '{
         role: $role,
+        instance: $instance,
         pane: $pane,
         cli: $cli,
         config: $config,
@@ -307,6 +322,9 @@ state_json_update \
 
 log_success "state.json 已更新"
 
+# 释放 join 互斥锁（实例名已写入 state.json，后续操作无需互斥）
+flock -u 201
+
 # 刷新所有角色的持久上下文（团队成员变化了）
 log_info "刷新持久上下文..."
 refresh_all_contexts "$STATE_FILE"
@@ -319,12 +337,12 @@ log_info "通知现有角色..."
 
 # 使用共享双通道通知函数
 notify_all_roles "join" \
-    "新角色 $ROLE 已加入蜂群 (CLI: $CLI_CMD, 配置: $CONFIG_PATH)。你现在可以用 swarm-msg.sh send $ROLE \"消息\" 与该角色沟通。执行 swarm-msg.sh list-roles 查看完整团队。" \
-    "[Swarm 系统通知] 新角色 $ROLE 已加入蜂群。执行 swarm-msg.sh list-roles 查看团队，swarm-msg.sh read 查看详情。" \
-    "$ROLE"
+    "新实例 $INSTANCE (角色: $ROLE) 已加入蜂群 (CLI: $CLI_CMD, 配置: $CONFIG_PATH)。你现在可以用 swarm-msg.sh send $INSTANCE \"消息\" 与该实例沟通。执行 swarm-msg.sh list-roles 查看完整团队。" \
+    "[Swarm 系统通知] 新实例 $INSTANCE (角色: $ROLE) 已加入蜂群。执行 swarm-msg.sh list-roles 查看团队，swarm-msg.sh read 查看详情。" \
+    "$INSTANCE"
 
 # 发射事件（也供 swarm-msg.sh wait 感知）
-emit_event "role.joined" "$ROLE" "cli=$CLI_CMD" "config=$CONFIG_PATH" "pane=$PANE_TARGET"
+emit_event "role.joined" "$INSTANCE" "cli=$CLI_CMD" "config=$CONFIG_PATH" "pane=$PANE_TARGET" "role=$ROLE"
 
 # =============================================================================
 # 完成
@@ -340,18 +358,16 @@ if [[ -n "$INITIAL_TASK" ]]; then
 
     TASK_TMP=$(mktemp "${RUNTIME_DIR}/.task-XXXXXX")
     printf '%s' "$INITIAL_TASK" > "$TASK_TMP"
-    tmux load-buffer "$TASK_TMP"
-    tmux paste-buffer -t "$SESSION_NAME:$PANE_TARGET"
-    sleep 0.3
-    tmux send-keys -t "$SESSION_NAME:$PANE_TARGET" Enter
+    _pane_locked_paste_enter "$PANE_TARGET" "$TASK_TMP"
     rm -f "$TASK_TMP"
 
     log_success "初始任务已派发"
 fi
 
-log_success "角色 $ROLE 已成功加入蜂群!"
+log_success "实例 $INSTANCE (角色: $ROLE) 已成功加入蜂群!"
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "实例:     $INSTANCE"
 echo "角色:     $ROLE"
 echo "Pane:     $SESSION_NAME:$PANE_TARGET"
 echo "CLI:      $CLI_CMD"
@@ -362,7 +378,7 @@ echo "分支:     $ROLE_BRANCH"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "操作:"
-echo "  发送任务:  swarm-send.sh $ROLE '任务内容'"
-echo "  发送消息:  swarm-msg.sh send $ROLE '消息内容'"
+echo "  发送任务:  swarm-send.sh $INSTANCE '任务内容'"
+echo "  发送消息:  swarm-msg.sh send $INSTANCE '消息内容'"
 echo "  查看状态:  swarm-status.sh"
 echo ""

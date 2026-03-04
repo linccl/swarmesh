@@ -109,42 +109,46 @@ TARGET_ROLE=""
 TARGET_PANE=""
 TARGET_CLI=""
 
-# 尝试匹配角色
+# 尝试匹配角色/实例
 for ((i=0; i<PANES_COUNT; i++)); do
     ROLE=$(echo "$PANES_JSON" | jq -r ".[$i].role")
+    INSTANCE=$(echo "$PANES_JSON" | jq -r ".[$i].instance // .[$i].role")
     PANE=$(echo "$PANES_JSON" | jq -r ".[$i].pane")
     CLI=$(echo "$PANES_JSON" | jq -r ".[$i].cli")
     ALIAS=$(echo "$PANES_JSON" | jq -r ".[$i].alias // \"\"")
 
     # 匹配规则:
-    # 1. 角色名完全匹配
-    # 2. 别名匹配
-    # 3. 索引匹配
+    # 1. 实例名完全匹配
+    # 2. 角色名完全匹配
+    # 3. 别名匹配
+    # 4. 索引匹配
 
-    if [[ "$ROLE_INPUT" == "$ROLE" ]] || \
+    if [[ "$ROLE_INPUT" == "$INSTANCE" ]] || \
+       [[ "$ROLE_INPUT" == "$ROLE" ]] || \
        [[ -n "$ALIAS" && "$ROLE_INPUT" == "$ALIAS" ]] || \
        [[ "$ROLE_INPUT" == "$i" ]]; then
         TARGET_ROLE="$ROLE"
         TARGET_PANE="$PANE"
         TARGET_CLI="$CLI"
-        log_success "角色匹配成功: $ROLE (pane: $TARGET_PANE)"
+        log_success "匹配成功: $INSTANCE (角色: $ROLE, pane: $TARGET_PANE)"
         break
     fi
 done
 
 # 检查是否找到匹配
 if [[ -z "$TARGET_ROLE" ]]; then
-    log_error "无法匹配角色: $ROLE_INPUT"
+    log_error "无法匹配角色/实例: $ROLE_INPUT"
     echo ""
-    echo "可用角色:"
+    echo "可用实例:"
     for ((i=0; i<PANES_COUNT; i++)); do
         ROLE=$(echo "$PANES_JSON" | jq -r ".[$i].role")
+        INSTANCE=$(echo "$PANES_JSON" | jq -r ".[$i].instance // .[$i].role")
         PANE=$(echo "$PANES_JSON" | jq -r ".[$i].pane")
         ALIAS=$(echo "$PANES_JSON" | jq -r ".[$i].alias // \"\"")
         if [[ -n "$ALIAS" ]]; then
-            echo "  [$i] $ROLE (别名: $ALIAS) -> $PANE"
+            echo "  [$i] $INSTANCE (角色: $ROLE, 别名: $ALIAS) -> $PANE"
         else
-            echo "  [$i] $ROLE -> $PANE"
+            echo "  [$i] $INSTANCE (角色: $ROLE) -> $PANE"
         fi
     done
     exit 1
@@ -188,15 +192,13 @@ log_success "任务记录创建: $PENDING_FILE"
 
 log_info "发送任务到 pane: $SESSION_NAME:$TARGET_PANE"
 
-# 使用 tmux load-buffer + paste-buffer 发送任务
+# 使用原子发送（flock + 命名 buffer + paste-buffer + Enter）
 # 原因: send-keys 逐字符发送时，某些 CLI TUI（如 Claude Code）
 #        无法正确处理后续的 Enter 键提交。paste-buffer 一次性粘贴可避免此问题。
+# flock 防止并发发送同一 pane 时消息交错。
 SEND_TMP=$(mktemp "${RUNTIME_DIR}/.send-XXXXXX")
 printf '%s' "$TASK_CONTENT" > "$SEND_TMP"
-tmux load-buffer "$SEND_TMP"
-tmux paste-buffer -t "$SESSION_NAME:$TARGET_PANE"
-sleep 0.3
-tmux send-keys -t "$SESSION_NAME:$TARGET_PANE" Enter
+_pane_locked_paste_enter "$TARGET_PANE" "$SEND_TMP"
 rm -f "$SEND_TMP"
 
 # 等 pipe-pane 将输入文本刷入日志，确保偏移量跳过输入

@@ -9,16 +9,15 @@
 #   2. 按阶段 (stage) 顺序执行
 #   3. 同一阶段内的任务可以并行执行
 #   4. 跨阶段通过 swarm-relay.sh 自动传递结果
-#   5. 支持超时、失败处理、断点恢复
+#   5. 支持超时、失败处理、从指定阶段恢复
 #
 # 用法:
 #   swarm-workflow.sh <workflow.json> <需求描述> [选项]
 #   swarm-workflow.sh --status
-#   swarm-workflow.sh --resume <workflow_id>
 #
 # 选项:
 #   --timeout <秒>      单个任务超时 (默认: 300)
-#   --from-stage <N>    从第 N 阶段开始执行
+#   --from-stage <N>    从第 N 阶段开始执行（用于断点恢复）
 #   --dry-run           仅显示执行计划，不实际执行
 ################################################################################
 
@@ -34,6 +33,8 @@ readonly SESSION_NAME="${SWARM_SESSION:-swarm}"
 
 # 加载共享事件库
 source "${SCRIPT_DIR}/swarm-lib.sh"
+# 加载质量门模块（可选，用于 verify 字段）
+source "${SCRIPT_DIR}/lib/msg-quality-gate.sh" 2>/dev/null || true
 
 # 默认配置
 TASK_TIMEOUT=300
@@ -145,7 +146,12 @@ execute_task() {
         message="请完成以下任务: $requirement"
     fi
 
-    info "执行任务 [$task_id] → 角色: $role"
+    # 从 task_json 读取可选的 verify 和 max_retries
+    local verify_spec max_retries
+    verify_spec=$(echo "$task_json" | jq -r '.verify // empty')
+    max_retries=$(echo "$task_json" | jq -r '.max_retries // 1')
+
+    info "执行任务 [$task_id] → 角色: $role (max_retries=$max_retries)"
 
     if [[ "$DRY_RUN" == "true" ]]; then
         info "[DRY-RUN] 将发送给 $role: ${message:0:80}..."
@@ -153,52 +159,91 @@ execute_task() {
         return 0
     fi
 
-    # 发送任务
-    update_task_state "$wf_id" "$task_id" "processing"
-    "$SCRIPTS_DIR/swarm-send.sh" "$role" "$message" > /dev/null 2>&1
+    local attempt=0
+    while [[ $attempt -lt $max_retries ]]; do
+        ((attempt++))
+        [[ $attempt -gt 1 ]] && {
+            warn "重试 [$task_id] 第 $attempt 次..."
+            sleep $((attempt * 30))
+        }
 
-    # 等待完成（事件驱动，零轮询）
-    info "等待 $role 完成 [$task_id]..."
-    if "$SCRIPTS_DIR/swarm-events.sh" --wait task.completed \
-            --role "$role" --timeout "$timeout_val" > /dev/null 2>&1; then
-        success "任务 [$task_id] 完成"
-        update_task_state "$wf_id" "$task_id" "completed"
+        # 发送任务
+        update_task_state "$wf_id" "$task_id" "processing"
+        "$SCRIPTS_DIR/swarm-send.sh" "$role" "$message" > /dev/null 2>&1
 
-        # 捕获结果（优先从日志精确提取，无截断）
-        local log_file log_offset result
-        log_file=$(jq -r --arg q "$role" '
-            .panes[] | select(.role == $q) | .log
-        ' "$STATE_FILE")
+        # 等待完成（事件驱动，零轮询）
+        info "等待 $role 完成 [$task_id]..."
+        if "$SCRIPTS_DIR/swarm-events.sh" --wait task.completed \
+                --role "$role" --timeout "$timeout_val" > /dev/null 2>&1; then
+            success "任务 [$task_id] 完成 (第 $attempt 次尝试)"
 
-        # 从 task.sent 事件获取偏移量
-        log_offset=$(grep "\"task.sent\"" "$EVENTS_LOG" 2>/dev/null \
-            | grep "\"role\":\"$role\"" \
-            | tail -1 \
-            | jq -r '.data.log_offset // "0"')
+            # 捕获结果（优先从日志精确提取，无截断）
+            local log_file log_offset result
+            log_file=$(jq -r --arg q "$role" '
+                (.panes[] | select(.instance == $q) | .log) //
+                (.panes[] | select(.role == $q) | .log) //
+                empty
+            ' "$STATE_FILE" | head -1)
 
-        if [[ "$log_offset" != "0" ]] && [[ -f "$log_file" ]]; then
-            result=$(tail -c "+$((log_offset + 1))" "$log_file" 2>/dev/null \
-                | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
-                | grep -vE '^\s*$|^❯|^>|^›|Type your message')
+            # 从 task.sent 事件获取偏移量
+            log_offset=$(grep "\"task.sent\"" "$EVENTS_LOG" 2>/dev/null \
+                | grep "\"role\":\"$role\"" \
+                | tail -1 \
+                | jq -r '.data.log_offset // "0"')
+
+            if [[ "$log_offset" != "0" ]] && [[ -f "$log_file" ]]; then
+                result=$(tail -c "+$((log_offset + 1))" "$log_file" 2>/dev/null \
+                    | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+                    | grep -vE '^\s*$|^❯|^>|^›|Type your message')
+            else
+                # 回退到 pane 截屏
+                local pane_info
+                pane_info=$(jq -r --arg q "$role" '
+                    (.panes[] | select(.instance == $q) | .pane) //
+                    (.panes[] | select(.role == $q) | .pane) //
+                    empty
+                ' "$STATE_FILE" | head -1)
+                result=$(tmux capture-pane -t "${SESSION_NAME}:${pane_info}" -p -S -50 2>/dev/null \
+                    | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+                    | grep -vE '^\s*$|^❯|^>|^›|Type your message' \
+                    | tail -30)
+            fi
+
+            # 可选质量门（verify 字段非空时执行）
+            if [[ -n "$verify_spec" ]] && type _run_quality_gate &>/dev/null; then
+                local send_task_id
+                send_task_id=$(grep "\"task.sent\"" "$EVENTS_LOG" 2>/dev/null \
+                    | grep "\"role\":\"$role\"" \
+                    | tail -1 \
+                    | jq -r '.data.task_id // ""')
+                if [[ -n "$send_task_id" ]]; then
+                    local task_file="$TASKS_DIR/processing/$send_task_id.json"
+                    if [[ -f "$task_file" ]]; then
+                        # 注入 verify 字段供质量门读取
+                        local verify_json
+                        verify_json=$(echo "$task_json" | jq -c '.verify')
+                        jq --argjson v "$verify_json" '.verify = $v' "$task_file" > "${task_file}.tmp" \
+                            && mv "${task_file}.tmp" "$task_file"
+                        if ! _run_quality_gate "$send_task_id" "$role"; then
+                            warn "[$task_id] 质量门未通过"
+                            continue  # 重试
+                        fi
+                    fi
+                fi
+            fi
+
+            save_task_result "$wf_id" "$task_id" "$result"
+            update_task_state "$wf_id" "$task_id" "completed"
+            return 0
         else
-            # 回退到 pane 截屏
-            local pane_info
-            pane_info=$(jq -r --arg q "$role" '
-                .panes[] | select(.role == $q) | .pane
-            ' "$STATE_FILE")
-            result=$(tmux capture-pane -t "${SESSION_NAME}:${pane_info}" -p -S -50 2>/dev/null \
-                | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
-                | grep -vE '^\s*$|^❯|^>|^›|Type your message' \
-                | tail -30)
+            warn "任务 [$task_id] 第 $attempt 次尝试超时"
+            continue
         fi
+    done
 
-        save_task_result "$wf_id" "$task_id" "$result"
-        return 0
-    else
-        warn "任务 [$task_id] 超时！"
-        update_task_state "$wf_id" "$task_id" "timeout"
-        return 1
-    fi
+    warn "任务 [$task_id] 重试 $max_retries 次后仍失败"
+    update_task_state "$wf_id" "$task_id" "failed"
+    return 1
 }
 
 # ============================================================================
@@ -339,7 +384,7 @@ run_workflow() {
         echo -e "\033[1;33m╔══════════════════════════════════════════════════╗\033[0m"
         echo -e "\033[1;33m║  工作流执行中止（部分完成）\033[0m"
         echo -e "\033[1;33m║  ID: $wf_id\033[0m"
-        echo -e "\033[1;33m║  使用 --resume 恢复: swarm-workflow.sh --resume $wf_id\033[0m"
+        echo -e "\033[1;33m║  使用 --from-stage 恢复: swarm-workflow.sh <workflow.json> <需求> --from-stage N\033[0m"
         echo -e "\033[1;33m╚══════════════════════════════════════════════════╝\033[0m"
 
         # 发射工作流失败事件
@@ -388,11 +433,10 @@ swarm-workflow - 多 CLI 工作流引擎
 用法:
   swarm-workflow.sh <workflow.json> <需求描述> [选项]
   swarm-workflow.sh --status
-  swarm-workflow.sh --resume <workflow_id>
 
 选项:
   --timeout <秒>      单任务超时 (默认: 300)
-  --from-stage <N>    从第 N 阶段开始
+  --from-stage <N>    从第 N 阶段开始（用于断点恢复）
   --dry-run           试运行（不实际执行）
   --help              帮助
 
@@ -403,7 +447,7 @@ swarm-workflow - 多 CLI 工作流引擎
   # 试运行
   swarm-workflow.sh workflows/feature-complete.json "实现登录" --dry-run
 
-  # 从第 3 阶段恢复
+  # 从第 3 阶段恢复（工作流中止后使用）
   swarm-workflow.sh workflows/feature-complete.json "实现登录" --from-stage 3
 EOF
 }
@@ -418,6 +462,7 @@ main() {
             --dry-run)    DRY_RUN=true; shift ;;
             --status)     show_status; exit 0 ;;
             --help|-h)    show_help; exit 0 ;;
+            --resume)     die "--resume 已移除，请使用 --from-stage N 从指定阶段恢复" ;;
             -*)           die "未知选项: $1" ;;
             *)
                 if [[ -z "$wf_file" ]]; then

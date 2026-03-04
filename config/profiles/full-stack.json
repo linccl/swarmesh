@@ -1,6 +1,6 @@
 {
   "name": "全栈开发团队",
-  "description": "包含全部 13 个角色的完整配置 - 覆盖开发、质量、管理全流程",
+  "description": "包含全部 14 个角色的完整配置 - 覆盖需求、开发、质量、管理全流程",
   "version": "1.0.0",
   "created": "2026-02-12",
   "roles": [
@@ -93,10 +93,18 @@
       "description": "审核专家，负责代码规范审核、标准符合性验证和发布检查"
     },
     {
+      "name": "prd",
+      "cli": "claude chat",
+      "config": "management/prd.md",
+      "alias": "pm,prd,product,11",
+      "title": "产品经理",
+      "description": "产品经理，负责需求分析、用户故事编写、优先级排序和需求澄清"
+    },
+    {
       "name": "supervisor",
       "cli": "claude chat",
       "config": "management/supervisor.md",
-      "alias": "sup,supervisor,11",
+      "alias": "sup,supervisor,12",
       "title": "编排者",
       "description": "编排者，负责任务拆解、角色调度、进度监控和跨角色协调"
     },
@@ -104,7 +112,7 @@
       "name": "inspector",
       "cli": "claude chat",
       "config": "management/inspector.md",
-      "alias": "insp,inspector,12",
+      "alias": "insp,inspector,13",
       "title": "督查员",
       "description": "督查员，负责任务验收、质量把关、返工决策和风险预警"
     }
@@ -129,7 +137,7 @@
     "team_composition": {
       "core_dev": ["frontend", "backend", "database", "devops"],
       "quality": ["tester", "security", "performance", "reviewer"],
-      "management": ["ui-designer", "architect", "auditor", "supervisor", "inspector"]
+      "management": ["prd", "ui-designer", "architect", "auditor", "supervisor", "inspector"]
     }
   }
 }

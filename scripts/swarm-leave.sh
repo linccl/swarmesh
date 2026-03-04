@@ -84,14 +84,21 @@ command -v jq &>/dev/null   || die "需要安装 jq"
 [[ -f "$STATE_FILE" ]] || die "state.json 不存在"
 tmux has-session -t "$SESSION_NAME" 2>/dev/null || die "Session '$SESSION_NAME' 不存在"
 
-# 查找角色信息
-ROLE_INFO=$(jq -r --arg role "$ROLE" '
-    .panes[] | select(.role == $role or (.alias // "" | split(",") | map(gsub("^\\s+|\\s+$"; "")) | index($role) != null))
-' "$STATE_FILE" 2>/dev/null)
+# 查找角色/实例信息（优先匹配 instance，回退到 role/alias）
+ROLE_INFO=$(jq -r --arg q "$ROLE" '
+    .panes[] | select(.instance == $q)
+' "$STATE_FILE" 2>/dev/null | head -1)
 
-[[ -n "$ROLE_INFO" ]] || die "找不到角色: $ROLE"
+if [[ -z "$ROLE_INFO" ]]; then
+    ROLE_INFO=$(jq -r --arg q "$ROLE" '
+        .panes[] | select(.role == $q or (.alias // "" | split(",") | map(gsub("^\\s+|\\s+$"; "")) | index($q) != null))
+    ' "$STATE_FILE" 2>/dev/null | head -1)
+fi
+
+[[ -n "$ROLE_INFO" ]] || die "找不到角色/实例: $ROLE"
 
 ROLE_NAME=$(echo "$ROLE_INFO" | jq -r '.role')
+INSTANCE_NAME=$(echo "$ROLE_INFO" | jq -r '.instance // .role')
 PANE_TARGET=$(echo "$ROLE_INFO" | jq -r '.pane')
 CLI_CMD=$(echo "$ROLE_INFO" | jq -r '.cli')
 WATCHER_PID=$(echo "$ROLE_INFO" | jq -r '.watcher_pid // 0')
@@ -107,7 +114,7 @@ PROJECT_DIR=$(jq -r '.project // ""' "$STATE_FILE" 2>/dev/null)
 
 if [[ "$FORCE" == false ]]; then
     echo ""
-    echo "即将移除角色: $ROLE_NAME"
+    echo "即将移除实例: $INSTANCE_NAME (角色: $ROLE_NAME)"
     echo "  Pane: $SESSION_NAME:$PANE_TARGET"
     echo "  CLI:  $CLI_CMD"
     [[ -n "$REASON" ]] && echo "  原因: $REASON"
@@ -123,7 +130,7 @@ fi
 # 执行移除
 # =============================================================================
 
-log_info "移除角色: $ROLE_NAME..."
+log_info "移除实例: $INSTANCE_NAME (角色: $ROLE_NAME)..."
 
 # 1. 停止 watcher 进程
 if [[ "$WATCHER_PID" != "0" ]] && kill -0 "$WATCHER_PID" 2>/dev/null; then
@@ -150,8 +157,8 @@ fi
 
 # 4. 更新 state.json（flock 加锁，避免并发竞态）
 state_json_update \
-    '.panes = [.panes[] | select(.role != $role)]' \
-    --arg role "$ROLE_NAME"
+    '.panes = [.panes[] | select(.instance != $inst)]' \
+    --arg inst "$INSTANCE_NAME"
 log_info "state.json 已更新"
 
 # 5. 刷新所有角色的持久上下文（团队成员变化了）
@@ -159,29 +166,30 @@ log_info "刷新持久上下文..."
 refresh_all_contexts "$STATE_FILE"
 
 # 6. 归档该角色的消息到 outbox
-if [[ -d "$MESSAGES_DIR/inbox/$ROLE_NAME" ]]; then
-    mkdir -p "$MESSAGES_DIR/outbox/$ROLE_NAME"
-    for f in "$MESSAGES_DIR/inbox/$ROLE_NAME"/*.json; do
-        [[ -f "$f" ]] && mv "$f" "$MESSAGES_DIR/outbox/$ROLE_NAME/"
+if [[ -d "$MESSAGES_DIR/inbox/$INSTANCE_NAME" ]]; then
+    mkdir -p "$MESSAGES_DIR/outbox/$INSTANCE_NAME"
+    for f in "$MESSAGES_DIR/inbox/$INSTANCE_NAME"/*.json; do
+        [[ -f "$f" ]] && mv "$f" "$MESSAGES_DIR/outbox/$INSTANCE_NAME/"
     done
-    rmdir "$MESSAGES_DIR/inbox/$ROLE_NAME" 2>/dev/null || true
+    rmdir "$MESSAGES_DIR/inbox/$INSTANCE_NAME" 2>/dev/null || true
     log_info "收件箱消息已归档"
 fi
 
 # 7. 通知其他角色（使用共享双通道通知函数）
 notify_all_roles "leave" \
-    "角色 $ROLE_NAME 已离开蜂群。${REASON:+原因: $REASON。}该角色的职责需要由其他成员承担，执行 swarm-msg.sh list-roles 查看当前团队。" \
-    "[Swarm 系统通知] $ROLE_NAME 已离开蜂群。${REASON:+原因: $REASON。}执行 swarm-msg.sh list-roles 查看当前团队。"
+    "实例 $INSTANCE_NAME (角色: $ROLE_NAME) 已离开蜂群。${REASON:+原因: $REASON。}该角色的职责需要由其他成员承担，执行 swarm-msg.sh list-roles 查看当前团队。" \
+    "[Swarm 系统通知] $INSTANCE_NAME (角色: $ROLE_NAME) 已离开蜂群。${REASON:+原因: $REASON。}执行 swarm-msg.sh list-roles 查看当前团队。" \
+    "$INSTANCE_NAME"
 
 # 8. 发射事件
-emit_event "role.left" "$ROLE_NAME" "reason=${REASON:-manual}" "pane=$PANE_TARGET"
+emit_event "role.left" "$INSTANCE_NAME" "reason=${REASON:-manual}" "pane=$PANE_TARGET" "role=$ROLE_NAME"
 
 # =============================================================================
 # 完成
 # =============================================================================
 
-log_success "角色 $ROLE_NAME 已移除!"
+log_success "实例 $INSTANCE_NAME (角色: $ROLE_NAME) 已移除!"
 echo ""
-echo "当前剩余角色:"
-jq -r '.panes[] | "  - \(.role) -> pane \(.pane)"' "$STATE_FILE"
+echo "当前剩余实例:"
+jq -r '.panes[] | "  - \(.instance // .role) (角色: \(.role)) -> pane \(.pane)"' "$STATE_FILE"
 echo ""

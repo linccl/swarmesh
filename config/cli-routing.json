@@ -43,10 +43,14 @@
     },
     "architecture": {
       "*":           { "recommended": "claude",  "fallback": "codex" }
+    },
+    "analysis": {
+      "*":           { "recommended": "claude",  "fallback": "codex" }
     }
   },
   "override_hints": {
     "simple-crud":       "codex",
+    "requirement-analysis": "claude",
     "complex-state":     "claude",
     "css-heavy":         "gemini",
     "performance-tuning":"claude",
