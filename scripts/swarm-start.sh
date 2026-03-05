@@ -15,25 +15,18 @@ set -euo pipefail
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-CONFIG_DIR="${CONFIG_DIR:-$SWARM_ROOT/config}"
-RUNTIME_DIR="${RUNTIME_DIR:-$SWARM_ROOT/runtime}"
-LOGS_DIR="${LOGS_DIR:-$RUNTIME_DIR/logs}"
-TASKS_DIR="${TASKS_DIR:-$RUNTIME_DIR/tasks}"
-SCRIPTS_DIR="${SCRIPTS_DIR:-$SWARM_ROOT/scripts}"
-SESSION_NAME="${SWARM_SESSION:-swarm}"
+
+# 加载共享事件库（统一路径管理）
+source "${SCRIPT_DIR}/swarm-lib.sh"
+
 LAYOUT="${LAYOUT:-even-horizontal}"
 DEFAULT_PROFILE="${DEFAULT_PROFILE:-minimal}"
 PROFILES_DIR="${PROFILES_DIR:-$CONFIG_DIR/profiles}"
-STATE_FILE="${STATE_FILE:-$RUNTIME_DIR/state.json}"
 
 # PANES_PER_WINDOW 由 config/defaults.conf 统一定义
 
 # CLI 启动等待时间（秒）
 CLI_STARTUP_WAIT="${CLI_STARTUP_WAIT:-3}"
-
-# 加载共享事件库
-source "${SCRIPT_DIR}/swarm-lib.sh"
 
 # =============================================================================
 # 参数解析
@@ -136,6 +129,7 @@ resume_swarm() {
 
     # 设置全局变量供后续函数使用
     PROJECT_DIR="$r_project"
+    _reinit_runtime_paths   # 重算运行时路径到项目 .swarm/runtime/
     LAYOUT="$r_layout"
     PANES_PER_WINDOW="$r_panes_per_window"
     MAX_CLI="$r_max_cli"
@@ -220,9 +214,12 @@ resume_swarm() {
         done
     fi
 
-    # 确保 .swarm-worktrees 在 .gitignore 中
+    # 确保 .swarm-worktrees 和 .swarm/runtime 在 .gitignore 中
     if ! grep -q '\.swarm-worktrees' "$r_project/.gitignore" 2>/dev/null; then
         echo '.swarm-worktrees/' >> "$r_project/.gitignore"
+    fi
+    if ! grep -q '\.swarm/runtime' "$r_project/.gitignore" 2>/dev/null; then
+        echo '.swarm/runtime/' >> "$r_project/.gitignore"
     fi
 
     # =========================================================================
@@ -296,9 +293,9 @@ resume_swarm() {
         fi
         log_info "      Worktree: $ROLE_WORKTREE (branch: $BRANCH)"
 
-        # --- 9c. 启动 CLI ---
+        # --- 9c. 启动 CLI ---（导出 RUNTIME_DIR 和 SWARM_SESSION 确保 pane 内脚本找到正确路径）
         tmux send-keys -t "$SESSION_NAME:$PANE_TARGET" \
-            "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && $CLI" C-m
+            "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && export RUNTIME_DIR=\"$RUNTIME_DIR\" && export SWARM_SESSION=\"$SESSION_NAME\" && $CLI" C-m
         sleep "$CLI_STARTUP_WAIT"
         sleep 0.5
 
@@ -454,6 +451,11 @@ resume_swarm() {
 }
 
 if [[ "${RESUME}" == "true" ]]; then
+    # 如果用户同时传了 --project，先重算路径确保 STATE_FILE 指向正确位置
+    if [[ -n "$PROJECT_DIR" ]]; then
+        PROJECT_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd)" || die "项目目录不存在: $PROJECT_DIR"
+        _reinit_runtime_paths
+    fi
     resume_swarm
     die "resume_swarm 意外返回"  # exit 0 失败时兜底
 fi
@@ -462,6 +464,7 @@ fi
 [[ -n "$PROJECT_DIR" ]] || die "请指定项目目录 (--project <路径>)"
 # 转为绝对路径
 PROJECT_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd)" || die "项目目录不存在: $PROJECT_DIR"
+_reinit_runtime_paths  # 重算运行时路径到项目 .swarm/runtime/
 load_project_config  # 加载项目级配置覆盖
 
 # =============================================================================
@@ -517,10 +520,14 @@ if [[ -d "$WORKTREE_DIR" ]]; then
     rm -rf "$WORKTREE_DIR"
 fi
 
-# 确保 .swarm-worktrees 在 .gitignore 中
+# 确保 .swarm-worktrees 和 .swarm/runtime 在 .gitignore 中
 if ! grep -q '\.swarm-worktrees' "$PROJECT_DIR/.gitignore" 2>/dev/null; then
     echo '.swarm-worktrees/' >> "$PROJECT_DIR/.gitignore"
     log_info ".swarm-worktrees/ 已添加到 .gitignore"
+fi
+if ! grep -q '\.swarm/runtime' "$PROJECT_DIR/.gitignore" 2>/dev/null; then
+    echo '.swarm/runtime/' >> "$PROJECT_DIR/.gitignore"
+    log_info ".swarm/runtime/ 已添加到 .gitignore"
 fi
 
 # 清理旧日志
@@ -671,8 +678,8 @@ for ((i=0; i<ROLES_COUNT; i++)); do
     fi
     log_info "      Worktree: $ROLE_WORKTREE (branch: $ROLE_BRANCH)"
 
-    # 在角色的 worktree 目录启动 CLI
-    tmux send-keys -t "$SESSION_NAME:$PANE_TARGET" "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && $CLI" C-m
+    # 在角色的 worktree 目录启动 CLI（导出 RUNTIME_DIR 和 SWARM_SESSION 确保 pane 内脚本找到正确路径）
+    tmux send-keys -t "$SESSION_NAME:$PANE_TARGET" "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && export RUNTIME_DIR=\"$RUNTIME_DIR\" && export SWARM_SESSION=\"$SESSION_NAME\" && $CLI" C-m
 
     # 等待 CLI 启动
     sleep "$CLI_STARTUP_WAIT"

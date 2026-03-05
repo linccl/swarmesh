@@ -26,9 +26,7 @@ set -euo pipefail
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-RUNTIME_DIR="${RUNTIME_DIR:-$SWARM_ROOT/runtime}"
-EVENTS_LOG="${EVENTS_LOG:-$RUNTIME_DIR/events.jsonl}"
+source "${SCRIPT_DIR}/swarm-lib.sh"
 
 # 模式
 MODE=""

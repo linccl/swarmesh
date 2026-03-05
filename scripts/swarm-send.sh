@@ -12,21 +12,7 @@ set -euo pipefail
 # 配置参数 (可通过环境变量覆盖)
 # =============================================================================
 
-# 从脚本位置推导项目根目录
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-
-# 目录结构
-RUNTIME_DIR="${RUNTIME_DIR:-$SWARM_ROOT/runtime}"
-TASKS_DIR="${TASKS_DIR:-$RUNTIME_DIR/tasks}"
-
-# Tmux session 配置
-SESSION_NAME="${SWARM_SESSION:-swarm}"
-
-# 状态文件
-STATE_FILE="${STATE_FILE:-$RUNTIME_DIR/state.json}"
-
-# 加载共享事件库
 source "${SCRIPT_DIR}/swarm-lib.sh"
 
 # 获取 Unix 时间戳（swarm-lib.sh 未提供此函数）
@@ -108,6 +94,7 @@ log_info "解析角色: $ROLE_INPUT"
 TARGET_ROLE=""
 TARGET_PANE=""
 TARGET_CLI=""
+TARGET_INSTANCE=""
 
 # 尝试匹配角色/实例
 for ((i=0; i<PANES_COUNT; i++)); do
@@ -130,6 +117,7 @@ for ((i=0; i<PANES_COUNT; i++)); do
         TARGET_ROLE="$ROLE"
         TARGET_PANE="$PANE"
         TARGET_CLI="$CLI"
+        TARGET_INSTANCE="$INSTANCE"
         log_success "匹配成功: $INSTANCE (角色: $ROLE, pane: $TARGET_PANE)"
         break
     fi
@@ -163,21 +151,53 @@ log_info "创建任务记录..."
 # 生成任务 ID
 TASK_ID="task-$(get_unix_timestamp)-$$-${RANDOM}"
 
-# 创建任务 JSON
+# 加载项目配置以获取 TASK_MAX_RETRIES
+load_project_config 2>/dev/null || log_warn "load_project_config 失败，使用默认配置"
+# 确保 TASK_MAX_RETRIES 是整数
+TASK_MAX_RETRIES=$(( ${TASK_MAX_RETRIES:-3} + 0 )) 2>/dev/null || TASK_MAX_RETRIES=3
+
+# 创建任务 JSON（与 cmd_publish 结构对齐，确保看门狗可监管）
 TASK_JSON=$(jq -n \
     --arg id "$TASK_ID" \
+    --arg type "direct" \
+    --arg from "human" \
     --arg role "$TARGET_ROLE" \
+    --arg instance "$TARGET_INSTANCE" \
     --arg pane "$TARGET_PANE" \
-    --arg task "$TASK_CONTENT" \
+    --arg title "$TASK_CONTENT" \
+    --arg description "$TASK_CONTENT" \
     --arg created_at "$(get_timestamp)" \
     --arg status "pending" \
+    --argjson max_retries "${TASK_MAX_RETRIES:-3}" \
     '{
         id: $id,
+        type: $type,
+        from: $from,
         role: $role,
         pane: $pane,
-        task: $task,
+        title: $title,
+        description: $description,
+        assigned_to: $instance,
         created_at: $created_at,
-        status: $status
+        status: $status,
+        claimed_by: null,
+        claimed_at: null,
+        completed_at: null,
+        result: null,
+        priority: "normal",
+        group_id: "",
+        depends_on: [],
+        blocked: false,
+        verify: null,
+        retry_count: 0,
+        max_retries: $max_retries,
+        failed_at: null,
+        fail_reason: null,
+        retry_history: [],
+        parent_task: null,
+        subtasks: [],
+        split_status: null,
+        depth: 0
     }')
 
 # 保存任务到 pending 目录
@@ -223,11 +243,13 @@ log_info "更新任务状态: pending -> processing"
 # 移动任务文件
 PROCESSING_FILE="$TASKS_DIR/processing/$TASK_ID.json"
 
-# 更新状态字段
+# 更新状态字段（补齐 claimed_by/claimed_at 供看门狗监管）
 UPDATED_TASK_JSON=$(echo "$TASK_JSON" | jq \
     --arg status "processing" \
     --arg sent_at "$(get_timestamp)" \
-    '. + {status: $status, sent_at: $sent_at}')
+    --arg claimed_by "$TARGET_INSTANCE" \
+    --arg claimed_at "$(get_timestamp)" \
+    '. + {status: $status, sent_at: $sent_at, claimed_by: $claimed_by, claimed_at: $claimed_at}')
 
 echo "$UPDATED_TASK_JSON" | jq '.' > "$PROCESSING_FILE"
 rm -f "$PENDING_FILE"

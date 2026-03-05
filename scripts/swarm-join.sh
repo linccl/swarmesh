@@ -28,20 +28,10 @@ set -euo pipefail
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-CONFIG_DIR="${CONFIG_DIR:-$SWARM_ROOT/config}"
-RUNTIME_DIR="${RUNTIME_DIR:-$SWARM_ROOT/runtime}"
-LOGS_DIR="${LOGS_DIR:-$RUNTIME_DIR/logs}"
-MESSAGES_DIR="${MESSAGES_DIR:-$RUNTIME_DIR/messages}"
-SCRIPTS_DIR="${SCRIPTS_DIR:-$SWARM_ROOT/scripts}"
-STATE_FILE="${STATE_FILE:-$RUNTIME_DIR/state.json}"
-SESSION_NAME="${SWARM_SESSION:-swarm}"
+source "${SCRIPT_DIR}/swarm-lib.sh"
 
 # CLI 启动等待时间
 CLI_STARTUP_WAIT="${CLI_STARTUP_WAIT:-3}"
-
-# 加载共享事件库
-source "${SCRIPT_DIR}/swarm-lib.sh"
 
 # =============================================================================
 # 参数解析
@@ -245,8 +235,8 @@ else
 fi
 log_info "Worktree: $ROLE_WORKTREE (branch: $ROLE_BRANCH)"
 
-# 在角色的 worktree 目录启动 CLI
-tmux send-keys -t "$SESSION_NAME:$PANE_TARGET" "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && $CLI_CMD" C-m
+# 在角色的 worktree 目录启动 CLI（导出 RUNTIME_DIR 和 SWARM_SESSION 确保 pane 内脚本找到正确路径）
+tmux send-keys -t "$SESSION_NAME:$PANE_TARGET" "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && export RUNTIME_DIR=\"$RUNTIME_DIR\" && export SWARM_SESSION=\"$SESSION_NAME\" && $CLI_CMD" C-m
 
 sleep "$CLI_STARTUP_WAIT"
 

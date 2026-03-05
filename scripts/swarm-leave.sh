@@ -24,14 +24,6 @@ set -euo pipefail
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-RUNTIME_DIR="${RUNTIME_DIR:-$SWARM_ROOT/runtime}"
-MESSAGES_DIR="${MESSAGES_DIR:-$RUNTIME_DIR/messages}"
-LOGS_DIR="${LOGS_DIR:-$RUNTIME_DIR/logs}"
-SCRIPTS_DIR="${SCRIPTS_DIR:-$SWARM_ROOT/scripts}"
-STATE_FILE="${STATE_FILE:-$RUNTIME_DIR/state.json}"
-SESSION_NAME="${SWARM_SESSION:-swarm}"
-
 source "${SCRIPT_DIR}/swarm-lib.sh"
 
 # =============================================================================

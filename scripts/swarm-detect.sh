@@ -26,11 +26,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-readonly SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-readonly STATE_FILE="${SWARM_ROOT}/runtime/state.json"
-readonly SESSION_NAME="${SWARM_SESSION:-swarm}"
-
-# 加载共享事件库
 source "${SCRIPT_DIR}/swarm-lib.sh"
 
 # 默认配置

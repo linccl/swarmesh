@@ -17,7 +17,10 @@ _SWARM_LIB_LOADED=1
 # 公共路径变量（不覆盖已有值）
 # =============================================================================
 
-# 从脚本位置推导项目根目录（scripts/ 的父目录）
+# 保存环境显式设置的值（区分"用户设了"vs"脚本默认"）
+_RUNTIME_DIR_FROM_ENV="${RUNTIME_DIR:-}"
+
+# 从脚本位置推导框架根目录（scripts/ 的父目录）
 if [[ -z "${SWARM_ROOT:-}" ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
         SWARM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,15 +28,63 @@ if [[ -z "${SWARM_ROOT:-}" ]]; then
         SWARM_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
     fi
 fi
-RUNTIME_DIR="${RUNTIME_DIR:-$SWARM_ROOT/runtime}"
+
+# 从 CWD 向上查找 .swarm/runtime/state.json，定位项目根目录
+_detect_project_from_cwd() {
+    local dir="$(pwd)"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -f "$dir/.swarm/runtime/state.json" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+# 根据 PROJECT_DIR 重算所有运行时路径（swarm-start.sh 解析 --project 后调用）
+_reinit_runtime_paths() {
+    [[ -n "${PROJECT_DIR:-}" ]] || return 0
+    RUNTIME_DIR="$PROJECT_DIR/.swarm/runtime"
+    MESSAGES_DIR="$RUNTIME_DIR/messages"
+    INBOX_DIR="$MESSAGES_DIR/inbox"
+    OUTBOX_DIR="$MESSAGES_DIR/outbox"
+    LOGS_DIR="$RUNTIME_DIR/logs"
+    TASKS_DIR="$RUNTIME_DIR/tasks"
+    STATE_FILE="$RUNTIME_DIR/state.json"
+    EVENTS_LOG="$RUNTIME_DIR/events.jsonl"
+    SESSION_NAME="${SWARM_SESSION:-swarm-$(basename "$PROJECT_DIR")}"
+}
+
+# 路径优先级：环境变量 > 项目检测 > 框架回退
+if [[ -n "$_RUNTIME_DIR_FROM_ENV" ]]; then
+    RUNTIME_DIR="$_RUNTIME_DIR_FROM_ENV"
+elif [[ -n "${PROJECT_DIR:-}" ]]; then
+    RUNTIME_DIR="$PROJECT_DIR/.swarm/runtime"
+elif _auto_project=$(_detect_project_from_cwd 2>/dev/null); then
+    PROJECT_DIR="$_auto_project"
+    RUNTIME_DIR="$PROJECT_DIR/.swarm/runtime"
+else
+    RUNTIME_DIR="$SWARM_ROOT/runtime"
+fi
+
+# SESSION_NAME：有项目时带项目名
+if [[ -n "${PROJECT_DIR:-}" ]]; then
+    SESSION_NAME="${SWARM_SESSION:-swarm-$(basename "$PROJECT_DIR")}"
+else
+    SESSION_NAME="${SWARM_SESSION:-swarm}"
+fi
+
+# 后续依赖路径（基于正确的 RUNTIME_DIR）
 SCRIPTS_DIR="${SCRIPTS_DIR:-$SWARM_ROOT/scripts}"
 CONFIG_DIR="${CONFIG_DIR:-$SWARM_ROOT/config}"
 MESSAGES_DIR="${MESSAGES_DIR:-$RUNTIME_DIR/messages}"
+INBOX_DIR="${INBOX_DIR:-$MESSAGES_DIR/inbox}"
+OUTBOX_DIR="${OUTBOX_DIR:-$MESSAGES_DIR/outbox}"
 LOGS_DIR="${LOGS_DIR:-$RUNTIME_DIR/logs}"
 TASKS_DIR="${TASKS_DIR:-$RUNTIME_DIR/tasks}"
 STATE_FILE="${STATE_FILE:-$RUNTIME_DIR/state.json}"
 EVENTS_LOG="${EVENTS_LOG:-$RUNTIME_DIR/events.jsonl}"
-SESSION_NAME="${SWARM_SESSION:-swarm}"
 
 # =============================================================================
 # 加载配置（优先级：框架默认 < 项目覆盖 < 环境变量）
@@ -612,6 +663,89 @@ notify_all_roles() {
 }
 
 # =============================================================================
+# 统一通知系统
+# =============================================================================
+
+# 从配置读取投递规则
+# 参数: $1 - 通知类别 (如 "task.published")
+# 返回: "dual" 或 "inbox_only"
+_get_delivery_rule() {
+    local category="$1"
+    local policy_file="${SWARM_ROOT}/config/notification-policy.json"
+    if [[ -f "$policy_file" ]]; then
+        local rule
+        rule=$(jq -r --arg cat "$category" '.delivery_rules[$cat] // .delivery_rules["default"] // "dual"' "$policy_file" 2>/dev/null)
+        case "${rule:-dual}" in
+            dual|inbox_only) echo "$rule" ;;
+            *) log_warn "[_get_delivery_rule] 未知规则: $rule (类别: $category)，回退到 dual"; echo "dual" ;;
+        esac
+    else
+        echo "dual"
+    fi
+}
+
+# 统一通知入口：所有脚本内部的通知都通过此函数发送
+# 参数:
+#   $1 - 目标实例名 (如 "supervisor", "backend", "backend-2")
+#   $2 - 通知内容
+#   $3 - 通知类别 (如 "task.published", "task.claimed", "gate.failed")
+#   $4 - 优先级 (low/normal/high，默认 normal)
+_unified_notify() {
+    local to="$1" content="$2" category="${3:-default}" priority="${4:-normal}"
+
+    # 守卫：过滤无效目标
+    if [[ -z "$to" || "$to" == "null" ]]; then
+        log_warn "[_unified_notify] 无效目标: to='$to' category=$category，跳过"
+        return 0
+    fi
+
+    # 解析目标 pane
+    local target_pane
+    target_pane=$(_resolve_pane_by_id "$to")
+
+    # 通道 1: 始终写 inbox（持久、可追踪）
+    local notify_id="notify-${category//\./-}-$(date +%s)-$$-${RANDOM}"
+    local my_instance="${SWARM_INSTANCE:-${SWARM_ROLE:-system}}"
+    mkdir -p "${MESSAGES_DIR}/inbox/${to}"
+    if ! jq -n \
+        --arg id "$notify_id" \
+        --arg from "$my_instance" \
+        --arg to "$to" \
+        --arg content "$content" \
+        --arg timestamp "$(get_timestamp)" \
+        --arg priority "$priority" \
+        --arg category "$category" \
+        '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:"pending", reply_to:null, priority:$priority, category:$category}' \
+        > "${MESSAGES_DIR}/inbox/${to}/${notify_id}.json" 2>/dev/null; then
+        log_warn "[_unified_notify] inbox 写入失败: to=$to category=$category"
+    fi
+
+    # 通道 2: 根据投递策略决定是否 push 到 pane
+    if [[ -n "$target_pane" && "$target_pane" != "null" ]]; then
+        local delivery
+        delivery=$(_get_delivery_rule "$category")
+        if [[ "$delivery" == "dual" ]]; then
+            push_to_pane "$target_pane" "$content" 2>/dev/null || true
+        fi
+    fi
+}
+
+# 批量通知：向多个目标发送相同通知
+# 参数:
+#   $1 - 通知内容
+#   $2 - 通知类别
+#   $3 - 优先级
+#   stdin - 目标列表 (每行一个 instance 名，或 "instance|pane" 格式，pane 字段被忽略)
+_unified_notify_multi() {
+    local content="$1" category="${2:-default}" priority="${3:-normal}"
+    local to _unused
+    while IFS='|' read -r to _unused; do
+        [[ -z "$to" ]] && continue
+        _unified_notify "$to" "$content" "$category" "$priority"
+    done
+}
+
+# =============================================================================
 # state.json 原子更新（flock 文件锁）
 # =============================================================================
 
@@ -1141,15 +1275,8 @@ _notify_supervisor_completion() {
 # 通知 inspector 某角色已停滞
 _notify_inspector_stall() {
     local instance="$1" elapsed="$2"
-    local inspector_pane
-    inspector_pane=$(_resolve_pane_by_id "inspector") || return 0
-    [[ -z "$inspector_pane" || "$inspector_pane" == "null" ]] && return 0
     local msg="[STALL] 实例 $instance 已停滞 ${elapsed}s 无输出，请检查"
-    local tmp
-    tmp=$(mktemp "${RUNTIME_DIR}/.stall-XXXXXX")
-    printf '%s' "$msg" > "$tmp"
-    _pane_locked_paste_enter "$inspector_pane" "$tmp" 2>/dev/null || true
-    rm -f "$tmp"
+    _unified_notify "inspector" "$msg" "stall.detected"
 }
 
 # =============================================================================

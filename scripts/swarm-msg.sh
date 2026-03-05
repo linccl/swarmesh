@@ -31,16 +31,6 @@ set -euo pipefail
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-RUNTIME_DIR="${RUNTIME_DIR:-$SWARM_ROOT/runtime}"
-MESSAGES_DIR="${MESSAGES_DIR:-$RUNTIME_DIR/messages}"
-INBOX_DIR="${INBOX_DIR:-$MESSAGES_DIR/inbox}"
-OUTBOX_DIR="${OUTBOX_DIR:-$MESSAGES_DIR/outbox}"
-TASKS_DIR="${TASKS_DIR:-$RUNTIME_DIR/tasks}"
-STATE_FILE="${STATE_FILE:-$RUNTIME_DIR/state.json}"
-SESSION_NAME="${SWARM_SESSION:-swarm}"
-
-# 加载共享事件库
 source "${SCRIPT_DIR}/swarm-lib.sh"
 
 # 加载子模块
@@ -145,7 +135,9 @@ push_to_pane() {
     trap "rm -f '$tmp_file'" RETURN
     printf '%s' "$notification" > "$tmp_file"
 
-    _pane_locked_paste_enter "$pane_target" "$tmp_file"
+    if ! _pane_locked_paste_enter "$pane_target" "$tmp_file" 2>/dev/null; then
+        log_warn "[push_to_pane] paste-buffer 失败: pane=$pane_target"
+    fi
 }
 
 # =============================================================================

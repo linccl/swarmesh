@@ -37,14 +37,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-readonly SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-readonly SCRIPTS_DIR="${SWARM_ROOT}/scripts"
-readonly STATE_FILE="${SWARM_ROOT}/runtime/state.json"
-readonly RESULTS_DIR="${SWARM_ROOT}/runtime/results"
-readonly SESSION_NAME="${SWARM_SESSION:-swarm}"
-
-# 加载共享事件库
 source "${SCRIPT_DIR}/swarm-lib.sh"
+readonly RESULTS_DIR="${RUNTIME_DIR}/results"
 
 # 默认配置
 TIMEOUT=300

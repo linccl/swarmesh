@@ -28,22 +28,10 @@ set -euo pipefail
 # 配置区域
 ################################################################################
 
-# 基础路径配置（从脚本位置推导）
+# 基础路径配置（统一由 swarm-lib.sh 管理）
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-readonly SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-readonly CONFIG_DIR="${SWARM_ROOT}/config"
-readonly RUNTIME_DIR="${SWARM_ROOT}/runtime"
-readonly LOGS_DIR="${RUNTIME_DIR}/logs"
-readonly TASKS_DIR="${RUNTIME_DIR}/tasks"
-readonly STATE_FILE="${RUNTIME_DIR}/state.json"
-readonly ARCHIVE_DIR="${LOGS_DIR}/archive"
-
-# Tmux 配置
-readonly DEFAULT_SESSION_NAME="swarm"
-readonly SESSION_NAME="${SWARM_SESSION:-${DEFAULT_SESSION_NAME}}"
-
-# 加载共享事件库
 source "${SCRIPT_DIR}/swarm-lib.sh"
+readonly ARCHIVE_DIR="${LOGS_DIR}/archive"
 
 # 时间格式配置（使用 defaults.conf 统一定义的 LOG_TIMESTAMP_FORMAT）
 readonly ARCHIVE_DATE_FORMAT="%Y%m%d_%H%M%S"

@@ -9,12 +9,10 @@ set -euo pipefail
 # 配置部分
 #==========================================
 
-# 从脚本位置推导项目根目录
+# 路径配置（统一由 swarm-lib.sh 管理）
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-STATE_FILE="${SWARM_ROOT}/runtime/state.json"
-RESULTS_DIR="${SWARM_ROOT}/runtime/results"
-SESSION_NAME="${SWARM_SESSION:-swarm}"
+source "${SCRIPT_DIR}/swarm-lib.sh"
+RESULTS_DIR="${RESULTS_DIR:-$RUNTIME_DIR/results}"
 
 # 默认读取行数
 DEFAULT_LINES=50

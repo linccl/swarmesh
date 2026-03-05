@@ -91,9 +91,7 @@ _auto_claim_next() {
     # 通知发布者
     local from_id from_pane
     from_id=$(jq -r '.from' "$TASKS_DIR/processing/$next_id.json")
-    from_pane=$(_resolve_pane_by_id "$from_id")
-    [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-        "[自动认领] $my_instance 已认领任务: $next_id" 2>/dev/null || true
+    _unified_notify "$from_id" "[自动认领] $my_instance 已认领任务: $next_id" "task.auto_claimed"
 
     # 输出任务详情，CLI 看到后直接开始工作
     echo ""
@@ -120,6 +118,66 @@ _deps_all_met() {
         [[ -f "$TASKS_DIR/completed/$dep_id.json" ]] || return 1
     done < <(echo "$depends_json" | jq -r '.[]' 2>/dev/null)
     return 0
+}
+
+# 任务失败后，级联 fail 依赖它的 blocked 任务（防止永久阻塞）
+# 参数: $1 - 刚失败的任务 ID
+# 注意: 使用保存/恢复 nullglob 状态，防止递归调用时提前关闭导致外层循环漏处理
+_cascade_fail_blocked() {
+    local failed_task_id="$1"
+
+    # 保存 nullglob 状态（递归安全）
+    local _nullglob_was_set=false
+    shopt -q nullglob && _nullglob_was_set=true
+    shopt -s nullglob
+
+    # 先收集需要处理的文件列表（避免循环中文件变动影响迭代）
+    local -a files_to_process=()
+    for blocked_file in "$TASKS_DIR/blocked/"*.json; do
+        [[ -f "$blocked_file" ]] || continue
+        files_to_process+=("$blocked_file")
+    done
+
+    # 恢复 nullglob（后续逻辑不再需要）
+    "$_nullglob_was_set" || shopt -u nullglob
+
+    local blocked_file
+    for blocked_file in "${files_to_process[@]}"; do
+        [[ -f "$blocked_file" ]] || continue
+
+        # 该任务是否依赖刚失败的任务
+        local has_dep
+        has_dep=$(jq --arg dep "$failed_task_id" \
+            'if .depends_on then (.depends_on | index($dep)) else null end' \
+            "$blocked_file" 2>/dev/null)
+        [[ "$has_dep" != "null" && -n "$has_dep" ]] || continue
+
+        local tid
+        tid=$(jq -r '.id' "$blocked_file")
+        local now_ts
+        now_ts=$(get_timestamp)
+
+        # blocked → failed（级联失败）
+        mkdir -p "$TASKS_DIR/failed"
+        local tmp="$TASKS_DIR/blocked/${tid}.json.tmp"
+        if jq --arg at "$now_ts" --arg dep "$failed_task_id" \
+            '.status = "failed" | .fail_reason = "依赖任务失败: " + $dep | .failed_at = $at' \
+            "$blocked_file" > "$tmp" 2>/dev/null; then
+            if mv "$tmp" "$TASKS_DIR/failed/$tid.json" 2>/dev/null; then
+                rm -f "$blocked_file"
+                emit_event "task.cascade_failed" "" "task_id=$tid" "failed_dep=$failed_task_id"
+                _story_update_task "$tid" "failed" "依赖任务 $failed_task_id 失败"
+                log_info "[cascade] 级联失败: $tid (依赖 $failed_task_id)"
+
+                # 递归：该任务也可能被其他 blocked 任务依赖
+                _cascade_fail_blocked "$tid"
+            else
+                rm -f "$tmp"
+            fi
+        else
+            rm -f "$tmp"
+        fi
+    done
 }
 
 # 任务完成后，扫描 blocked/ 中的任务，解除满足条件的阻塞
@@ -183,21 +241,21 @@ _check_and_unblock() {
             notify_msg+=$'\n'"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
             if [[ -n "$t_assign" && "$t_assign" != "null" ]]; then
-                # 定向推送给被指派实例/角色
+                # 定向通知给被指派实例/角色
                 local tp
                 tp=$(_resolve_pane_by_id "$t_assign")
                 if [[ -n "$tp" ]]; then
-                    push_to_pane "$tp" "$notify_msg" 2>/dev/null || true
+                    _unified_notify "$t_assign" "$notify_msg" "task.unblocked"
                 else
                     # 回退: 按角色查所有实例
                     while IFS='|' read -r _p _inst; do
-                        push_to_pane "$_p" "$notify_msg" 2>/dev/null || true
+                        _unified_notify "$_inst" "$notify_msg" "task.unblocked"
                     done < <(resolve_role_to_all_panes "$t_assign")
                 fi
             else
                 # 广播给所有实例
                 while IFS='|' read -r r p; do
-                    push_to_pane "$p" "$notify_msg" 2>/dev/null || true
+                    _unified_notify "$r" "$notify_msg" "task.unblocked"
                 done < <(jq -r '.panes[] | "\(.instance)|\(.pane)"' "$STATE_FILE" 2>/dev/null)
             fi
         fi
@@ -247,24 +305,10 @@ _check_group_completion() {
             # 标记 Story 为已完成
             _story_mark_completed "$group_id"
 
-            # 双通道通知主控
-            local notify_id="sys-group-done-$(date +%s)-${group_id}"
-            mkdir -p "${INBOX_DIR}/${from_id}"
-            jq -n \
-                --arg id "$notify_id" \
-                --arg from "system" \
-                --arg to "$from_id" \
-                --arg content "[任务组完成] $group_title (ID: $group_id)\n全部 $total 个任务已完成。执行 swarm-msg.sh group-status $group_id 查看详情。" \
-                --arg timestamp "$(get_timestamp)" \
-                --arg status "pending" \
-                --arg priority "high" \
-                '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-                > "${INBOX_DIR}/${from_id}/${notify_id}.json"
-
-            local from_pane
-            from_pane=$(_resolve_pane_by_id "$from_id")
-            [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-                "[任务组完成] $group_title ($completed/$total 全部完成)" 2>/dev/null || true
+            # 通知主控
+            _unified_notify "$from_id" \
+                "[任务组完成] $group_title (ID: $group_id) 全部 $total 个任务已完成。执行 swarm-msg.sh group-status $group_id 查看详情。" \
+                "task.group_completed" "high"
 
             info "任务组全部完成: $group_id ($group_title)"
         fi
@@ -376,6 +420,9 @@ _cancel_subtask_tree() {
         }
     fi
     _story_update_task "$task_id" "failed" "$reason"
+
+    # 级联失败：依赖此任务的 blocked 任务也标记为 failed
+    _cascade_fail_blocked "$task_id"
 }
 
 # =============================================================================
@@ -473,23 +520,9 @@ _compose_parent() {
         from_id=$(jq -r '.from' "$TASKS_DIR/completed/$parent_id.json")
         parent_title=$(jq -r '.title' "$TASKS_DIR/completed/$parent_id.json")
 
-        local notify_id="sys-task-composed-$(date +%s)-${parent_id}"
-        mkdir -p "${INBOX_DIR}/${from_id}"
-        jq -n \
-            --arg id "$notify_id" \
-            --arg from "system" \
-            --arg to "$from_id" \
-            --arg content "[任务归一] $parent_title (ID: $parent_id) 所有子任务已完成，结果已汇总。\n$composed_result" \
-            --arg timestamp "$(get_timestamp)" \
-            --arg status "pending" \
-            --arg priority "high" \
-            '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-            > "${INBOX_DIR}/${from_id}/${notify_id}.json"
-
-        local from_pane
-        from_pane=$(_resolve_pane_by_id "$from_id")
-        [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-            "[任务归一] $parent_title 的所有子任务已完成，结果已汇总" 2>/dev/null || true
+        _unified_notify "$from_id" \
+            "[任务归一] $parent_title (ID: $parent_id) 所有子任务已完成，结果已汇总。"$'\n'"$composed_result" \
+            "task.composed" "high"
 
         # 更新 Story
         _story_update_task "$parent_id" "completed" "子任务全部完成，已归一"
@@ -695,21 +728,21 @@ cmd_publish() {
         notify_msg+=$'\n'"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
         if [[ -n "$assign_to" ]]; then
-            # 定向推送：先尝试精确匹配 instance，再回退到角色的所有实例
+            # 定向通知：先尝试精确匹配 instance，再回退到角色的所有实例
             local target_pane
             target_pane=$(_resolve_pane_by_id "$assign_to")
             if [[ -n "$target_pane" ]]; then
-                push_to_pane "$target_pane" "$notify_msg" 2>/dev/null || true
+                _unified_notify "$assign_to" "$notify_msg" "task.published"
             else
                 while IFS='|' read -r _p _inst; do
-                    push_to_pane "$_p" "$notify_msg" 2>/dev/null || true
+                    _unified_notify "$_inst" "$notify_msg" "task.published"
                 done < <(resolve_role_to_all_panes "$assign_to")
             fi
         else
             # 无指派：广播给所有实例（排除发布者自己）
             while IFS='|' read -r other_inst other_pane; do
                 [[ "$other_inst" == "$my_instance" ]] && continue
-                push_to_pane "$other_pane" "$notify_msg" 2>/dev/null || true
+                _unified_notify "$other_inst" "$notify_msg" "task.published"
             done < <(jq -r '.panes[] | "\(.instance)|\(.pane)"' "$STATE_FILE" 2>/dev/null)
         fi
     fi
@@ -838,10 +871,8 @@ cmd_claim() {
     from_id=$(jq -r '.from' "$TASKS_DIR/processing/$task_id.json")
     from_pane=$(_resolve_pane_by_id "$from_id")
 
-    if [[ -n "$from_pane" ]]; then
-        local notify="[任务认领] $my_instance 已认领你发布的任务: $task_id"
-        push_to_pane "$from_pane" "$notify" 2>/dev/null || true
-    fi
+    local notify="[任务认领] $my_instance 已认领你发布的任务: $task_id"
+    _unified_notify "$from_id" "$notify" "task.claimed"
 
     info "已认领任务: $task_id"
     echo ""
@@ -908,23 +939,9 @@ cmd_complete_task() {
     local task_title
     task_title=$(jq -r '.title' "$TASKS_DIR/completed/$task_id.json")
 
-    local notify_id="sys-task-done-$(date +%s)-${task_id}"
-    mkdir -p "${INBOX_DIR}/${from_id}"
-    jq -n \
-        --arg id "$notify_id" \
-        --arg from "$my_instance" \
-        --arg to "$from_id" \
-        --arg content "[任务完成] $task_title (ID: $task_id)\n结果: $result" \
-        --arg timestamp "$(get_timestamp)" \
-        --arg status "pending" \
-        --arg priority "high" \
-        '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-        > "${INBOX_DIR}/${from_id}/${notify_id}.json"
-
-    local from_pane
-    from_pane=$(_resolve_pane_by_id "$from_id")
-    [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-        "[任务完成] $my_instance 完成了任务 $task_id: $result" 2>/dev/null || true
+    _unified_notify "$from_id" \
+        "[任务完成] $task_title (ID: $task_id)"$'\n'"结果: $result" \
+        "task.completed" "high"
 
     info "任务已完成: $task_id"
 
@@ -1023,10 +1040,8 @@ cmd_fail_task() {
         # 通知发布者
         local from_id
         from_id=$(jq -r '.from' "$TASKS_DIR/pending/$task_id.json")
-        local from_pane
-        from_pane=$(_resolve_pane_by_id "$from_id")
-        [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-            "[任务重试] $task_id 失败(原因: $reason)，将在 ${delay}s 后重试 ($new_count/$max_retries)" 2>/dev/null || true
+        _unified_notify "$from_id" \
+            "[任务重试] $task_id 失败(原因: $reason)，将在 ${delay}s 后重试 ($new_count/$max_retries)" "task.retry"
 
         info "任务失败，已安排重试: $task_id ($new_count/$max_retries, 延迟 ${delay}s)"
     else
@@ -1066,27 +1081,20 @@ cmd_fail_task() {
         local task_title
         task_title=$(jq -r '.title' "$TASKS_DIR/failed/$task_id.json")
 
-        # 通知 inspector
-        local notify_id="sys-task-exhausted-$(date +%s)-${task_id}"
-        mkdir -p "${INBOX_DIR}/inspector"
-        jq -n \
-            --arg id "$notify_id" \
-            --arg from "system" \
-            --arg to "inspector" \
-            --arg content "[任务失败] 任务 $task_id ($task_title) 重试耗尽 ($new_count/$max_retries)。最终原因: $reason。请人工介入。" \
-            --arg timestamp "$now_ts" \
-            --arg status "pending" \
-            --arg priority "high" \
-            '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-            > "${INBOX_DIR}/inspector/${notify_id}.json"
+        # 通知 inspector（高优先级）
+        _unified_notify "inspector" \
+            "[任务失败] 任务 $task_id ($task_title) 重试耗尽 ($new_count/$max_retries)。最终原因: $reason。请人工介入。" \
+            "task.exhausted" "high"
 
-        # 通知发布者
-        local from_pane
-        from_pane=$(_resolve_pane_by_id "$from_id")
-        [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-            "[任务失败] $task_id ($task_title) 重试耗尽 ($new_count/$max_retries)，已移入 failed/，请人工介入" 2>/dev/null || true
+        # 通知发布者（高优先级）
+        _unified_notify "$from_id" \
+            "[任务失败] $task_id ($task_title) 重试耗尽 ($new_count/$max_retries)，已移入 failed/，请人工介入" \
+            "task.exhausted" "high"
 
         info "任务重试耗尽，已移入 failed/: $task_id ($new_count/$max_retries)"
+
+        # 级联失败：依赖此任务的 blocked 任务也标记为 failed
+        _cascade_fail_blocked "$task_id"
     fi
 }
 
@@ -1137,29 +1145,11 @@ cmd_escalate_task() {
     # Story 更新
     _story_update_task "$task_id" "escalated" "上报拆分: $reason"
 
-    # 通知 supervisor
-    local supervisor_pane
-    supervisor_pane=$(_resolve_pane_by_id "supervisor")
-    if [[ -n "$supervisor_pane" ]]; then
-        push_to_pane "$supervisor_pane" \
-            "[任务上报] $my_instance 上报任务 $task_id 需要拆分。原因: $reason
-请使用 split-task 拆分此任务: swarm-msg.sh split-task $task_id --subtask \"子任务1\" --assign 角色 [...]
-（如需同层替换而非嵌套拆分，可用 expand-subtask）"
-    fi
-
-    # 也写入 supervisor inbox（确保不遗漏）
-    local msg_id="escalate-${task_id}-$(date +%s)"
-    mkdir -p "${INBOX_DIR}/supervisor"
-    jq -n \
-        --arg id "$msg_id" \
-        --arg from "$my_instance" \
-        --arg to "supervisor" \
-        --arg content "[任务上报] 任务 $task_id 需要拆分。原因: $reason。请使用 split-task 拆分此任务（如需同层替换可用 expand-subtask）。" \
-        --arg timestamp "$now_ts" \
-        --arg status "pending" \
-        --arg priority "high" \
-        '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-        > "${INBOX_DIR}/supervisor/${msg_id}.json"
+    # 通知 supervisor（统一通知，含 inbox 持久化 + 可选 pane 推送）
+    local escalate_msg="[任务上报] $my_instance 上报任务 $task_id 需要拆分。原因: $reason。"
+    escalate_msg+=$'\n'"请使用 split-task 拆分此任务: swarm-msg.sh split-task $task_id --subtask \"子任务1\" --assign 角色 [...]"
+    escalate_msg+=$'\n'"（如需同层替换而非嵌套拆分，可用 expand-subtask）"
+    _unified_notify "supervisor" "$escalate_msg" "task.escalated" "high"
 
     info "任务已上报: $task_id → supervisor"
 
@@ -1388,10 +1378,8 @@ cmd_split_task() {
         "subtask_ids=$(IFS=,; echo "${subtask_ids[*]}")"
 
     # 推送通知
-    local from_pane
-    from_pane=$(_resolve_pane_by_id "$p_from")
-    [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-        "[任务拆分] $parent_id 已拆分为 $subtask_count 个子任务: $(IFS=,; echo "${subtask_ids[*]}")" 2>/dev/null || true
+    _unified_notify "$p_from" \
+        "[任务拆分] $parent_id 已拆分为 $subtask_count 个子任务: $(IFS=,; echo "${subtask_ids[*]}")" "task.split"
 
     # 通知被指派的实例/角色
     for i in $(seq 0 $((subtask_count - 1))); do
@@ -1399,10 +1387,8 @@ cmd_split_task() {
         local sub_id="${subtask_ids[$i]}"
         local sub_title="${subtask_titles[$i]}"
         if [[ -n "$sub_assign" ]]; then
-            local target_pane
-            target_pane=$(_resolve_pane_by_id "$sub_assign")
-            [[ -n "$target_pane" ]] && push_to_pane "$target_pane" \
-                "[子任务] $sub_id: $sub_title (父任务: $parent_id) 已指派给你" 2>/dev/null || true
+            _unified_notify "$sub_assign" \
+                "[子任务] $sub_id: $sub_title (父任务: $parent_id) 已指派给你" "task.split"
         fi
     done
 
@@ -1803,19 +1789,15 @@ cmd_expand_subtask() {
         "new_subtasks=$(IFS=,; echo "${subtask_ids[*]}")"
 
     # 通知父任务发布者
-    local from_pane
-    from_pane=$(_resolve_pane_by_id "$p_from")
-    [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-        "[子任务展开] $parent_id 的子任务 $old_subtask_id 已展开为: $(IFS=,; echo "${subtask_ids[*]}")" 2>/dev/null || true
+    _unified_notify "$p_from" \
+        "[子任务展开] $parent_id 的子任务 $old_subtask_id 已展开为: $(IFS=,; echo "${subtask_ids[*]}")" "task.expanded"
 
     # 通知 Worker（旧子任务的认领者，如果不是发布者本人）
     local worker_id
     worker_id=$(jq -r '.claimed_by // ""' "$TASKS_DIR/failed/$old_subtask_id.json" 2>/dev/null)
     if [[ -n "$worker_id" && "$worker_id" != "null" && "$worker_id" != "$p_from" ]]; then
-        local worker_pane
-        worker_pane=$(_resolve_pane_by_id "$worker_id")
-        [[ -n "$worker_pane" ]] && push_to_pane "$worker_pane" \
-            "[子任务展开] $old_subtask_id → ${subtask_ids[*]} (父任务: $parent_id)" 2>/dev/null || true
+        _unified_notify "$worker_id" \
+            "[子任务展开] $old_subtask_id → ${subtask_ids[*]} (父任务: $parent_id)" "task.expanded"
     fi
 
     # 通知被指派的实例/角色
@@ -1824,10 +1806,8 @@ cmd_expand_subtask() {
         local sub_id="${subtask_ids[$i]}"
         local sub_title="${subtask_titles[$i]}"
         if [[ -n "$sub_assign" ]]; then
-            local target_pane
-            target_pane=$(_resolve_pane_by_id "$sub_assign")
-            [[ -n "$target_pane" ]] && push_to_pane "$target_pane" \
-                "[子任务] $sub_id: $sub_title (父任务: $parent_id, 展开自: $old_subtask_id) 已指派给你" 2>/dev/null || true
+            _unified_notify "$sub_assign" \
+                "[子任务] $sub_id: $sub_title (父任务: $parent_id, 展开自: $old_subtask_id) 已指派给你" "task.expanded"
         fi
     done
 
@@ -2061,10 +2041,7 @@ cmd_set_limit() {
     emit_event "config.max_cli_changed" "human" "new_limit=$new_limit" "current_count=$current_count"
 
     # 通知 supervisor（如果存在）
-    local sup_pane
-    sup_pane=$(_resolve_pane_by_id "supervisor")
-    if [[ -n "$sup_pane" && "$sup_pane" != "null" ]]; then
-        local notify_msg="[系统通知] CLI 上限已更新为 $new_limit（当前 $current_count 个）。如需扩容可继续使用 swarm-join.sh。"
-        push_to_pane "$sup_pane" "$notify_msg" 2>/dev/null || true
-    fi
+    _unified_notify "supervisor" \
+        "[系统通知] CLI 上限已更新为 $new_limit（当前 $current_count 个）。如需扩容可继续使用 swarm-join.sh。" \
+        "config.changed"
 }

@@ -24,15 +24,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-readonly SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-readonly SCRIPTS_DIR="${SWARM_ROOT}/scripts"
-readonly STATE_FILE="${SWARM_ROOT}/runtime/state.json"
-readonly WF_STATE_DIR="${SWARM_ROOT}/runtime/workflows"
-readonly RESULTS_DIR="${SWARM_ROOT}/runtime/results"
-readonly SESSION_NAME="${SWARM_SESSION:-swarm}"
-
-# 加载共享事件库
 source "${SCRIPT_DIR}/swarm-lib.sh"
+readonly WF_STATE_DIR="${RUNTIME_DIR}/workflows"
+readonly RESULTS_DIR="${RUNTIME_DIR}/results"
 # 加载质量门模块（可选，用于 verify 字段）
 source "${SCRIPT_DIR}/lib/msg-quality-gate.sh" 2>/dev/null || true
 
@@ -49,6 +43,46 @@ info()    { echo -e "\033[0;34m[workflow]\033[0m $*" >&2; }
 success() { echo -e "\033[0;32m[workflow]\033[0m $*" >&2; }
 warn()    { echo -e "\033[1;33m[workflow]\033[0m $*" >&2; }
 stage()   { echo -e "\n\033[1;35m━━━ $* ━━━\033[0m" >&2; }
+
+# ============================================================================
+# 工作流清理
+# ============================================================================
+
+# 清理工作流失败后遗留的 processing/pending 任务
+# 参数: $1 - 工作流 ID
+_cleanup_workflow_tasks() {
+    local wf_id="$1"
+    local state_file="${WF_STATE_DIR}/${wf_id}.json"
+    [[ -f "$state_file" ]] || return 0
+
+    local cleaned=0
+    while IFS=$'\t' read -r tid status; do
+        [[ "$status" == "completed" || "$status" == "dry-run" ]] && continue
+        local now_ts
+        now_ts=$(get_timestamp)
+        for d in processing pending; do
+            local f="$TASKS_DIR/$d/$tid.json"
+            [[ -f "$f" ]] || continue
+            mkdir -p "$TASKS_DIR/failed"
+            local task_tmp="${f}.tmp"
+            if jq --arg at "$now_ts" --arg wf "$wf_id" \
+                '.status = "failed" | .fail_reason = "workflow aborted: " + $wf | .failed_at = $at' \
+                "$f" > "$task_tmp" 2>/dev/null; then
+                mv "$task_tmp" "$TASKS_DIR/failed/$tid.json"
+                rm -f "$f"
+                ((cleaned++)) || true
+            else
+                rm -f "$task_tmp"
+            fi
+        done
+    done < <(jq -r '.tasks | to_entries[] | "\(.key)\t\(.value)"' "$state_file" 2>/dev/null)
+
+    # 更新工作流状态
+    local state_tmp="${state_file}.tmp"
+    jq '.status = "failed"' "$state_file" > "$state_tmp" && mv "$state_tmp" "$state_file"
+
+    [[ $cleaned -gt 0 ]] && warn "已清理 $cleaned 个工作流遗留任务"
+}
 
 # ============================================================================
 # 工作流状态管理
@@ -159,17 +193,43 @@ execute_task() {
         return 0
     fi
 
+    # 辅助: 清理本轮发送产生的 processing 任务（防止重试时产生重复）
+    _cleanup_send_task() {
+        local stid="$1"
+        [[ -n "$stid" ]] || return 0
+        local f="$TASKS_DIR/processing/$stid.json"
+        [[ -f "$f" ]] || return 0
+        mkdir -p "$TASKS_DIR/failed"
+        local tmp="${f}.tmp"
+        if jq --arg at "$(get_timestamp)" --arg wf "$wf_id" \
+            '.status = "failed" | .fail_reason = "workflow retry cleanup: " + $wf | .failed_at = $at' \
+            "$f" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$TASKS_DIR/failed/$stid.json" 2>/dev/null
+            rm -f "$f"
+        else
+            rm -f "$tmp"
+        fi
+    }
+
     local attempt=0
+    local cur_send_task_id=""
     while [[ $attempt -lt $max_retries ]]; do
         ((attempt++))
         [[ $attempt -gt 1 ]] && {
+            # 清理上一轮的 processing 任务
+            _cleanup_send_task "$cur_send_task_id"
+            cur_send_task_id=""
             warn "重试 [$task_id] 第 $attempt 次..."
             sleep $((attempt * 30))
         }
 
-        # 发送任务
+        # 发送任务，捕获 stdout 以提取 task_id（避免 events.log grep 竞态）
         update_task_state "$wf_id" "$task_id" "processing"
-        "$SCRIPTS_DIR/swarm-send.sh" "$role" "$message" > /dev/null 2>&1
+        local send_output
+        send_output=$("$SCRIPTS_DIR/swarm-send.sh" "$role" "$message" 2>/dev/null) || true
+
+        # 从 swarm-send.sh 的 stdout 中提取 "任务 ID:    task-xxx"
+        cur_send_task_id=$(echo "$send_output" | grep -oE 'task-[0-9]+-[0-9]+-[0-9]+' | head -1)
 
         # 等待完成（事件驱动，零轮询）
         info "等待 $role 完成 [$task_id]..."
@@ -211,22 +271,17 @@ execute_task() {
 
             # 可选质量门（verify 字段非空时执行）
             if [[ -n "$verify_spec" ]] && type _run_quality_gate &>/dev/null; then
-                local send_task_id
-                send_task_id=$(grep "\"task.sent\"" "$EVENTS_LOG" 2>/dev/null \
-                    | grep "\"role\":\"$role\"" \
-                    | tail -1 \
-                    | jq -r '.data.task_id // ""')
-                if [[ -n "$send_task_id" ]]; then
-                    local task_file="$TASKS_DIR/processing/$send_task_id.json"
+                if [[ -n "$cur_send_task_id" ]]; then
+                    local task_file="$TASKS_DIR/processing/$cur_send_task_id.json"
                     if [[ -f "$task_file" ]]; then
                         # 注入 verify 字段供质量门读取
                         local verify_json
                         verify_json=$(echo "$task_json" | jq -c '.verify')
                         jq --argjson v "$verify_json" '.verify = $v' "$task_file" > "${task_file}.tmp" \
                             && mv "${task_file}.tmp" "$task_file"
-                        if ! _run_quality_gate "$send_task_id" "$role"; then
+                        if ! _run_quality_gate "$cur_send_task_id" "$role"; then
                             warn "[$task_id] 质量门未通过"
-                            continue  # 重试
+                            continue  # 重试（循环头部会清理 cur_send_task_id）
                         fi
                     fi
                 fi
@@ -237,9 +292,12 @@ execute_task() {
             return 0
         else
             warn "任务 [$task_id] 第 $attempt 次尝试超时"
-            continue
+            continue  # 重试（循环头部会清理 cur_send_task_id）
         fi
     done
+
+    # 清理最后一轮的 processing 任务
+    _cleanup_send_task "$cur_send_task_id"
 
     warn "任务 [$task_id] 重试 $max_retries 次后仍失败"
     update_task_state "$wf_id" "$task_id" "failed"
@@ -377,6 +435,11 @@ run_workflow() {
             break
         fi
     done
+
+    # 工作流失败时清理关联的 processing 任务（避免孤儿任务等看门狗 TTL）
+    if [[ "$failed" == "true" ]]; then
+        _cleanup_workflow_tasks "$wf_id"
+    fi
 
     # 最终报告
     echo ""

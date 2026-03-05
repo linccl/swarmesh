@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "delivery_rules": {
+    "task.published":       "dual",
+    "task.unblocked":       "dual",
+    "task.claimed":         "inbox_only",
+    "task.auto_claimed":    "inbox_only",
+    "task.completed":       "dual",
+    "task.composed":        "dual",
+    "task.group_completed": "dual",
+    "task.escalated":       "dual",
+    "task.retry":           "inbox_only",
+    "task.exhausted":       "dual",
+    "task.recovered":       "inbox_only",
+    "task.idle_warning":    "inbox_only",
+    "task.cascade_failed":  "inbox_only",
+    "task.subtask_failed":  "inbox_only",
+    "task.subtask_stall":   "inbox_only",
+    "task.escalate_stall":  "inbox_only",
+    "task.split":           "inbox_only",
+    "task.expanded":        "inbox_only",
+    "gate.failed":          "dual",
+    "gate.skip_warning":    "inbox_only",
+    "stall.detected":       "inbox_only",
+    "config.changed":       "inbox_only",
+    "default":              "dual"
+  }
+}
