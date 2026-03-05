@@ -96,6 +96,9 @@ You can also call the underlying scripts directly:
 # Start
 ./scripts/swarm-start.sh --project /path/to/your/project --profile minimal --hidden
 
+# Resume previous session (recover orphan tasks, reuse config)
+./scripts/swarm-start.sh --resume
+
 # Status
 ./scripts/swarm-status.sh
 
@@ -244,6 +247,24 @@ swarm-msg.sh set-limit 20     # Set limit to 20
 swarm-msg.sh set-limit 0      # Remove limit
 ```
 
+### Session Resume
+
+Swarm sessions can be resumed after being stopped, preserving tasks, messages, and context:
+
+```bash
+# Resume previous session
+./scripts/swarm-start.sh --resume
+
+# Or short flag
+./scripts/swarm-start.sh -r
+```
+
+On resume, the framework:
+- Validates previous `state.json` is resumable
+- Recovers orphan tasks stuck in `processing` state (configurable via `RESUME_ORPHAN_RECOVERY`)
+- Regenerates per-role context summaries (git commits, task progress, recent messages)
+- Injects resume summaries into each role's initialization message
+
 ### Configuration Reference
 
 All parameters are centralized in `config/defaults.conf` with 3-tier priority: env vars > project-level `.swarm/swarm.conf` > defaults.
@@ -266,6 +287,14 @@ All parameters are centralized in `config/defaults.conf` with 3-tier priority: e
 | `SUBTASK_STALL_TTL` | 7200 | Subtask group stall detection threshold (seconds) |
 | `ESCALATE_STALL_TTL` | 3600 | Escalated task unhandled timeout (seconds) |
 | `CLEANUP_TTL` | 3600 | Expired message/task TTL (seconds) |
+| `SILENCE_THRESHOLD` | 5 | Pane watcher silence threshold (seconds, how long no output = done) |
+| `STALL_THRESHOLD` | 1800 | Active pane no-output threshold (seconds, triggers stall notification) |
+| `PASTE_DELAY` | 0.3 | Delay after paste-buffer (seconds) |
+| `RESUME_ORPHAN_RECOVERY` | true | Recover orphan tasks in processing/ on resume |
+| `RESUME_SUMMARY_MAX_COMMITS` | 20 | Max git commits in resume summary |
+| `RESUME_SUMMARY_MAX_TASKS` | 10 | Max completed/pending tasks in resume summary |
+| `RESUME_PANE_LINES` | 50 | Capture last N lines of each pane for resume |
+| `RESUME_SUMMARY_MAX_MESSAGES` | 10 | Max recent messages in resume summary |
 | `PANES_PER_WINDOW` | 2 | Tmux panes per window |
 
 ### Project Structure
@@ -302,8 +331,9 @@ swarmesh/
 │   ├── roles/               # Role system prompts
 │   │   ├── core/            # Core dev (frontend, backend, database, devops)
 │   │   ├── quality/         # QA (tester, reviewer, security, performance)
-│   │   └── management/      # Management (supervisor, architect, auditor, inspector, ui-designer)
-│   └── cli-routing.json     # CLI routing config
+│   │   └── management/      # Management (supervisor, architect, auditor, inspector, ui-designer, prd)
+│   ├── cli-routing.json     # CLI routing config
+│   └── notification-policy.json  # Notification delivery policy
 ├── workflows/               # Predefined workflows
 │   ├── quick-task.json
 │   ├── feature-complete.json
@@ -318,7 +348,8 @@ swarmesh/
     ├── stories/             # Task group Story files
     ├── workflows/           # Workflow runtime state
     ├── gate-logs/           # Quality gate check logs
-    └── results/             # Task results
+    ├── results/             # Task results
+    └── resume/              # Session resume summaries
 ```
 
 ### Profile Presets
@@ -326,8 +357,8 @@ swarmesh/
 | Profile | Roles | Use Case |
 |---------|-------|----------|
 | `minimal` | 3 | Quick validation, small features |
-| `web-dev` | 7 | Web application development |
-| `full-stack` | 13 | Large projects, enterprise-level |
+| `web-dev` | 6 | Web application development |
+| `full-stack` | 14 | Large projects, enterprise-level |
 
 Supports mixing different AI CLIs — frontend uses Gemini, backend uses Claude, reviewer uses Codex within the same swarm, each leveraging their strengths.
 
@@ -439,6 +470,9 @@ Supports mixing different AI CLIs — frontend uses Gemini, backend uses Claude,
 ```bash
 # 启动
 ./scripts/swarm-start.sh --project /path/to/your/project --profile minimal --hidden
+
+# 恢复上次会话（回收孤儿任务，复用配置）
+./scripts/swarm-start.sh --resume
 
 # 状态
 ./scripts/swarm-status.sh
@@ -587,6 +621,24 @@ swarm-msg.sh set-limit 20     # 设置上限为 20
 swarm-msg.sh set-limit 0      # 取消上限
 ```
 
+### 会话恢复
+
+蜂群停止后可恢复，保留任务、消息和上下文：
+
+```bash
+# 恢复上次会话
+./scripts/swarm-start.sh --resume
+
+# 或短参数
+./scripts/swarm-start.sh -r
+```
+
+恢复时框架会：
+- 校验上次 `state.json` 的可恢复性
+- 回收卡在 `processing` 状态的孤儿任务（可通过 `RESUME_ORPHAN_RECOVERY` 配置）
+- 为每个角色重新生成上下文摘要（git commit、任务进度、最近消息）
+- 将恢复摘要注入到角色的初始化消息中
+
 ### 配置参考
 
 所有参数集中定义在 `config/defaults.conf`，支持三层优先级：环境变量 > 项目级 `.swarm/swarm.conf` > 默认值。
@@ -609,6 +661,14 @@ swarm-msg.sh set-limit 0      # 取消上限
 | `SUBTASK_STALL_TTL` | 7200 | 子任务组停滞检测阈值（秒） |
 | `ESCALATE_STALL_TTL` | 3600 | 上报任务未处理超时阈值（秒） |
 | `CLEANUP_TTL` | 3600 | 过期消息/任务 TTL（秒） |
+| `SILENCE_THRESHOLD` | 5 | Pane 静默阈值（秒，多久没输出算完成） |
+| `STALL_THRESHOLD` | 1800 | Active 状态无新输出阈值（秒，触发 stall 通知） |
+| `PASTE_DELAY` | 0.3 | paste-buffer 后等待延迟（秒） |
+| `RESUME_ORPHAN_RECOVERY` | true | 恢复时是否回收 processing 中的孤儿任务 |
+| `RESUME_SUMMARY_MAX_COMMITS` | 20 | 恢复摘要中最多包含的 git commit 数 |
+| `RESUME_SUMMARY_MAX_TASKS` | 10 | 恢复摘要中最多包含的已完成/未完成任务数 |
+| `RESUME_PANE_LINES` | 50 | 捕获 pane 最后 N 行用于恢复 |
+| `RESUME_SUMMARY_MAX_MESSAGES` | 10 | 恢复摘要中的最近消息数 |
 | `PANES_PER_WINDOW` | 2 | 每窗口 pane 数 |
 
 ### 项目结构
@@ -645,8 +705,9 @@ swarmesh/
 │   ├── roles/               # 角色 system prompt
 │   │   ├── core/            # 核心开发（frontend, backend, database, devops）
 │   │   ├── quality/         # 质量保障（tester, reviewer, security, performance）
-│   │   └── management/      # 管理协调（supervisor, architect, auditor, inspector, ui-designer）
-│   └── cli-routing.json     # CLI 路由配置
+│   │   └── management/      # 管理协调（supervisor, architect, auditor, inspector, ui-designer, prd）
+│   ├── cli-routing.json     # CLI 路由配置
+│   └── notification-policy.json  # 通知投递策略
 ├── workflows/               # 预定义工作流
 │   ├── quick-task.json
 │   ├── feature-complete.json
@@ -661,7 +722,8 @@ swarmesh/
     ├── stories/             # 任务组 Story 文件
     ├── workflows/           # 工作流运行时状态
     ├── gate-logs/           # 质量门检查日志
-    └── results/             # 任务结果
+    ├── results/             # 任务结果
+    └── resume/              # 会话恢复摘要
 ```
 
 ### Profile 预设
@@ -669,8 +731,8 @@ swarmesh/
 | Profile | 角色数 | 适用场景 |
 |---------|--------|---------|
 | `minimal` | 3 | 快速验证、小功能开发 |
-| `web-dev` | 7 | Web 应用开发 |
-| `full-stack` | 13 | 大型项目、企业级开发 |
+| `web-dev` | 6 | Web 应用开发 |
+| `full-stack` | 14 | 大型项目、企业级开发 |
 
 支持混合不同 AI CLI —— 同一蜂群中 frontend 用 Gemini、backend 用 Claude、reviewer 用 Codex，各取所长。
 
