@@ -165,14 +165,41 @@ get_timestamp() {
     date "+$LOG_TIMESTAMP_FORMAT"
 }
 
+# 获取 stat 数值结果（GNU/BSD 兼容，且保证输出纯数字）
+_stat_numeric() {
+    local file="$1"
+    local gnu_format="$2"
+    local bsd_format="$3"
+    local value=""
+
+    [[ -e "$file" ]] || {
+        echo "0"
+        return 0
+    }
+
+    value=$(stat -c "$gnu_format" "$file" 2>/dev/null || true)
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
+        return 0
+    fi
+
+    value=$(stat -f "$bsd_format" "$file" 2>/dev/null || true)
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "$value"
+        return 0
+    fi
+
+    echo "0"
+}
+
 # 获取文件修改时间（macOS/Linux 兼容）
 _file_mtime() {
-    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo "0"
+    _stat_numeric "$1" '%Y' '%m'
 }
 
 # 获取文件大小（macOS/Linux 兼容）
 _file_size() {
-    stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo "0"
+    _stat_numeric "$1" '%s' '%z'
 }
 
 # 检查命令是否存在

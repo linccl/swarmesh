@@ -467,36 +467,44 @@ _watchdog_check_subtask_stall() {
 # 主函数: 启动看门狗守护进程
 # =============================================================================
 
+# 看门狗主循环（前台运行，便于 nohup/后台封装复用）
+_watchdog_main_loop() {
+    # 等待运行时目录就绪
+    while [[ ! -d "$TASKS_DIR/processing" ]]; do sleep 1; done
+
+    local last_rotate_check=0
+
+    while true; do
+        sleep "$WATCHDOG_INTERVAL"
+
+        # 原有：任务健康检查
+        shopt -s nullglob
+        for f in "$TASKS_DIR/processing/"*.json; do
+            _watchdog_check_one_task "$f"
+        done
+        shopt -u nullglob
+
+        # 子任务停滞检测
+        _watchdog_check_subtask_stall
+
+        # 日志轮转检查（按 LOG_ROTATE_INTERVAL 频率）
+        local now
+        now=$(date +%s)
+        if (( now - last_rotate_check >= LOG_ROTATE_INTERVAL )); then
+            _check_and_rotate_logs
+            last_rotate_check=$now
+        fi
+    done
+}
+
 # 启动后台守护进程，定期巡检 processing/ 中的任务 + 日志轮转
 # 输出: 守护进程 PID (stdout)
 start_task_watchdog() {
+    local watchdog_log="$LOGS_DIR/watchdog.log"
+    mkdir -p "$LOGS_DIR"
+
     (
-        # 等待运行时目录就绪
-        while [[ ! -d "$TASKS_DIR/processing" ]]; do sleep 1; done
-
-        local last_rotate_check=0
-
-        while true; do
-            sleep "$WATCHDOG_INTERVAL"
-
-            # 原有：任务健康检查
-            shopt -s nullglob
-            for f in "$TASKS_DIR/processing/"*.json; do
-                _watchdog_check_one_task "$f"
-            done
-            shopt -u nullglob
-
-            # 子任务停滞检测
-            _watchdog_check_subtask_stall
-
-            # 日志轮转检查（按 LOG_ROTATE_INTERVAL 频率）
-            local now
-            now=$(date +%s)
-            if (( now - last_rotate_check >= LOG_ROTATE_INTERVAL )); then
-                _check_and_rotate_logs
-                last_rotate_check=$now
-            fi
-        done
-    ) >/dev/null &
+        _watchdog_main_loop
+    ) >>"$watchdog_log" 2>&1 &
     echo $!
 }
