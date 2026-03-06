@@ -9,12 +9,10 @@ set -euo pipefail
 # 配置部分
 #==========================================
 
-# 从脚本位置推导项目根目录
+# 路径配置（统一由 swarm-lib.sh 管理）
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-STATE_FILE="${SWARM_ROOT}/runtime/state.json"
-RESULTS_DIR="${SWARM_ROOT}/runtime/results"
-SESSION_NAME="${SWARM_SESSION:-swarm}"
+source "${SCRIPT_DIR}/swarm-lib.sh"
+RESULTS_DIR="${RESULTS_DIR:-$RUNTIME_DIR/results}"
 
 # 默认读取行数
 DEFAULT_LINES=50
@@ -119,18 +117,28 @@ check_state_file() {
 find_pane() {
     local role_query="$1"
 
-    # 从 state.json 中查找匹配的角色
+    # 从 state.json 中查找匹配的实例/角色
     local pane_info
+    # 优先匹配 instance
     pane_info=$(jq -r --arg query "$role_query" '
         .panes[] |
-        select(.role == $query or (.alias // "" | split(",") | index($query))) |
-        "\(.pane)|\(.role)|\(.cli)"
+        select(.instance == $query) |
+        "\(.pane)|\(.instance)|\(.cli)"
     ' "$STATE_FILE" | head -1)
 
+    # 回退到 role/alias 匹配
     if [[ -z "$pane_info" ]]; then
-        error "未找到角色: $role_query"
-        error "可用角色列表:"
-        jq -r '.panes[] | "  - \(.role) (\(.alias))"' "$STATE_FILE"
+        pane_info=$(jq -r --arg query "$role_query" '
+            .panes[] |
+            select(.role == $query or (.alias // "" | split(",") | index($query))) |
+            "\(.pane)|\(.instance // .role)|\(.cli)"
+        ' "$STATE_FILE" | head -1)
+    fi
+
+    if [[ -z "$pane_info" ]]; then
+        error "未找到角色/实例: $role_query"
+        error "可用实例列表:"
+        jq -r '.panes[] | "  - \(.instance // .role) (角色: \(.role), 别名: \(.alias))"' "$STATE_FILE"
         exit 1
     fi
 

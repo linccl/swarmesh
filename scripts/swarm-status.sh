@@ -9,13 +9,9 @@ set -euo pipefail
 # 配置部分
 #==========================================
 
-# 从脚本位置推导项目根目录
+# 路径配置（统一由 swarm-lib.sh 管理）
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-STATE_FILE="${SWARM_ROOT}/runtime/state.json"
-TASKS_DIR="${SWARM_ROOT}/runtime/tasks"
-LOGS_DIR="${SWARM_ROOT}/runtime/logs"
-SESSION_NAME="${SWARM_SESSION:-swarm}"
+source "${SCRIPT_DIR}/swarm-lib.sh"
 
 # 颜色定义
 COLOR_RESET='\033[0m'

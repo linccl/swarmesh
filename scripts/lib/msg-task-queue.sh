@@ -18,20 +18,24 @@ _MSG_TASK_QUEUE_LOADED=1
 # 扫描 pending/，找本角色能接的任务，按优先级认领
 # 参数: $1 - 当前角色名
 _auto_claim_next() {
-    local my_role="$1"
+    local my_instance="$1"
+    # 获取角色分类（用于匹配 assigned_to 是角色名的情况）
+    local my_role
+    my_role=$(jq -r --arg inst "$my_instance" '.panes[] | select(.instance == $inst) | .role' "$STATE_FILE" 2>/dev/null | head -1)
+    [[ -n "$my_role" ]] || my_role="$my_instance"
 
     shopt -s nullglob
     local candidates=()
     local now_epoch
     now_epoch=$(date +%s)
-    for f in "$TASKS_DIR/pending/"*.json; do
+    for f in "$TASKS_DIR/pending/task-"*.json; do
         [[ -f "$f" ]] || continue
         # 单次 jq 提取 assigned_to + retry_after（减少进程开销）
         local meta assigned retry_after
         meta=$(jq -r '[(.assigned_to // ""), (.retry_after // "")] | join("\u0001")' "$f" 2>/dev/null) || continue
         IFS=$'\001' read -r assigned retry_after <<< "$meta"
-        # 能接: assigned_to 为空（谁都能接）或匹配本角色
-        if [[ -z "$assigned" || "$assigned" == "$my_role" ]]; then
+        # 能接: assigned_to 为空（谁都能接）或匹配本实例/本角色
+        if [[ -z "$assigned" || "$assigned" == "$my_instance" || "$assigned" == "$my_role" ]]; then
             # retry_after 检查: 还没到重试时间的任务跳过
             if [[ -n "$retry_after" && "$retry_after" != "null" ]]; then
                 local retry_epoch
@@ -77,20 +81,17 @@ _auto_claim_next() {
     fi
     # 更新字段
     local tmp_file="$TASKS_DIR/processing/$next_id.json.tmp"
-    jq --arg role "$my_role" --arg at "$claimed_at" \
-        '.status = "processing" | .claimed_by = $role | .claimed_at = $at' \
+    jq --arg inst "$my_instance" --arg at "$claimed_at" \
+        '.status = "processing" | .claimed_by = $inst | .claimed_at = $at' \
         "$TASKS_DIR/processing/$next_id.json" > "$tmp_file"
     mv "$tmp_file" "$TASKS_DIR/processing/$next_id.json"
 
-    emit_event "task.auto_claimed" "$my_role" "task_id=$next_id"
+    emit_event "task.auto_claimed" "$my_instance" "task_id=$next_id"
 
     # 通知发布者
-    local from_role from_pane
-    from_role=$(jq -r '.from' "$TASKS_DIR/processing/$next_id.json")
-    from_pane=$(jq -r --arg role "$from_role" \
-        '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-    [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-        "[自动认领] $my_role 已认领任务: $next_id" 2>/dev/null || true
+    local from_id from_pane
+    from_id=$(jq -r '.from' "$TASKS_DIR/processing/$next_id.json")
+    _unified_notify "$from_id" "[自动认领] $my_instance 已认领任务: $next_id" "task.auto_claimed"
 
     # 输出任务详情，CLI 看到后直接开始工作
     echo ""
@@ -117,6 +118,66 @@ _deps_all_met() {
         [[ -f "$TASKS_DIR/completed/$dep_id.json" ]] || return 1
     done < <(echo "$depends_json" | jq -r '.[]' 2>/dev/null)
     return 0
+}
+
+# 任务失败后，级联 fail 依赖它的 blocked 任务（防止永久阻塞）
+# 参数: $1 - 刚失败的任务 ID
+# 注意: 使用保存/恢复 nullglob 状态，防止递归调用时提前关闭导致外层循环漏处理
+_cascade_fail_blocked() {
+    local failed_task_id="$1"
+
+    # 保存 nullglob 状态（递归安全）
+    local _nullglob_was_set=false
+    shopt -q nullglob && _nullglob_was_set=true
+    shopt -s nullglob
+
+    # 先收集需要处理的文件列表（避免循环中文件变动影响迭代）
+    local -a files_to_process=()
+    for blocked_file in "$TASKS_DIR/blocked/"*.json; do
+        [[ -f "$blocked_file" ]] || continue
+        files_to_process+=("$blocked_file")
+    done
+
+    # 恢复 nullglob（后续逻辑不再需要）
+    "$_nullglob_was_set" || shopt -u nullglob
+
+    local blocked_file
+    for blocked_file in "${files_to_process[@]}"; do
+        [[ -f "$blocked_file" ]] || continue
+
+        # 该任务是否依赖刚失败的任务
+        local has_dep
+        has_dep=$(jq --arg dep "$failed_task_id" \
+            'if .depends_on then (.depends_on | index($dep)) else null end' \
+            "$blocked_file" 2>/dev/null)
+        [[ "$has_dep" != "null" && -n "$has_dep" ]] || continue
+
+        local tid
+        tid=$(jq -r '.id' "$blocked_file")
+        local now_ts
+        now_ts=$(get_timestamp)
+
+        # blocked → failed（级联失败）
+        mkdir -p "$TASKS_DIR/failed"
+        local tmp="$TASKS_DIR/blocked/${tid}.json.tmp"
+        if jq --arg at "$now_ts" --arg dep "$failed_task_id" \
+            '.status = "failed" | .fail_reason = "依赖任务失败: " + $dep | .failed_at = $at' \
+            "$blocked_file" > "$tmp" 2>/dev/null; then
+            if mv "$tmp" "$TASKS_DIR/failed/$tid.json" 2>/dev/null; then
+                rm -f "$blocked_file"
+                emit_event "task.cascade_failed" "" "task_id=$tid" "failed_dep=$failed_task_id"
+                _story_update_task "$tid" "failed" "依赖任务 $failed_task_id 失败"
+                log_info "[cascade] 级联失败: $tid (依赖 $failed_task_id)"
+
+                # 递归：该任务也可能被其他 blocked 任务依赖
+                _cascade_fail_blocked "$tid"
+            else
+                rm -f "$tmp"
+            fi
+        else
+            rm -f "$tmp"
+        fi
+    done
 }
 
 # 任务完成后，扫描 blocked/ 中的任务，解除满足条件的阻塞
@@ -180,16 +241,22 @@ _check_and_unblock() {
             notify_msg+=$'\n'"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
             if [[ -n "$t_assign" && "$t_assign" != "null" ]]; then
-                # 定向推送给被指派角色
-                while IFS= read -r tp; do
-                    push_to_pane "$tp" "$notify_msg" 2>/dev/null || true
-                done < <(jq -r --arg role "$t_assign" \
-                    '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null)
+                # 定向通知给被指派实例/角色
+                local tp
+                tp=$(_resolve_pane_by_id "$t_assign")
+                if [[ -n "$tp" ]]; then
+                    _unified_notify "$t_assign" "$notify_msg" "task.unblocked"
+                else
+                    # 回退: 按角色查所有实例
+                    while IFS='|' read -r _p _inst; do
+                        _unified_notify "$_inst" "$notify_msg" "task.unblocked"
+                    done < <(resolve_role_to_all_panes "$t_assign")
+                fi
             else
-                # 广播给所有角色
+                # 广播给所有实例
                 while IFS='|' read -r r p; do
-                    push_to_pane "$p" "$notify_msg" 2>/dev/null || true
-                done < <(jq -r '.panes[] | "\(.role)|\(.pane)"' "$STATE_FILE" 2>/dev/null)
+                    _unified_notify "$r" "$notify_msg" "task.unblocked"
+                done < <(jq -r '.panes[] | "\(.instance)|\(.pane)"' "$STATE_FILE" 2>/dev/null)
             fi
         fi
     done
@@ -229,34 +296,19 @@ _check_group_completion() {
         if [[ $completed -eq $total && $total -gt 0 ]]; then
             jq '.status = "completed"' "$group_file" > "$tmp" && mv "$tmp" "$group_file"
 
-            local group_title from_role
+            local group_title from_id
             group_title=$(jq -r '.title' "$group_file")
-            from_role=$(jq -r '.from' "$group_file")
+            from_id=$(jq -r '.from' "$group_file")
 
-            emit_event "group.completed" "$from_role" "group_id=$group_id" "title=$group_title"
+            emit_event "group.completed" "$from_id" "group_id=$group_id" "title=$group_title"
 
             # 标记 Story 为已完成
             _story_mark_completed "$group_id"
 
-            # 双通道通知主控
-            local notify_id="sys-group-done-$(date +%s)-${group_id}"
-            mkdir -p "${INBOX_DIR}/${from_role}"
-            jq -n \
-                --arg id "$notify_id" \
-                --arg from "system" \
-                --arg to "$from_role" \
-                --arg content "[任务组完成] $group_title (ID: $group_id)\n全部 $total 个任务已完成。执行 swarm-msg.sh group-status $group_id 查看详情。" \
-                --arg timestamp "$(get_timestamp)" \
-                --arg status "pending" \
-                --arg priority "high" \
-                '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-                > "${INBOX_DIR}/${from_role}/${notify_id}.json"
-
-            # TODO: push_to_pane 涉及 tmux 调用，理想情况应移到 flock 外以缩短锁持有时间
-            local from_pane
-            from_pane=$(jq -r --arg role "$from_role" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-            [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-                "[任务组完成] $group_title ($completed/$total 全部完成)" 2>/dev/null || true
+            # 通知主控
+            _unified_notify "$from_id" \
+                "[任务组完成] $group_title (ID: $group_id) 全部 $total 个任务已完成。执行 swarm-msg.sh group-status $group_id 查看详情。" \
+                "task.group_completed" "high"
 
             info "任务组全部完成: $group_id ($group_title)"
         fi
@@ -368,6 +420,9 @@ _cancel_subtask_tree() {
         }
     fi
     _story_update_task "$task_id" "failed" "$reason"
+
+    # 级联失败：依赖此任务的 blocked 任务也标记为 failed
+    _cascade_fail_blocked "$task_id"
 }
 
 # =============================================================================
@@ -461,27 +516,13 @@ _compose_parent() {
         emit_event "task.composed" "" "parent_id=$parent_id"
 
         # 通知发布者
-        local from_role parent_title
-        from_role=$(jq -r '.from' "$TASKS_DIR/completed/$parent_id.json")
+        local from_id parent_title
+        from_id=$(jq -r '.from' "$TASKS_DIR/completed/$parent_id.json")
         parent_title=$(jq -r '.title' "$TASKS_DIR/completed/$parent_id.json")
 
-        local notify_id="sys-task-composed-$(date +%s)-${parent_id}"
-        mkdir -p "${INBOX_DIR}/${from_role}"
-        jq -n \
-            --arg id "$notify_id" \
-            --arg from "system" \
-            --arg to "$from_role" \
-            --arg content "[任务归一] $parent_title (ID: $parent_id) 所有子任务已完成，结果已汇总。\n$composed_result" \
-            --arg timestamp "$(get_timestamp)" \
-            --arg status "pending" \
-            --arg priority "high" \
-            '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-            > "${INBOX_DIR}/${from_role}/${notify_id}.json"
-
-        local from_pane
-        from_pane=$(jq -r --arg role "$from_role" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-        [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-            "[任务归一] $parent_title 的所有子任务已完成，结果已汇总" 2>/dev/null || true
+        _unified_notify "$from_id" \
+            "[任务归一] $parent_title (ID: $parent_id) 所有子任务已完成，结果已汇总。"$'\n'"$composed_result" \
+            "task.composed" "high"
 
         # 更新 Story
         _story_update_task "$parent_id" "completed" "子任务全部完成，已归一"
@@ -504,7 +545,7 @@ cmd_create_group() {
     local title="$1"
 
     local my_role
-    my_role=$(detect_my_role)
+    my_role=$(detect_my_instance)
 
     local group_id="group-$(date +%s)-$$-$((RANDOM % 10000))"
 
@@ -558,15 +599,15 @@ cmd_publish() {
         esac
     done
 
-    local my_role
-    my_role=$(detect_my_role)
+    local my_instance
+    my_instance=$(detect_my_instance)
 
     # 分支: 优先使用显式指定的 --branch，否则自动取发布者的分支
     local branch="" commit_hash="" project_dir=""
     if [[ -n "$explicit_branch" ]]; then
         branch="$explicit_branch"
     else
-        branch=$(jq -r --arg role "$my_role" '.panes[] | select(.role == $role) | .branch // ""' "$STATE_FILE" 2>/dev/null)
+        branch=$(jq -r --arg inst "$my_instance" '.panes[] | select(.instance == $inst) | .branch // ""' "$STATE_FILE" 2>/dev/null)
     fi
     project_dir=$(jq -r '.project // ""' "$STATE_FILE" 2>/dev/null)
     if [[ -n "$branch" && -n "$project_dir" ]]; then
@@ -607,7 +648,7 @@ cmd_publish() {
     jq -n \
         --arg id "$task_id" \
         --arg type "$type" \
-        --arg from "$my_role" \
+        --arg from "$my_instance" \
         --arg title "$title" \
         --arg description "$description" \
         --arg branch "$branch" \
@@ -667,14 +708,14 @@ cmd_publish() {
     fi
 
     # 发射事件
-    emit_event "task.published" "$my_role" "task_id=$task_id" "type=$type" "title=$title" \
+    emit_event "task.published" "$my_instance" "task_id=$task_id" "type=$type" "title=$title" \
         "assigned_to=${assign_to:-all}" "group=${group_id:-none}" "blocked=$is_blocked"
 
     # 如果不是阻塞的，推送通知（包含完整任务描述）
     if [[ "$is_blocked" == false ]]; then
         local notify_msg="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         notify_msg+=$'\n'"[新任务] $type: $title"
-        notify_msg+=$'\n'"发布者: $my_role | 任务ID: $task_id"
+        notify_msg+=$'\n'"发布者: $my_instance | 任务ID: $task_id"
         [[ -n "$assign_to" ]] && notify_msg+=$'\n'"指派给: $assign_to"
         [[ -n "$branch" ]] && notify_msg+=$'\n'"分支: $branch"
         [[ -n "$group_id" ]] && notify_msg+=$'\n'"任务组: $group_id"
@@ -687,17 +728,22 @@ cmd_publish() {
         notify_msg+=$'\n'"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
         if [[ -n "$assign_to" ]]; then
-            # 定向推送：只发给被指派角色的所有 pane（同角色可能有多个 CLI）
-            while IFS= read -r target_pane; do
-                push_to_pane "$target_pane" "$notify_msg" 2>/dev/null || true
-            done < <(jq -r --arg role "$assign_to" \
-                '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null)
+            # 定向通知：先尝试精确匹配 instance，再回退到角色的所有实例
+            local target_pane
+            target_pane=$(_resolve_pane_by_id "$assign_to")
+            if [[ -n "$target_pane" ]]; then
+                _unified_notify "$assign_to" "$notify_msg" "task.published"
+            else
+                while IFS='|' read -r _p _inst; do
+                    _unified_notify "$_inst" "$notify_msg" "task.published"
+                done < <(resolve_role_to_all_panes "$assign_to")
+            fi
         else
-            # 无指派：广播给所有角色（排除发布者自己）
-            while IFS='|' read -r other_role other_pane; do
-                [[ "$other_role" == "$my_role" ]] && continue
-                push_to_pane "$other_pane" "$notify_msg" 2>/dev/null || true
-            done < <(jq -r '.panes[] | "\(.role)|\(.pane)"' "$STATE_FILE" 2>/dev/null)
+            # 无指派：广播给所有实例（排除发布者自己）
+            while IFS='|' read -r other_inst other_pane; do
+                [[ "$other_inst" == "$my_instance" ]] && continue
+                _unified_notify "$other_inst" "$notify_msg" "task.published"
+            done < <(jq -r '.panes[] | "\(.instance)|\(.pane)"' "$STATE_FILE" 2>/dev/null)
         fi
     fi
 
@@ -780,8 +826,12 @@ cmd_list_tasks() {
 cmd_claim() {
     local task_id="$1"
 
+    local my_instance
+    my_instance=$(detect_my_instance)
+    # 获取角色分类（用于匹配 assigned_to 是角色名的情况）
     local my_role
-    my_role=$(detect_my_role)
+    my_role=$(jq -r --arg inst "$my_instance" '.panes[] | select(.instance == $inst) | .role' "$STATE_FILE" 2>/dev/null | head -1)
+    [[ -n "$my_role" ]] || my_role="$my_instance"
 
     local task_file="$TASKS_DIR/pending/$task_id.json"
     mkdir -p "$TASKS_DIR/processing"
@@ -794,37 +844,35 @@ cmd_claim() {
     # 检查指派限制（抢占后检查，不符合则回退）
     local assigned_to
     assigned_to=$(jq -r '.assigned_to // ""' "$TASKS_DIR/processing/$task_id.json")
-    if [[ -n "$assigned_to" && "$assigned_to" != "$my_role" ]]; then
+    if [[ -n "$assigned_to" && "$assigned_to" != "$my_instance" && "$assigned_to" != "$my_role" ]]; then
         # 回退：移回 pending
         if ! mv "$TASKS_DIR/processing/$task_id.json" "$task_file" 2>/dev/null; then
             info "[WARNING] 任务 $task_id 回退 pending 失败，可能需要手动恢复或使用 recover-tasks"
         fi
-        die "此任务已指派给 ${assigned_to}，你(${my_role})无法认领"
+        die "此任务已指派给 $assigned_to，你($my_instance/$my_role)无法认领"
     fi
 
     # 更新字段
     local claimed_at
     claimed_at=$(get_timestamp)
     local tmp_file="$TASKS_DIR/processing/$task_id.json.tmp"
-    jq --arg role "$my_role" --arg at "$claimed_at" \
-        '.status = "processing" | .claimed_by = $role | .claimed_at = $at' \
+    jq --arg inst "$my_instance" --arg at "$claimed_at" \
+        '.status = "processing" | .claimed_by = $inst | .claimed_at = $at' \
         "$TASKS_DIR/processing/$task_id.json" > "$tmp_file"
     mv "$tmp_file" "$TASKS_DIR/processing/$task_id.json"
 
-    emit_event "task.claimed" "$my_role" "task_id=$task_id"
+    emit_event "task.claimed" "$my_instance" "task_id=$task_id"
 
     # 更新 Story 中的任务状态
     _story_update_task "$task_id" "processing"
 
     # 通知发布者
-    local from_role from_pane
-    from_role=$(jq -r '.from' "$TASKS_DIR/processing/$task_id.json")
-    from_pane=$(jq -r --arg role "$from_role" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
+    local from_id from_pane
+    from_id=$(jq -r '.from' "$TASKS_DIR/processing/$task_id.json")
+    from_pane=$(_resolve_pane_by_id "$from_id")
 
-    if [[ -n "$from_pane" ]]; then
-        local notify="[任务认领] $my_role 已认领你发布的任务: $task_id"
-        push_to_pane "$from_pane" "$notify" 2>/dev/null || true
-    fi
+    local notify="[任务认领] $my_instance 已认领你发布的任务: $task_id"
+    _unified_notify "$from_id" "$notify" "task.claimed"
 
     info "已认领任务: $task_id"
     echo ""
@@ -855,14 +903,14 @@ cmd_complete_task() {
     local task_id="$1"
     local result="$2"
 
-    local my_role
-    my_role=$(detect_my_role)
+    local my_instance
+    my_instance=$(detect_my_instance)
 
     local task_file="$TASKS_DIR/processing/$task_id.json"
     [[ -f "$task_file" ]] || die "任务不在处理中: $task_id"
 
     # === 质量门（在 processing 阶段执行，通过后才移到 completed） ===
-    if ! _run_quality_gate "$task_id" "$my_role"; then
+    if ! _run_quality_gate "$task_id" "$my_instance"; then
         # Gate 失败，任务保持 processing，通知工蜂修复
         return 0
     fi
@@ -883,31 +931,17 @@ cmd_complete_task() {
         die "complete-task: jq 处理失败: $task_id"
     fi
 
-    emit_event "task.completed_by_queue" "$my_role" "task_id=$task_id"
+    emit_event "task.completed_by_queue" "$my_instance" "task_id=$task_id"
 
     # 通知发布者（Gate 已通过，此通知可信）
-    local from_role
-    from_role=$(jq -r '.from' "$TASKS_DIR/completed/$task_id.json")
+    local from_id
+    from_id=$(jq -r '.from' "$TASKS_DIR/completed/$task_id.json")
     local task_title
     task_title=$(jq -r '.title' "$TASKS_DIR/completed/$task_id.json")
 
-    local notify_id="sys-task-done-$(date +%s)-${task_id}"
-    mkdir -p "${INBOX_DIR}/${from_role}"
-    jq -n \
-        --arg id "$notify_id" \
-        --arg from "$my_role" \
-        --arg to "$from_role" \
-        --arg content "[任务完成] $task_title (ID: $task_id)\n结果: $result" \
-        --arg timestamp "$(get_timestamp)" \
-        --arg status "pending" \
-        --arg priority "high" \
-        '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-        > "${INBOX_DIR}/${from_role}/${notify_id}.json"
-
-    local from_pane
-    from_pane=$(jq -r --arg role "$from_role" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-    [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-        "[任务完成] $my_role 完成了任务 $task_id: $result" 2>/dev/null || true
+    _unified_notify "$from_id" \
+        "[任务完成] $task_title (ID: $task_id)"$'\n'"结果: $result" \
+        "task.completed" "high"
 
     info "任务已完成: $task_id"
 
@@ -924,7 +958,7 @@ cmd_complete_task() {
     _check_group_completion "$task_id"
 
     # 自动拉取下一个任务（工蜂自驱动）
-    _auto_claim_next "$my_role"
+    _auto_claim_next "$my_instance"
 }
 
 # =============================================================================
@@ -935,8 +969,8 @@ cmd_fail_task() {
     local task_id="$1"
     local reason="${2:-未指定原因}"
 
-    local my_role
-    my_role=$(detect_my_role)
+    local my_instance
+    my_instance=$(detect_my_instance)
 
     local task_file="$TASKS_DIR/processing/$task_id.json"
     [[ -f "$task_file" ]] || die "任务不在处理中: $task_id (只能对 processing 状态的任务报告失败)"
@@ -954,7 +988,7 @@ cmd_fail_task() {
     history_entry=$(jq -n \
         --arg failed_at "$now_ts" \
         --arg reason "$reason" \
-        --arg failed_by "$my_role" \
+        --arg failed_by "$my_instance" \
         '{failed_at: $failed_at, reason: $reason, failed_by: $failed_by}')
 
     # 递增 retry_count
@@ -998,18 +1032,16 @@ cmd_fail_task() {
         fi
         rm -f "$task_file"
 
-        emit_event "task.retry" "$my_role" "task_id=$task_id" "retry_count=$new_count" "max_retries=$max_retries" "delay=${delay}s"
+        emit_event "task.retry" "$my_instance" "task_id=$task_id" "retry_count=$new_count" "max_retries=$max_retries" "delay=${delay}s"
 
         # 更新 Story
         _story_update_task "$task_id" "pending" "重试 $new_count/$max_retries (原因: $reason)"
 
         # 通知发布者
-        local from_role
-        from_role=$(jq -r '.from' "$TASKS_DIR/pending/$task_id.json")
-        local from_pane
-        from_pane=$(jq -r --arg role "$from_role" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-        [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-            "[任务重试] $task_id 失败(原因: $reason)，将在 ${delay}s 后重试 ($new_count/$max_retries)" 2>/dev/null || true
+        local from_id
+        from_id=$(jq -r '.from' "$TASKS_DIR/pending/$task_id.json")
+        _unified_notify "$from_id" \
+            "[任务重试] $task_id 失败(原因: $reason)，将在 ${delay}s 后重试 ($new_count/$max_retries)" "task.retry"
 
         info "任务失败，已安排重试: $task_id ($new_count/$max_retries, 延迟 ${delay}s)"
     else
@@ -1038,38 +1070,31 @@ cmd_fail_task() {
         fi
         rm -f "$task_file"
 
-        emit_event "task.exhausted" "$my_role" "task_id=$task_id" "retry_count=$new_count" "max_retries=$max_retries"
+        emit_event "task.exhausted" "$my_instance" "task_id=$task_id" "retry_count=$new_count" "max_retries=$max_retries"
 
         # 更新 Story
         _story_update_task "$task_id" "failed" "重试耗尽 ($new_count/$max_retries, 最终原因: $reason)"
 
         # 通知 inspector + 发布者
-        local from_role
-        from_role=$(jq -r '.from' "$TASKS_DIR/failed/$task_id.json")
+        local from_id
+        from_id=$(jq -r '.from' "$TASKS_DIR/failed/$task_id.json")
         local task_title
         task_title=$(jq -r '.title' "$TASKS_DIR/failed/$task_id.json")
 
-        # 通知 inspector
-        local notify_id="sys-task-exhausted-$(date +%s)-${task_id}"
-        mkdir -p "${INBOX_DIR}/inspector"
-        jq -n \
-            --arg id "$notify_id" \
-            --arg from "system" \
-            --arg to "inspector" \
-            --arg content "[任务失败] 任务 $task_id ($task_title) 重试耗尽 ($new_count/$max_retries)。最终原因: $reason。请人工介入。" \
-            --arg timestamp "$now_ts" \
-            --arg status "pending" \
-            --arg priority "high" \
-            '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-            > "${INBOX_DIR}/inspector/${notify_id}.json"
+        # 通知 inspector（高优先级）
+        _unified_notify "inspector" \
+            "[任务失败] 任务 $task_id ($task_title) 重试耗尽 ($new_count/$max_retries)。最终原因: $reason。请人工介入。" \
+            "task.exhausted" "high"
 
-        # 通知发布者
-        local from_pane
-        from_pane=$(jq -r --arg role "$from_role" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-        [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-            "[任务失败] $task_id ($task_title) 重试耗尽 ($new_count/$max_retries)，已移入 failed/，请人工介入" 2>/dev/null || true
+        # 通知发布者（高优先级）
+        _unified_notify "$from_id" \
+            "[任务失败] $task_id ($task_title) 重试耗尽 ($new_count/$max_retries)，已移入 failed/，请人工介入" \
+            "task.exhausted" "high"
 
         info "任务重试耗尽，已移入 failed/: $task_id ($new_count/$max_retries)"
+
+        # 级联失败：依赖此任务的 blocked 任务也标记为 failed
+        _cascade_fail_blocked "$task_id"
     fi
 }
 
@@ -1081,8 +1106,8 @@ cmd_escalate_task() {
     local task_id="$1"
     local reason="${2:-任务过于复杂，需要拆分}"
 
-    local my_role
-    my_role=$(detect_my_role)
+    local my_instance
+    my_instance=$(detect_my_instance)
 
     local task_file="$TASKS_DIR/processing/$task_id.json"
     [[ -f "$task_file" ]] || die "escalate-task: 任务不在 processing 状态: $task_id"
@@ -1090,7 +1115,7 @@ cmd_escalate_task() {
     # 验证是当前角色认领的任务
     local claimed_by
     claimed_by=$(jq -r '.claimed_by // ""' "$task_file")
-    [[ "$claimed_by" == "$my_role" ]] || die "escalate-task: 任务 $task_id 不是由你 ($my_role) 认领的 (认领者: $claimed_by)"
+    [[ "$claimed_by" == "$my_instance" ]] || die "escalate-task: 任务 $task_id 不是由你 ($my_instance) 认领的 (认领者: $claimed_by)"
 
     local now_ts
     now_ts=$(get_timestamp)
@@ -1098,7 +1123,7 @@ cmd_escalate_task() {
     # 更新任务: 释放认领 + 标记 escalated
     local tmp="$task_file.tmp"
     if ! jq --arg reason "$reason" \
-       --arg by "$my_role" \
+       --arg by "$my_instance" \
        --arg at "$now_ts" \
        '
        .claimed_by = null
@@ -1115,39 +1140,21 @@ cmd_escalate_task() {
     fi
     mv "$tmp" "$task_file"
 
-    emit_event "task.escalated" "$my_role" "task_id=$task_id" "reason=$reason"
+    emit_event "task.escalated" "$my_instance" "task_id=$task_id" "reason=$reason"
 
     # Story 更新
     _story_update_task "$task_id" "escalated" "上报拆分: $reason"
 
-    # 通知 supervisor
-    local supervisor_pane
-    supervisor_pane=$(jq -r '.panes[] | select(.role == "supervisor") | .pane' "$STATE_FILE" 2>/dev/null | head -1)
-    if [[ -n "$supervisor_pane" ]]; then
-        push_to_pane "$supervisor_pane" \
-            "[任务上报] $my_role 上报任务 $task_id 需要拆分。原因: $reason
-请使用 split-task 拆分此任务: swarm-msg.sh split-task $task_id --subtask \"子任务1\" --assign 角色 [...]
-（如需同层替换而非嵌套拆分，可用 expand-subtask）"
-    fi
-
-    # 也写入 supervisor inbox（确保不遗漏）
-    local msg_id="escalate-${task_id}-$(date +%s)"
-    mkdir -p "${INBOX_DIR}/supervisor"
-    jq -n \
-        --arg id "$msg_id" \
-        --arg from "$my_role" \
-        --arg to "supervisor" \
-        --arg content "[任务上报] 任务 $task_id 需要拆分。原因: $reason。请使用 split-task 拆分此任务（如需同层替换可用 expand-subtask）。" \
-        --arg timestamp "$now_ts" \
-        --arg status "pending" \
-        --arg priority "high" \
-        '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-        > "${INBOX_DIR}/supervisor/${msg_id}.json"
+    # 通知 supervisor（统一通知，含 inbox 持久化 + 可选 pane 推送）
+    local escalate_msg="[任务上报] $my_instance 上报任务 $task_id 需要拆分。原因: $reason。"
+    escalate_msg+=$'\n'"请使用 split-task 拆分此任务: swarm-msg.sh split-task $task_id --subtask \"子任务1\" --assign 角色 [...]"
+    escalate_msg+=$'\n'"（如需同层替换而非嵌套拆分，可用 expand-subtask）"
+    _unified_notify "supervisor" "$escalate_msg" "task.escalated" "high"
 
     info "任务已上报: $task_id → supervisor"
 
     # 自动认领下一个任务
-    _auto_claim_next "$my_role"
+    _auto_claim_next "$my_instance"
 }
 
 # =============================================================================
@@ -1371,21 +1378,17 @@ cmd_split_task() {
         "subtask_ids=$(IFS=,; echo "${subtask_ids[*]}")"
 
     # 推送通知
-    local from_pane
-    from_pane=$(jq -r --arg role "$p_from" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-    [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-        "[任务拆分] $parent_id 已拆分为 $subtask_count 个子任务: $(IFS=,; echo "${subtask_ids[*]}")" 2>/dev/null || true
+    _unified_notify "$p_from" \
+        "[任务拆分] $parent_id 已拆分为 $subtask_count 个子任务: $(IFS=,; echo "${subtask_ids[*]}")" "task.split"
 
-    # 通知被指派的角色
+    # 通知被指派的实例/角色
     for i in $(seq 0 $((subtask_count - 1))); do
         local sub_assign="${subtask_assigns[$i]}"
         local sub_id="${subtask_ids[$i]}"
         local sub_title="${subtask_titles[$i]}"
         if [[ -n "$sub_assign" ]]; then
-            local target_pane
-            target_pane=$(jq -r --arg role "$sub_assign" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-            [[ -n "$target_pane" ]] && push_to_pane "$target_pane" \
-                "[子任务] $sub_id: $sub_title (父任务: $parent_id) 已指派给你" 2>/dev/null || true
+            _unified_notify "$sub_assign" \
+                "[子任务] $sub_id: $sub_title (父任务: $parent_id) 已指派给你" "task.split"
         fi
     done
 
@@ -1786,31 +1789,25 @@ cmd_expand_subtask() {
         "new_subtasks=$(IFS=,; echo "${subtask_ids[*]}")"
 
     # 通知父任务发布者
-    local from_pane
-    from_pane=$(jq -r --arg role "$p_from" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-    [[ -n "$from_pane" ]] && push_to_pane "$from_pane" \
-        "[子任务展开] $parent_id 的子任务 $old_subtask_id 已展开为: $(IFS=,; echo "${subtask_ids[*]}")" 2>/dev/null || true
+    _unified_notify "$p_from" \
+        "[子任务展开] $parent_id 的子任务 $old_subtask_id 已展开为: $(IFS=,; echo "${subtask_ids[*]}")" "task.expanded"
 
     # 通知 Worker（旧子任务的认领者，如果不是发布者本人）
-    local worker_role
-    worker_role=$(jq -r '.claimed_by // ""' "$TASKS_DIR/failed/$old_subtask_id.json" 2>/dev/null)
-    if [[ -n "$worker_role" && "$worker_role" != "null" && "$worker_role" != "$p_from" ]]; then
-        local worker_pane
-        worker_pane=$(jq -r --arg role "$worker_role" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-        [[ -n "$worker_pane" ]] && push_to_pane "$worker_pane" \
-            "[子任务展开] $old_subtask_id → ${subtask_ids[*]} (父任务: $parent_id)" 2>/dev/null || true
+    local worker_id
+    worker_id=$(jq -r '.claimed_by // ""' "$TASKS_DIR/failed/$old_subtask_id.json" 2>/dev/null)
+    if [[ -n "$worker_id" && "$worker_id" != "null" && "$worker_id" != "$p_from" ]]; then
+        _unified_notify "$worker_id" \
+            "[子任务展开] $old_subtask_id → ${subtask_ids[*]} (父任务: $parent_id)" "task.expanded"
     fi
 
-    # 通知被指派的角色
+    # 通知被指派的实例/角色
     for i in $(seq 0 $((subtask_count - 1))); do
         local sub_assign="${subtask_assigns[$i]}"
         local sub_id="${subtask_ids[$i]}"
         local sub_title="${subtask_titles[$i]}"
         if [[ -n "$sub_assign" ]]; then
-            local target_pane
-            target_pane=$(jq -r --arg role "$sub_assign" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-            [[ -n "$target_pane" ]] && push_to_pane "$target_pane" \
-                "[子任务] $sub_id: $sub_title (父任务: $parent_id, 展开自: $old_subtask_id) 已指派给你" 2>/dev/null || true
+            _unified_notify "$sub_assign" \
+                "[子任务] $sub_id: $sub_title (父任务: $parent_id, 展开自: $old_subtask_id) 已指派给你" "task.expanded"
         fi
     done
 
@@ -1931,10 +1928,9 @@ cmd_recover_tasks() {
             continue
         fi
 
-        # 检查认领者的 pane 是否还活着
+        # 检查认领者的 pane 是否还活着（claimed_by 存储的是 instance）
         local pane_target=""
-        pane_target=$(jq -r --arg role "$claimed_by" \
-            '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
+        pane_target=$(_resolve_pane_by_id "$claimed_by")
 
         local pane_alive=true
         if [[ -z "$pane_target" || "$pane_target" == "null" ]]; then
@@ -2045,10 +2041,7 @@ cmd_set_limit() {
     emit_event "config.max_cli_changed" "human" "new_limit=$new_limit" "current_count=$current_count"
 
     # 通知 supervisor（如果存在）
-    local sup_pane
-    sup_pane=$(jq -r '.panes[] | select(.role == "supervisor") | .pane' "$STATE_FILE" 2>/dev/null || true)
-    if [[ -n "$sup_pane" && "$sup_pane" != "null" ]]; then
-        local notify_msg="[系统通知] CLI 上限已更新为 $new_limit（当前 $current_count 个）。如需扩容可继续使用 swarm-join.sh。"
-        push_to_pane "$sup_pane" "$notify_msg" 2>/dev/null || true
-    fi
+    _unified_notify "supervisor" \
+        "[系统通知] CLI 上限已更新为 $new_limit（当前 $current_count 个）。如需扩容可继续使用 swarm-join.sh。" \
+        "config.changed"
 }

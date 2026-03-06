@@ -31,16 +31,6 @@ set -euo pipefail
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-RUNTIME_DIR="${RUNTIME_DIR:-$SWARM_ROOT/runtime}"
-MESSAGES_DIR="${MESSAGES_DIR:-$RUNTIME_DIR/messages}"
-INBOX_DIR="${INBOX_DIR:-$MESSAGES_DIR/inbox}"
-OUTBOX_DIR="${OUTBOX_DIR:-$MESSAGES_DIR/outbox}"
-TASKS_DIR="${TASKS_DIR:-$RUNTIME_DIR/tasks}"
-STATE_FILE="${STATE_FILE:-$RUNTIME_DIR/state.json}"
-SESSION_NAME="${SWARM_SESSION:-swarm}"
-
-# 加载共享事件库
 source "${SCRIPT_DIR}/swarm-lib.sh"
 
 # 加载子模块
@@ -97,6 +87,39 @@ detect_my_role() {
     die "无法检测当前角色。请设置 SWARM_ROLE 环境变量。"
 }
 
+# 自动检测当前实例（唯一标识，用于消息路由和 inbox 目录）
+detect_my_instance() {
+    # 1. SWARM_INSTANCE 环境变量（优先）
+    if [[ -n "${SWARM_INSTANCE:-}" ]]; then
+        echo "$SWARM_INSTANCE"
+        return 0
+    fi
+
+    # 2. 通过当前 tmux pane 推断
+    if [[ -f "$STATE_FILE" ]] && command -v tmux &>/dev/null; then
+        local current_pane
+        current_pane=$(tmux display-message -p '#{window_index}.#{pane_index}' 2>/dev/null || true)
+        if [[ -n "$current_pane" ]]; then
+            local inst
+            inst=$(jq -r --arg pane "$current_pane" \
+                '.panes[] | select(.pane == $pane) | .instance' "$STATE_FILE" 2>/dev/null || true)
+            if [[ -n "$inst" && "$inst" != "null" ]]; then
+                echo "$inst"
+                return 0
+            fi
+        fi
+    fi
+
+    # 3. 回退: SWARM_ROLE（首实例 instance==role）
+    if [[ -n "${SWARM_ROLE:-}" ]]; then
+        log_warn "SWARM_INSTANCE 未设置，使用 SWARM_ROLE='$SWARM_ROLE' 回退（多实例场景可能导致身份混淆）"
+        echo "$SWARM_ROLE"
+        return 0
+    fi
+
+    die "无法检测当前实例。请设置 SWARM_INSTANCE 或 SWARM_ROLE 环境变量。"
+}
+
 # =============================================================================
 # 消息推送（tmux paste-buffer）
 # =============================================================================
@@ -107,16 +130,14 @@ push_to_pane() {
     local pane_target="$1"
     local notification="$2"
 
-    local buf_name="msg-$$-$RANDOM"
     local tmp_file
     tmp_file=$(mktemp "${RUNTIME_DIR}/.msg-push-XXXXXX")
     trap "rm -f '$tmp_file'" RETURN
     printf '%s' "$notification" > "$tmp_file"
 
-    tmux load-buffer -b "$buf_name" "$tmp_file"
-    tmux paste-buffer -b "$buf_name" -t "${SESSION_NAME}:${pane_target}" -d
-    sleep 0.3
-    tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
+    if ! _pane_locked_paste_enter "$pane_target" "$tmp_file" 2>/dev/null; then
+        log_warn "[push_to_pane] paste-buffer 失败: pane=$pane_target"
+    fi
 }
 
 # =============================================================================
@@ -128,31 +149,31 @@ cmd_send() {
     local content="$2"
     local priority="${3:-normal}"
 
-    local my_role
-    my_role=$(detect_my_role)
+    local my_instance
+    my_instance=$(detect_my_instance)
 
-    # 解析目标角色（human 是特殊角色，不在 pane 中）
-    local target_pane="" target_role_name=""
+    # 解析目标（human 是特殊角色，不在 pane 中）
+    local target_pane="" target_instance=""
     if [[ "$to_role" == "human" ]]; then
-        target_role_name="human"
+        target_instance="human"
     else
         local target_info
         target_info=$(resolve_role_to_pane "$to_role")
         target_pane=$(echo "$target_info" | cut -d'|' -f1)
-        target_role_name=$(echo "$target_info" | cut -d'|' -f2)
+        target_instance=$(echo "$target_info" | cut -d'|' -f2)
     fi
 
     # 创建消息
     local msg_id
     msg_id=$(gen_msg_id)
 
-    mkdir -p "${INBOX_DIR}/${target_role_name}"
+    mkdir -p "${INBOX_DIR}/${target_instance}"
 
-    local msg_file="${INBOX_DIR}/${target_role_name}/${msg_id}.json"
+    local msg_file="${INBOX_DIR}/${target_instance}/${msg_id}.json"
     jq -n \
         --arg id "$msg_id" \
-        --arg from "$my_role" \
-        --arg to "$target_role_name" \
+        --arg from "$my_instance" \
+        --arg to "$target_instance" \
         --arg content "$content" \
         --arg timestamp "$(get_timestamp)" \
         --arg status "pending" \
@@ -170,12 +191,12 @@ cmd_send() {
         }' > "$msg_file"
 
     # 发射事件
-    emit_event "message.sent" "$my_role" "msg_id=$msg_id" "to=$target_role_name" "priority=$priority"
+    emit_event "message.sent" "$my_instance" "msg_id=$msg_id" "to=$target_instance" "priority=$priority"
 
     # 推送通知到目标 pane（human 没有 pane，只写 inbox）
     if [[ -n "$target_pane" ]]; then
         local notification
-        notification="[Swarm 消息] 来自 ${my_role}:
+        notification="[Swarm 消息] 来自 ${my_instance}:
 ${content}
 
 回复方式: swarm-msg.sh reply ${msg_id} \"你的回复\""
@@ -183,7 +204,7 @@ ${content}
         push_to_pane "$target_pane" "$notification"
     fi
 
-    info "消息已发送: $my_role -> $target_role_name (${msg_id})"
+    info "消息已发送: $my_instance -> $target_instance (${msg_id})"
     echo "$msg_id"
 }
 
@@ -195,46 +216,47 @@ cmd_reply() {
     local original_msg_id="$1"
     local content="$2"
 
-    local my_role
-    my_role=$(detect_my_role)
+    local my_instance
+    my_instance=$(detect_my_instance)
 
     # 查找原始消息（在自己的收件箱中）
     local original_msg_file=""
-    if [[ -d "${INBOX_DIR}/${my_role}" ]]; then
-        original_msg_file=$(find "${INBOX_DIR}/${my_role}" -name "${original_msg_id}.json" 2>/dev/null | head -1)
+    if [[ -d "${INBOX_DIR}/${my_instance}" ]]; then
+        original_msg_file=$(find "${INBOX_DIR}/${my_instance}" -name "${original_msg_id}.json" 2>/dev/null | head -1)
     fi
     # 也在 outbox 中查找（已标记已读的消息）
-    if [[ -z "$original_msg_file" ]] && [[ -d "${OUTBOX_DIR}/${my_role}" ]]; then
-        original_msg_file=$(find "${OUTBOX_DIR}/${my_role}" -name "${original_msg_id}.json" 2>/dev/null | head -1)
+    if [[ -z "$original_msg_file" ]] && [[ -d "${OUTBOX_DIR}/${my_instance}" ]]; then
+        original_msg_file=$(find "${OUTBOX_DIR}/${my_instance}" -name "${original_msg_id}.json" 2>/dev/null | head -1)
     fi
 
     [[ -n "$original_msg_file" ]] || die "找不到消息: $original_msg_id"
 
-    local from_role
-    from_role=$(jq -r '.from' "$original_msg_file")
+    # .from 字段存储的是发送者的 instance
+    local from_instance
+    from_instance=$(jq -r '.from' "$original_msg_file")
 
-    # 解析目标角色（human 是特殊角色，不在 pane 中）
-    local target_pane="" target_role_name=""
-    if [[ "$from_role" == "human" ]]; then
-        target_role_name="human"
+    # 解析目标（human 是特殊角色，不在 pane 中）
+    local target_pane="" target_instance=""
+    if [[ "$from_instance" == "human" ]]; then
+        target_instance="human"
     else
         local target_info
-        target_info=$(resolve_role_to_pane "$from_role")
+        target_info=$(resolve_role_to_pane "$from_instance")
         target_pane=$(echo "$target_info" | cut -d'|' -f1)
-        target_role_name=$(echo "$target_info" | cut -d'|' -f2)
+        target_instance=$(echo "$target_info" | cut -d'|' -f2)
     fi
 
     # 创建回复消息
     local reply_id
     reply_id=$(gen_msg_id)
 
-    mkdir -p "${INBOX_DIR}/${target_role_name}"
+    mkdir -p "${INBOX_DIR}/${target_instance}"
 
-    local reply_file="${INBOX_DIR}/${target_role_name}/${reply_id}.json"
+    local reply_file="${INBOX_DIR}/${target_instance}/${reply_id}.json"
     jq -n \
         --arg id "$reply_id" \
-        --arg from "$my_role" \
-        --arg to "$target_role_name" \
+        --arg from "$my_instance" \
+        --arg to "$target_instance" \
         --arg content "$content" \
         --arg timestamp "$(get_timestamp)" \
         --arg status "pending" \
@@ -252,12 +274,12 @@ cmd_reply() {
         }' > "$reply_file"
 
     # 发射事件
-    emit_event "message.replied" "$my_role" "msg_id=$reply_id" "to=$target_role_name" "reply_to=$original_msg_id"
+    emit_event "message.replied" "$my_instance" "msg_id=$reply_id" "to=$target_instance" "reply_to=$original_msg_id"
 
     # 推送通知到目标 pane（human 没有 pane，只写 inbox）
     if [[ -n "$target_pane" ]]; then
         local notification
-        notification="[Swarm 回复] 来自 ${my_role} (回复 ${original_msg_id}):
+        notification="[Swarm 回复] 来自 ${my_instance} (回复 ${original_msg_id}):
 ${content}
 
 回复方式: swarm-msg.sh reply ${reply_id} \"你的回复\""
@@ -265,7 +287,7 @@ ${content}
         push_to_pane "$target_pane" "$notification"
     fi
 
-    info "回复已发送: $my_role -> $target_role_name (${reply_id})"
+    info "回复已发送: $my_instance -> $target_instance (${reply_id})"
     echo "$reply_id"
 }
 
@@ -274,18 +296,27 @@ ${content}
 # =============================================================================
 
 cmd_read() {
-    local my_role
-    my_role=$(detect_my_role)
+    local my_instance
+    my_instance=$(detect_my_instance)
 
-    local inbox="${INBOX_DIR}/${my_role}"
+    local inbox="${INBOX_DIR}/${my_instance}"
 
     if [[ ! -d "$inbox" ]]; then
         echo "没有新消息。"
         return 0
     fi
 
+    # 按优先级排序：urgent > high > normal > low，同优先级按文件名（时间戳）排序
+    # 使用 find + xargs 分批传递，避免大量文件时超过 ARG_MAX
     local msg_files
-    msg_files=$(find "$inbox" -name "*.json" -type f 2>/dev/null | sort)
+    msg_files=$(
+        find "$inbox" -maxdepth 1 -name '*.json' -type f -print0 2>/dev/null \
+        | xargs -0 jq -r '
+            ({"urgent":"0","high":"1","normal":"2","low":"3"}[.priority // "normal"] // "2")
+            + "|" + input_filename
+          ' 2>/dev/null \
+        | sort -t'|' -k1,1n -k2,2 | cut -d'|' -f2
+    )
 
     if [[ -z "$msg_files" ]]; then
         echo "没有新消息。"
@@ -327,8 +358,8 @@ cmd_wait() {
         esac
     done
 
-    local my_role
-    my_role=$(detect_my_role)
+    local my_instance
+    my_instance=$(detect_my_instance)
 
     info "等待新消息... (超时: ${timeout}s${from_filter:+, 来自: $from_filter})"
 
@@ -359,10 +390,10 @@ cmd_wait() {
                 *) continue ;;
             esac
 
-            # 检查目标是否为当前角色
+            # 检查目标是否为当前实例
             local event_to
             event_to=$(echo "$line" | jq -r '.data.to // ""' 2>/dev/null)
-            if [[ "$event_type" != "message.broadcast" && "$event_to" != "$my_role" ]]; then
+            if [[ "$event_type" != "message.broadcast" && "$event_to" != "$my_instance" ]]; then
                 continue
             fi
 
@@ -388,10 +419,10 @@ cmd_wait() {
 cmd_list_roles() {
     [[ -f "$STATE_FILE" ]] || die "state.json 不存在，蜂群未启动？"
 
-    echo "在线角色:"
+    echo "在线实例:"
     echo ""
 
-    jq -r '.panes[] | "  \(.role)\(if .alias and .alias != "" then " (\(.alias))" else "" end) -> pane \(.pane) [\(.cli)]\(if .branch and .branch != "" then " branch:\(.branch)" else "" end)"' "$STATE_FILE"
+    jq -r '.panes[] | "  \(.instance // .role)\(if .instance != .role then " (角色: \(.role))" else "" end)\(if .alias and .alias != "" then " (\(.alias))" else "" end) -> pane \(.pane) [\(.cli)]\(if .branch and .branch != "" then " branch:\(.branch)" else "" end)"' "$STATE_FILE"
 }
 
 # =============================================================================
@@ -401,33 +432,33 @@ cmd_list_roles() {
 cmd_broadcast() {
     local content="$1"
 
-    local my_role
-    my_role=$(detect_my_role)
+    local my_instance
+    my_instance=$(detect_my_instance)
 
     [[ -f "$STATE_FILE" ]] || die "state.json 不存在，蜂群未启动？"
 
     local msg_id
     msg_id=$(gen_msg_id)
 
-    # 获取所有角色（排除自己）
-    local roles
-    roles=$(jq -r --arg me "$my_role" '.panes[] | select(.role != $me) | "\(.role)|\(.pane)"' "$STATE_FILE")
+    # 获取所有实例（排除自己）
+    local instances
+    instances=$(jq -r --arg me "$my_instance" '.panes[] | select(.instance != $me) | "\(.instance)|\(.pane)"' "$STATE_FILE")
 
-    if [[ -z "$roles" ]]; then
-        info "没有其他在线角色可以广播。"
+    if [[ -z "$instances" ]]; then
+        info "没有其他在线实例可以广播。"
         return 0
     fi
 
     local count=0
-    while IFS='|' read -r role pane; do
-        # 为每个角色创建消息副本
-        local individual_id="${msg_id}-${role}"
-        mkdir -p "${INBOX_DIR}/${role}"
+    while IFS='|' read -r inst pane; do
+        # 为每个实例创建消息副本
+        local individual_id="${msg_id}-${inst}"
+        mkdir -p "${INBOX_DIR}/${inst}"
 
         jq -n \
             --arg id "$individual_id" \
-            --arg from "$my_role" \
-            --arg to "$role" \
+            --arg from "$my_instance" \
+            --arg to "$inst" \
             --arg content "$content" \
             --arg timestamp "$(get_timestamp)" \
             --arg status "pending" \
@@ -441,26 +472,26 @@ cmd_broadcast() {
                 status: $status,
                 reply_to: null,
                 priority: $priority
-            }' > "${INBOX_DIR}/${role}/${individual_id}.json"
+            }' > "${INBOX_DIR}/${inst}/${individual_id}.json"
 
         # 推送通知
         local notification
-        notification="[Swarm 广播] 来自 ${my_role}:
+        notification="[Swarm 广播] 来自 ${my_instance}:
 ${content}
 
 回复方式: swarm-msg.sh reply ${individual_id} \"你的回复\""
 
         push_to_pane "$pane" "$notification" 2>/dev/null || {
-            info "警告: 推送通知到 ${role} (pane ${pane}) 失败，跳过"
+            info "警告: 推送通知到 ${inst} (pane ${pane}) 失败，跳过"
         }
 
         count=$((count + 1))
-    done <<< "$roles"
+    done <<< "$instances"
 
     # 发射广播事件
-    emit_event "message.broadcast" "$my_role" "msg_id=$msg_id" "recipients=$count"
+    emit_event "message.broadcast" "$my_instance" "msg_id=$msg_id" "recipients=$count"
 
-    info "广播已发送给 ${count} 个角色"
+    info "广播已发送给 ${count} 个实例"
 }
 
 # =============================================================================
@@ -470,11 +501,11 @@ ${content}
 cmd_mark_read() {
     local target="$1"
 
-    local my_role
-    my_role=$(detect_my_role)
+    local my_instance
+    my_instance=$(detect_my_instance)
 
-    local inbox="${INBOX_DIR}/${my_role}"
-    mkdir -p "${OUTBOX_DIR}/${my_role}"
+    local inbox="${INBOX_DIR}/${my_instance}"
+    mkdir -p "${OUTBOX_DIR}/${my_instance}"
 
     if [[ "$target" == "--all" ]]; then
         # 标记所有消息为已读
@@ -482,7 +513,7 @@ cmd_mark_read() {
         if [[ -d "$inbox" ]]; then
             for msg_file in "$inbox"/*.json; do
                 [[ -f "$msg_file" ]] || continue
-                mv "$msg_file" "${OUTBOX_DIR}/${my_role}/"
+                mv "$msg_file" "${OUTBOX_DIR}/${my_instance}/"
                 count=$((count + 1))
             done
         fi
@@ -491,7 +522,7 @@ cmd_mark_read() {
         # 标记指定消息为已读
         local msg_file="${inbox}/${target}.json"
         if [[ -f "$msg_file" ]]; then
-            mv "$msg_file" "${OUTBOX_DIR}/${my_role}/"
+            mv "$msg_file" "${OUTBOX_DIR}/${my_instance}/"
             info "消息 $target 已标记为已读"
         else
             die "找不到消息: $target"
@@ -812,6 +843,11 @@ main() {
         story-view)
             [[ $# -ge 1 ]] || die "用法: swarm-msg.sh story-view <group-id>"
             _story_render_markdown "$1"
+            ;;
+        set-prd)
+            [[ $# -ge 2 ]] || die "用法: swarm-msg.sh set-prd <group-id> \"<prd-content>\""
+            _story_set_prd "$1" "$2" "$(detect_my_instance)"
+            echo "PRD 已关联到任务组 $1"
             ;;
         recover-tasks)
             cmd_recover_tasks

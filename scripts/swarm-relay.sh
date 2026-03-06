@@ -37,14 +37,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-readonly SWARM_ROOT="${SWARM_ROOT:-$(dirname "$SCRIPT_DIR")}"
-readonly SCRIPTS_DIR="${SWARM_ROOT}/scripts"
-readonly STATE_FILE="${SWARM_ROOT}/runtime/state.json"
-readonly RESULTS_DIR="${SWARM_ROOT}/runtime/results"
-readonly SESSION_NAME="${SWARM_SESSION:-swarm}"
-
-# 加载共享事件库
 source "${SCRIPT_DIR}/swarm-lib.sh"
+readonly RESULTS_DIR="${RUNTIME_DIR}/results"
 
 # 默认配置
 TIMEOUT=300
@@ -208,11 +202,8 @@ ${response}"
     tmp_file=$(mktemp "${SWARM_ROOT}/runtime/.relay-XXXXXX")
     echo "$message" > "$tmp_file"
 
-    # 使用 tmux load-buffer + paste-buffer 发送长消息
-    tmux load-buffer "$tmp_file"
-    tmux paste-buffer -t "${SESSION_NAME}:${to_pane}"
-    sleep 0.5
-    tmux send-keys -t "${SESSION_NAME}:${to_pane}" Enter
+    # 使用原子发送（flock 保护 paste-buffer + Enter 序列）
+    _pane_locked_paste_enter "$to_pane" "$tmp_file"
 
     rm -f "$tmp_file"
 

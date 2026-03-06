@@ -49,10 +49,38 @@ _create_story() {
             from: $from,
             created_at: $created_at,
             status: "active",
+            prd: null,
             tasks: [],
             verifications: [],
             timeline: [($created_at + " 任务组创建 by " + $from)]
         }' > "$story_file"
+}
+
+# 关联 PRD 到 Story
+# 参数: $1=group_id, $2=prd_content, $3=from(提交者)
+# 使用临时文件传递 PRD 内容，避免长文本超出 ARG_MAX 限制
+_story_set_prd() {
+    local group_id="$1" prd_content="$2" from="${3:-prd}"
+    local now
+    now=$(get_timestamp)
+
+    # 将 PRD 构造为 JSON 对象写入临时文件（通过文件传递内容，避免 ARG_MAX）
+    local prd_tmp prd_content_tmp
+    prd_tmp=$(mktemp "${RUNTIME_DIR:=/tmp}/.prd-XXXXXX")
+    prd_content_tmp=$(mktemp "${RUNTIME_DIR:=/tmp}/.prd-content-XXXXXX")
+    trap "rm -f '$prd_tmp' '$prd_content_tmp'" RETURN
+    printf '%s' "$prd_content" > "$prd_content_tmp"
+    jq -n \
+        --rawfile content "$prd_content_tmp" \
+        --arg from "$from" \
+        --arg updated_at "$now" \
+        '{content:$content, from:$from, updated_at:$updated_at}' > "$prd_tmp"
+    rm -f "$prd_content_tmp"
+
+    _story_update "$group_id" \
+        '.prd = $p[0] | .timeline += [$msg]' \
+        --slurpfile p "$prd_tmp" \
+        --arg msg "$now PRD 关联 by $from"
 }
 
 # 向 Story 追加子任务
@@ -145,6 +173,11 @@ _story_render_markdown() {
         "> 创建者: \(.from)\n" +
         "> 创建时间: \(.created_at)\n" +
         "> 状态: \(.status)\n\n" +
+        (if .prd then
+            "## PRD\n\n" +
+            "> 提交者: \(.prd.from) | 更新时间: \(.prd.updated_at)\n\n" +
+            "\(.prd.content)\n\n"
+         else "" end) +
         "## 子任务\n\n" +
         (if (.tasks | length) == 0 then "（暂无子任务）\n"
          else (.tasks | map(

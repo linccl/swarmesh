@@ -32,6 +32,7 @@ swarm-msg.sh list-roles
 | 类型 | 说明 | 处理方式 |
 |------|------|---------|
 | **开发任务** | 需要拆解、派发给角色执行的工作 | → 继续第 3 步，走编排流程 |
+| **模糊需求** | 需求不清晰、缺少验收标准或有歧义 | → 转发给 prd 角色进行需求分析（见下方） |
 | **操作指令** | 规范约束、行为要求、流程变更等 | → 广播或转发给相关角色（见下方） |
 | **信息咨询** | 询问进度、状态、角色情况等 | → 直接查询并回复 human |
 
@@ -40,6 +41,15 @@ swarm-msg.sh list-roles
 - 涉及特定角色 → `swarm-msg.sh send <role> "指令内容"`
 - 不确定发给谁 → 广播给所有在线角色
 - 处理完毕后向 human 确认: `swarm-msg.sh send human "已将指令转发给 XX"`
+
+**模糊需求处理**：
+- 判断标准：需求缺少具体功能点、无验收标准、有明显歧义、或只是一个方向性描述（如"做个用户系统"）
+- 转发给 prd: `swarm-msg.sh send prd "收到以下需求，请进行需求分析并输出 PRD：\n[原始需求内容]"`
+- prd 会主动向 human 澄清不明确的点，然后输出结构化 PRD 回传给你
+- 收到 PRD 后，按正常编排流程（第 3 步起）进行技术拆解
+- **状态追踪**: 转发后记录时间，每隔一段时间用 `swarm-msg.sh read` 检查 prd 是否有回复
+- **超时降级**: 如果长时间未收到 prd 回复，向 prd 催促一次：`swarm-msg.sh send prd "需求分析进展？是否在等 human 回复？"`。如果催促后仍无响应，降级处理：自行向 human 确认需求细节后继续
+- 如果团队中没有 prd 角色，自行向 human 确认需求细节后继续
 
 **信息咨询处理**：
 - 用 `swarm-msg.sh list-tasks --all`、`swarm-msg.sh group-status` 等命令查询
@@ -78,6 +88,9 @@ swarm-msg.sh send inspector "请分析项目技术栈并配置质量门。
 ```bash
 # 创建任务组
 G=$(swarm-msg.sh create-group "需求标题")
+
+# 如果有 PRD，关联到任务组（便于 inspector 验收时追溯原始需求）
+swarm-msg.sh set-prd $G "PRD 内容..."
 
 # 派发子任务（定向指派 + 详细描述）
 T1=$(swarm-msg.sh publish develop "设计 users 表" -g $G --assign database \
@@ -230,6 +243,7 @@ swarm-join.sh <role> --cli "<cli命令>" --config <配置路径>
 | performance | `claude chat` | quality/performance.md | 性能分析需要复杂推理 |
 | reviewer | `codex chat` | quality/reviewer.md | 代码审查属标准化检查 |
 | ui-designer | `gemini --approval-mode yolo` | management/ui-designer.md | UI 设计需要多模态能力 |
+| prd | `claude chat` | management/prd.md | 需求分析需要理解力和结构化表达 |
 | architect | `claude chat` | management/architect.md | 架构决策需要最强推理 |
 | auditor | `codex chat` | management/auditor.md | 审计检查属标准化流程 |
 | inspector | `claude chat` | management/inspector.md | 质量判断需要强推理 |
@@ -246,14 +260,26 @@ swarm-join.sh security --cli "claude chat" --config quality/security.md
 # security 加入后会自动从队列认领匹配的任务
 ```
 
-### 扩容同角色 CLI
+### 扩容同角色 CLI（多实例）
 
-当任务多、某角色成为瓶颈时，可以加更多 CLI：
+当任务多、某角色成为瓶颈时，可以加更多同角色 CLI 实例：
 
 ```bash
-# 再加一个 backend CLI（同角色多实例，先到先得认领任务）
+# 再加一个 backend CLI（自动编号为 backend-2）
 swarm-join.sh backend --cli "claude chat" --config core/backend.md
 ```
+
+**实例命名规则**: 首实例名 = 角色名（如 `backend`），后续实例自动编号（`backend-2`、`backend-3`）。
+
+**任务分配**:
+- `--assign backend` → 任意 backend 实例可认领（先到先得）
+- `--assign backend-2` → 只有 backend-2 可认领（精确指派）
+
+**消息路由**:
+- `swarm-msg.sh send backend "msg"` → 发给首实例 backend
+- `swarm-msg.sh send backend-2 "msg"` → 发给 backend-2
+
+**注意**: supervisor 和 inspector 为管理角色，不支持多实例。
 
 ## 禁止行为
 

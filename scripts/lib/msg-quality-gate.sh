@@ -85,9 +85,13 @@ _run_quality_gate() {
         fi
     done
 
-    # 获取工蜂的 worktree 路径
+    # 获取工蜂的 worktree 路径（role 参数实际上是 instance）
     local worktree=""
-    worktree=$(jq -r --arg role "$role" '.panes[] | select(.role == $role) | .worktree // ""' "$STATE_FILE" 2>/dev/null)
+    worktree=$(jq -r --arg inst "$role" '
+        (.panes[] | select(.instance == $inst) | .worktree // "") //
+        (.panes[] | select(.role == $inst) | .worktree // "") //
+        empty
+    ' "$STATE_FILE" 2>/dev/null | head -1)
     if [[ -z "$worktree" || ! -d "$worktree" ]]; then
         info "[质量门] 无法获取 $role 的 worktree，跳过检查"
         return 0
@@ -172,15 +176,10 @@ _run_quality_gate() {
     if [[ $skip_count -gt 0 ]]; then
         warn "[质量门] $skip_count 个检查因命令不存在被跳过: $skip_names"
         echo "WARNING: $skip_count 个检查被跳过 (命令不存在): $skip_names" >> "$log_file"
-        # 写入 inspector 收件箱
-        local warn_id="sys-gate-$(date +%s)-${RANDOM}"
-        mkdir -p "${INBOX_DIR}/inspector"
-        jq -n \
-            --arg id "$warn_id" \
-            --arg content "质量门警告: 任务 $task_id 有 $skip_count 个检查因命令不存在被跳过（${skip_names}）。请检查 worktree 环境是否缺少依赖，或调整 set-verify 配置。" \
-            --arg timestamp "$(get_timestamp)" \
-            '{id:$id, from:"system", to:"inspector", content:$content, timestamp:$timestamp, status:"pending", reply_to:"", priority:"high"}' \
-            > "${INBOX_DIR}/inspector/${warn_id}.json" 2>/dev/null || true
+        # 通知 inspector 环境可能缺依赖
+        _unified_notify "inspector" \
+            "质量门警告: 任务 $task_id 有 $skip_count 个检查因命令不存在被跳过（${skip_names}）。请检查 worktree 环境是否缺少依赖，或调整 set-verify 配置。" \
+            "gate.skip_warning" "high"
     fi
 
     if [[ "$all_passed" == true ]]; then
@@ -192,15 +191,11 @@ _run_quality_gate() {
         [[ -n "$group_id" ]] && _story_add_verification "$group_id" "$task_id" "Gate 失败" "自动"
 
         # 任务保持在 processing（无需回退，本来就没移走）
-        # 推送失败日志给工蜂
-        local role_pane
-        role_pane=$(jq -r --arg role "$role" '.panes[] | select(.role == $role) | .pane' "$STATE_FILE" 2>/dev/null || echo "")
-        if [[ -n "$role_pane" ]]; then
-            local fail_msg="[质量门失败] 任务 $task_id 未通过自动检查，仍在 processing 状态。"
-            fail_msg+=$'\n'"查看详情: cat $log_file"
-            fail_msg+=$'\n'"修复后重新执行: swarm-msg.sh complete-task $task_id \"修复说明\""
-            push_to_pane "$role_pane" "$fail_msg" 2>/dev/null || true
-        fi
+        # 推送失败日志给工蜂（role 参数实际上是 instance）
+        local fail_msg="[质量门失败] 任务 $task_id 未通过自动检查，仍在 processing 状态。"
+        fail_msg+=$'\n'"查看详情: cat $log_file"
+        fail_msg+=$'\n'"修复后重新执行: swarm-msg.sh complete-task $task_id \"修复说明\""
+        _unified_notify "$role" "$fail_msg" "gate.failed" "high"
 
         info "[质量门] 任务 $task_id 未通过检查，保持 processing"
         return 1
