@@ -394,7 +394,11 @@ ${team_info}
 开发完成后你的代码会自动 commit 到分支。如需审核,执行:
   swarm-msg.sh publish review "审核标题" --description "变更说明"
 
-当你判断任务涉及其他角色的职责时,主动用 swarm-msg.sh send 联系他们。收到消息后请及时处理并回复。
+当你判断任务涉及其他角色的职责时,主动用 swarm-msg.sh send 联系他们。
+收到消息后先判断是否真的需要回复:
+- 需要补充信息、明确行动、报告阻塞、交付结果 -> 回复
+- 纯确认、礼貌收尾、继续待命、重复同步 -> 不回复
+- 对方已说明“无需再回复”或“有实质进展再同步” -> 严格停止该线程
 INIT_EOF
 }
 
@@ -1361,6 +1365,26 @@ check_prompt() {
 # 任务完成自动通知 supervisor
 # =============================================================================
 
+# 统计实例当前仍持有的 processing 任务数
+_count_processing_tasks_for_instance() {
+    local instance="$1"
+    local count=0
+    local task_file
+
+    [[ -d "$TASKS_DIR/processing" ]] || { echo 0; return 0; }
+
+    for task_file in "$TASKS_DIR/processing/"*.json; do
+        [[ -f "$task_file" ]] || continue
+        local claimed_by
+        claimed_by=$(jq -r '.claimed_by // ""' "$task_file" 2>/dev/null)
+        if [[ "$claimed_by" == "$instance" ]]; then
+            ((count++)) || true
+        fi
+    done
+
+    echo "$count"
+}
+
 # 当角色完成任务时，自动通知 supervisor 可分配新任务
 # 双通道: inbox（可靠持久）+ paste-buffer（即时推送）
 _notify_supervisor_completion() {
@@ -1432,6 +1456,7 @@ start_pane_watcher() {
     (
         local state="init"
         local active_since=0
+        local claimed_tasks_before=0
 
         # 等待日志文件出现
         while [[ ! -f "$log_file" ]]; do sleep 0.5; done
@@ -1445,6 +1470,7 @@ start_pane_watcher() {
                 if [[ "$state" == "idle" ]]; then
                     state="active"
                     active_since=$(date +%s)
+                    claimed_tasks_before=$(_count_processing_tasks_for_instance "$instance")
                 fi
                 # init 和 active 状态下继续消费输出
             else
@@ -1459,13 +1485,19 @@ start_pane_watcher() {
                     active)
                         # 任务完成？检查提示符
                         if check_prompt "$pane"; then
-                            # 自动提交 worktree 中的变更
+                            local claimed_tasks_after=0
+                            claimed_tasks_after=$(_count_processing_tasks_for_instance "$instance")
+
+                            # 始终尝试提交当前 worktree 变更，但只有“认领中的任务数从 >0 变为 0”
+                            # 才认定为真实完成，避免把纯消息确认/待命同步误判成任务完成。
                             auto_commit_worktree "$instance" "$worktree"
-                            emit_event "task.completed" "$instance" "pane=$pane" "detected_by=watcher"
-                            # 自动通知 supervisor 可分配新任务
-                            _notify_supervisor_completion "$instance"
+                            if [[ "$claimed_tasks_before" -gt 0 && "$claimed_tasks_after" -eq 0 ]]; then
+                                emit_event "task.completed" "$instance" "pane=$pane" "detected_by=watcher"
+                                _notify_supervisor_completion "$instance"
+                            fi
                             state="idle"
                             active_since=0
+                            claimed_tasks_before=0
                         else
                             # stall 检测：active 状态下持续无输出且未完成
                             # active_since == 0 的防御：init → 静默超时的边界情况

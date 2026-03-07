@@ -120,6 +120,15 @@ detect_my_instance() {
     die "无法检测当前实例。请设置 SWARM_INSTANCE 或 SWARM_ROLE 环境变量。"
 }
 
+build_reply_guidance() {
+    local msg_id="$1"
+    cat <<EOF
+消息ID: ${msg_id}
+仅在需要补充信息、明确行动、报告阻塞或交付结果时回复。
+纯确认、礼貌收尾、待命同步不要回复。
+EOF
+}
+
 # =============================================================================
 # 消息推送（tmux paste-buffer）
 # =============================================================================
@@ -199,7 +208,7 @@ cmd_send() {
         notification="[Swarm 消息] 来自 ${my_instance}:
 ${content}
 
-回复方式: swarm-msg.sh reply ${msg_id} \"你的回复\""
+$(build_reply_guidance "$msg_id")"
 
         push_to_pane "$target_pane" "$notification"
     fi
@@ -282,7 +291,7 @@ cmd_reply() {
         notification="[Swarm 回复] 来自 ${my_instance} (回复 ${original_msg_id}):
 ${content}
 
-回复方式: swarm-msg.sh reply ${reply_id} \"你的回复\""
+$(build_reply_guidance "$reply_id")"
 
         push_to_pane "$target_pane" "$notification"
     fi
@@ -335,7 +344,7 @@ cmd_read() {
             "  ID: \(.id)\n  来自: \(.from)\n  时间: \(.timestamp)\n" +
             (if .reply_to and .reply_to != "" and .reply_to != null then "  回复: \(.reply_to)\n" else "" end) +
             (if (.priority // "normal") != "normal" then "  优先级: \(.priority)\n" else "" end) +
-            "  内容: \(.content)\n\n  回复: swarm-msg.sh reply \(.id) \"你的回复\""
+            "  内容: \(.content)\n\n  默认不要仅回复“收到”。如需回复（仅限新增信息/行动/结果）: swarm-msg.sh reply \(.id) \"回复内容\""
         ' "$msg_file"
     done <<< "$msg_files"
 
@@ -479,7 +488,7 @@ cmd_broadcast() {
         notification="[Swarm 广播] 来自 ${my_instance}:
 ${content}
 
-回复方式: swarm-msg.sh reply ${individual_id} \"你的回复\""
+$(build_reply_guidance "$individual_id")"
 
         push_to_pane "$pane" "$notification" 2>/dev/null || {
             info "警告: 推送通知到 ${inst} (pane ${pane}) 失败，跳过"
