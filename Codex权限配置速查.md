@@ -1,30 +1,30 @@
 # Codex 权限配置速查
 
-这是一份便于快速查看的 README 式说明，详细版见：`/Users/linshiyu/lincc/lincc-project/swarmesh/Codex权限配置方案.md`
+这是一份便于快速查看的 README 式说明，详细版见：`Codex权限配置方案.md`
 
 ## 当前目标
 
 - 尽量少打断
 - 但不要失控
-- 所有 Codex 都能访问 `/Users/linshiyu/lincc/lincc-project/swarmesh`
+- 所有 Codex 都能访问本项目 `swarmesh` 的路径
 
 ## 当前配置
 
-配置文件：`/Users/linshiyu/.codex/config.toml`
+配置文件：`~/.codex/config.toml`
 
 ```toml
 approval_policy = "never"
 sandbox_mode = "workspace-write"
 
 [sandbox_workspace_write]
-writable_roots = ["/Users/linshiyu/lincc/lincc-project/swarmesh"]
+writable_roots = ["<swarmesh 项目绝对路径>"]
 ```
 
 ## 这意味着什么
 
 - 命令执行默认不弹审批
 - 当前工作区默认可写
-- 所有 Codex 会话额外可写 `swarmesh` 目录
+- 所有 Codex 会话额外可写本项目 `swarmesh` 目录
 - 不会默认放开整台机器
 - 遇到方向性或高风险改动时，仍应先确认
 

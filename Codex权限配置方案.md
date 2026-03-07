@@ -7,11 +7,11 @@
 - 命令执行尽量自动化，不再频繁弹出命令审批。
 - 写入范围保持可控，避免默认放开整台机器。
 - 对任务方向、改动范围、潜在风险较高的事项，仍然先和用户确认。
-- 所有 Codex 会话都能额外访问 `/Users/linshiyu/lincc/lincc-project/swarmesh`。
+- 所有 Codex 会话都能额外访问本项目 `swarmesh` 的路径。
 
 ## 已落地的全局配置
 
-配置文件位置：`/Users/linshiyu/.codex/config.toml`
+配置文件位置：`~/.codex/config.toml`
 
 已写入的核心配置如下：
 
@@ -25,7 +25,7 @@ developer_instructions = """
 """
 
 [sandbox_workspace_write]
-writable_roots = ["/Users/linshiyu/lincc/lincc-project/swarmesh"]
+writable_roots = ["<swarmesh 项目绝对路径>"]
 ```
 
 ## 配置含义
@@ -49,19 +49,19 @@ writable_roots = ["/Users/linshiyu/lincc/lincc-project/swarmesh"]
 
 这解决的是“命令可以写到哪里”的问题。
 
-## 3. 所有 Codex 会话都能访问 swarmesh 目录
+## 3. 所有 Codex 会话都能访问本项目 `swarmesh` 目录
 
 通过以下配置：
 
 ```toml
 [sandbox_workspace_write]
-writable_roots = ["/Users/linshiyu/lincc/lincc-project/swarmesh"]
+writable_roots = ["<swarmesh 项目绝对路径>"]
 ```
 
 实现的效果是：
 
 - 无论从哪个目录启动 Codex，当前工作区仍然可写。
-- 额外允许所有 Codex 会话写入 `/Users/linshiyu/lincc/lincc-project/swarmesh`。
+- 额外允许所有 Codex 会话写入本项目 `swarmesh` 的实际绝对路径。
 
 ## 4. 保留“方向性确认”
 
@@ -105,7 +105,7 @@ writable_roots = ["/Users/linshiyu/lincc/lincc-project/swarmesh"]
 
 - 在允许写入的范围内，命令默认直接执行。
 - 当前工作区始终可写。
-- `/Users/linshiyu/lincc/lincc-project/swarmesh` 对所有 Codex 会话都可写。
+- 本项目 `swarmesh` 的实际绝对路径对所有 Codex 会话都可写。
 - 超出上述范围的写操作会失败，而不是自动获得更高权限。
 - 涉及方向调整或高风险改动时，先询问用户。
 
@@ -138,7 +138,7 @@ approval_policy = "on-request"
 
 ## 回滚方式
 
-如需回滚，只需编辑 `/Users/linshiyu/.codex/config.toml`，撤销以下几类配置：
+如需回滚，只需编辑 `~/.codex/config.toml`，撤销以下几类配置：
 
 - `approval_policy = "never"`
 - `sandbox_mode = "workspace-write"`
