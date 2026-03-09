@@ -562,6 +562,10 @@ cmd_msg() {
         echo "  list-tasks [选项]              列出任务"
         echo "  claim <task-id>               认领任务"
         echo "  complete-task <id> \"<result>\" 完成任务"
+        echo "  pause-task <id> [reason]      暂停任务"
+        echo "  resume-task <id>              恢复任务"
+        echo "  cancel-task <id> [reason]     取消任务"
+        echo "  group-report <group-id>       任务组汇总报告"
         echo "  set-limit [limit]             查看/设置 CLI 预算"
         echo "  wait [--from <role>]          等待消息"
         return 0

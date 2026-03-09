@@ -408,7 +408,7 @@ _generate_subtask_ids() {
 _cancel_subtask_tree() {
     local task_id="$1" reason="${2:-re-split-cascade}"
     local task_file=""
-    for d in pending processing blocked; do
+    for d in pending processing blocked paused; do
         [[ -f "$TASKS_DIR/$d/$task_id.json" ]] && task_file="$TASKS_DIR/$d/$task_id.json" && break
     done
     [[ -n "$task_file" ]] || return 0
@@ -422,8 +422,15 @@ _cancel_subtask_tree() {
     # 取消当前任务
     mkdir -p "$TASKS_DIR/failed"
     local ftmp="$task_file.tmp"
-    jq --arg reason "$reason" --arg at "$(get_timestamp)" \
-        '.status = "failed" | .fail_reason = $reason | .failed_at = $at' \
+    local prev_status
+    prev_status=$(jq -r '.status // "unknown"' "$task_file" 2>/dev/null)
+    jq --arg reason "$reason" --arg at "$(get_timestamp)" --arg from "$prev_status" \
+        '.status = "failed" | .fail_reason = $reason | .failed_at = $at
+         | .flow_log = ((.flow_log // []) + [{
+             ts: $at, action: "cancelled",
+             from_status: $from, to_status: "failed",
+             actor: "system", detail: $reason
+           }])' \
         "$task_file" > "$ftmp" && mv "$ftmp" "$TASKS_DIR/failed/$task_id.json"
     rm -f "$task_file"
 
@@ -806,7 +813,7 @@ cmd_list_tasks() {
 
     local dirs=()
     if [[ "$filter_status" == "all" ]]; then
-        dirs=("pending" "blocked" "processing" "completed" "failed")
+        dirs=("pending" "blocked" "processing" "paused" "completed" "failed")
     else
         dirs=("$filter_status")
     fi
@@ -1149,6 +1156,452 @@ cmd_fail_task() {
 
         # 级联失败：依赖此任务的 blocked 任务也标记为 failed
         _cascade_fail_blocked "$task_id"
+    fi
+}
+
+# =============================================================================
+# 子命令: pause-task (暂停正在执行的任务)
+# =============================================================================
+
+cmd_pause_task() {
+    local task_id="$1"
+    local reason="${2:-手动暂停}"
+
+    local my_instance
+    my_instance=$(detect_my_instance)
+
+    local task_file="$TASKS_DIR/processing/$task_id.json"
+    [[ -f "$task_file" ]] || die "任务不在处理中: $task_id (只能暂停 processing 状态的任务)"
+
+    local now_ts
+    now_ts=$(get_timestamp)
+
+    # 更新状态（保留 claimed_by/claimed_at，resume 时恢复）
+    mkdir -p "$TASKS_DIR/paused"
+    local tmp="$task_file.tmp"
+    if ! jq \
+        --arg reason "$reason" \
+        --arg now_ts "$now_ts" \
+        --arg actor "$my_instance" \
+        '
+        .status = "paused"
+        | .paused_at = $now_ts
+        | .pause_reason = $reason
+        | .flow_log = ((.flow_log // []) + [{
+            ts: $now_ts, action: "paused",
+            from_status: "processing", to_status: "paused",
+            actor: $actor, detail: $reason
+          }])
+        ' "$task_file" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "pause-task: jq 更新失败"
+    fi
+
+    if ! mv "$tmp" "$TASKS_DIR/paused/$task_id.json" 2>/dev/null; then
+        rm -f "$tmp"
+        die "pause-task: 移动到 paused 失败"
+    fi
+    rm -f "$task_file"
+
+    # 清理锁文件
+    rm -f "$TASKS_DIR/processing/${task_id}.op.lock" "$TASKS_DIR/processing/${task_id}.compose.lock" 2>/dev/null
+
+    emit_event "task.paused" "$my_instance" "task_id=$task_id" "reason=$reason"
+
+    # 通知认领者 + supervisor
+    local claimed_by
+    claimed_by=$(jq -r '.claimed_by // ""' "$TASKS_DIR/paused/$task_id.json")
+    local task_title
+    task_title=$(jq -r '.title' "$TASKS_DIR/paused/$task_id.json")
+
+    if [[ -n "$claimed_by" && "$claimed_by" != "null" ]]; then
+        _unified_notify "$claimed_by" \
+            "[任务暂停] $task_id ($task_title) 已暂停。原因: $reason" "task.paused"
+    fi
+    _unified_notify "supervisor" \
+        "[任务暂停] $task_id ($task_title) 已暂停。原因: $reason" "task.paused"
+
+    _story_update_task "$task_id" "paused" "已暂停: $reason"
+
+    info "任务已暂停: $task_id (原因: $reason)"
+}
+
+# =============================================================================
+# 子命令: resume-task (恢复暂停的任务)
+# =============================================================================
+
+cmd_resume_task() {
+    local task_id="$1"
+
+    local my_instance
+    my_instance=$(detect_my_instance)
+
+    local task_file="$TASKS_DIR/paused/$task_id.json"
+    [[ -f "$task_file" ]] || die "任务不在暂停状态: $task_id (只能恢复 paused 状态的任务)"
+
+    local now_ts
+    now_ts=$(get_timestamp)
+
+    # 检查原认领者是否存活
+    local claimed_by
+    claimed_by=$(jq -r '.claimed_by // ""' "$task_file")
+    local pane_alive=false
+    if [[ -n "$claimed_by" && "$claimed_by" != "null" ]]; then
+        local pane_target
+        pane_target=$(_resolve_pane_by_id "$claimed_by")
+        if [[ -n "$pane_target" ]]; then
+            # 检查 pane 是否存活
+            if tmux display-message -t "$pane_target" -p '#{pane_id}' &>/dev/null; then
+                pane_alive=true
+            fi
+        fi
+    fi
+
+    if [[ "$pane_alive" == true ]]; then
+        # 原认领者存活 → 恢复到 processing
+        mkdir -p "$TASKS_DIR/processing"
+        local tmp="$task_file.tmp"
+        if ! jq \
+            --arg now_ts "$now_ts" \
+            --arg actor "$my_instance" \
+            '
+            .status = "processing"
+            | del(.paused_at, .pause_reason)
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "resumed",
+                from_status: "paused", to_status: "processing",
+                actor: $actor, detail: "原认领者存活，恢复处理"
+              }])
+            ' "$task_file" > "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            die "resume-task: jq 更新失败"
+        fi
+
+        if ! mv "$tmp" "$TASKS_DIR/processing/$task_id.json" 2>/dev/null; then
+            rm -f "$tmp"
+            die "resume-task: 移动到 processing 失败"
+        fi
+        rm -f "$task_file"
+
+        emit_event "task.resumed" "$my_instance" "task_id=$task_id" "target=processing"
+
+        _unified_notify "$claimed_by" \
+            "[任务恢复] $task_id 已恢复，请继续处理" "task.resumed"
+
+        _story_update_task "$task_id" "processing" "已恢复: 由 $claimed_by 继续处理"
+
+        info "任务已恢复到 processing: $task_id (认领者: $claimed_by)"
+    else
+        # 原认领者离线 → 放回 pending，清空认领信息
+        mkdir -p "$TASKS_DIR/pending"
+        local tmp="$task_file.tmp"
+        if ! jq \
+            --arg now_ts "$now_ts" \
+            --arg actor "$my_instance" \
+            --arg old_claimed "$claimed_by" \
+            '
+            .status = "pending"
+            | .claimed_by = null
+            | .claimed_at = null
+            | del(.paused_at, .pause_reason)
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "resumed",
+                from_status: "paused", to_status: "pending",
+                actor: $actor, detail: ("原认领者 " + $old_claimed + " 离线，放回待认领")
+              }])
+            ' "$task_file" > "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            die "resume-task: jq 更新失败"
+        fi
+
+        if ! mv "$tmp" "$TASKS_DIR/pending/$task_id.json" 2>/dev/null; then
+            rm -f "$tmp"
+            die "resume-task: 移动到 pending 失败"
+        fi
+        rm -f "$task_file"
+
+        emit_event "task.resumed" "$my_instance" "task_id=$task_id" "target=pending"
+
+        # 广播可认领通知
+        local task_title
+        task_title=$(jq -r '.title' "$TASKS_DIR/pending/$task_id.json")
+        _unified_notify "supervisor" \
+            "[任务恢复] $task_id ($task_title) 已放回待认领队列（原认领者离线）" "task.resumed"
+
+        _story_update_task "$task_id" "pending" "已恢复: 原认领者 $claimed_by 离线，放回待认领"
+
+        info "任务已恢复到 pending: $task_id (原认领者 $claimed_by 离线)"
+    fi
+}
+
+# =============================================================================
+# 子命令: cancel-task (取消任务，级联取消依赖和子任务)
+# =============================================================================
+
+cmd_cancel_task() {
+    local task_id="$1"
+    local reason="${2:-手动取消}"
+
+    local my_instance
+    my_instance=$(detect_my_instance)
+
+    # 在多个目录中查找任务
+    local task_file="" from_status=""
+    for d in pending processing blocked paused; do
+        if [[ -f "$TASKS_DIR/$d/$task_id.json" ]]; then
+            task_file="$TASKS_DIR/$d/$task_id.json"
+            from_status="$d"
+            break
+        fi
+    done
+    [[ -n "$task_file" ]] || die "任务不存在或已完成/已失败: $task_id"
+
+    local now_ts
+    now_ts=$(get_timestamp)
+
+    # 读取任务信息（取消前）
+    local claimed_by task_title from_id
+    claimed_by=$(jq -r '.claimed_by // ""' "$task_file")
+    task_title=$(jq -r '.title' "$task_file")
+    from_id=$(jq -r '.from' "$task_file")
+
+    # 更新状态
+    mkdir -p "$TASKS_DIR/failed"
+    local tmp="$task_file.tmp"
+    if ! jq \
+        --arg reason "$reason" \
+        --arg now_ts "$now_ts" \
+        --arg actor "$my_instance" \
+        --arg from "$from_status" \
+        '
+        .status = "failed"
+        | .fail_reason = ("cancelled: " + $reason)
+        | .cancelled_at = $now_ts
+        | .failed_at = $now_ts
+        | .flow_log = ((.flow_log // []) + [{
+            ts: $now_ts, action: "cancelled",
+            from_status: $from, to_status: "failed",
+            actor: $actor, detail: $reason
+          }])
+        ' "$task_file" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "cancel-task: jq 更新失败"
+    fi
+
+    if ! mv "$tmp" "$TASKS_DIR/failed/$task_id.json" 2>/dev/null; then
+        rm -f "$tmp"
+        die "cancel-task: 移动到 failed 失败"
+    fi
+    rm -f "$task_file"
+
+    # 清理锁文件
+    rm -f "$TASKS_DIR/processing/${task_id}.op.lock" "$TASKS_DIR/processing/${task_id}.compose.lock" 2>/dev/null
+    rm -f "$TASKS_DIR/paused/${task_id}.op.lock" "$TASKS_DIR/paused/${task_id}.compose.lock" 2>/dev/null
+
+    emit_event "task.cancelled" "$my_instance" "task_id=$task_id" "reason=$reason" "from_status=$from_status"
+
+    # 通知 supervisor + 原认领者
+    _unified_notify "supervisor" \
+        "[任务取消] $task_id ($task_title) 已取消。原因: $reason" "task.cancelled"
+    if [[ -n "$claimed_by" && "$claimed_by" != "null" && "$claimed_by" != "$my_instance" ]]; then
+        _unified_notify "$claimed_by" \
+            "[任务取消] $task_id ($task_title) 已取消。原因: $reason" "task.cancelled"
+    fi
+    if [[ -n "$from_id" && "$from_id" != "null" && "$from_id" != "$my_instance" && "$from_id" != "supervisor" ]]; then
+        _unified_notify "$from_id" \
+            "[任务取消] $task_id ($task_title) 已取消。原因: $reason" "task.cancelled"
+    fi
+
+    _story_update_task "$task_id" "failed" "已取消: $reason"
+
+    info "任务已取消: $task_id (原因: $reason)"
+
+    # 级联：取消依赖此任务的 blocked 任务
+    _cascade_fail_blocked "$task_id"
+
+    # 子任务级联：取消所有子任务
+    local subtasks
+    subtasks=$(jq -r '.subtasks // [] | .[]' "$TASKS_DIR/failed/$task_id.json" 2>/dev/null)
+    while IFS= read -r sub_id; do
+        [[ -z "$sub_id" ]] && continue
+        _cancel_subtask_tree "$sub_id" "父任务 $task_id 已取消: $reason"
+    done <<< "$subtasks"
+}
+
+# =============================================================================
+# 子命令: group-report (任务组汇总报告)
+# =============================================================================
+
+cmd_group_report() {
+    local group_id="${1:-}"
+    [[ -n "$group_id" ]] || die "用法: group-report <group-id>"
+
+    local group_file="$TASKS_DIR/groups/$group_id.json"
+    [[ -f "$group_file" ]] || die "任务组不存在: $group_id"
+
+    # 读取组信息
+    local group_title group_from group_status completed total created_at
+    group_title=$(jq -r '.title' "$group_file")
+    group_from=$(jq -r '.from' "$group_file")
+    group_status=$(jq -r '.status' "$group_file")
+    completed=$(jq -r '.completed_count' "$group_file")
+    total=$(jq -r '.total_count' "$group_file")
+    created_at=$(jq -r '.created_at // ""' "$group_file")
+
+    # 计算组级耗时
+    local duration_str="进行中"
+    if [[ -n "$created_at" && "$created_at" != "null" ]]; then
+        local created_epoch now_epoch
+        created_epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$created_at" +%s 2>/dev/null \
+            || date -d "$created_at" +%s 2>/dev/null \
+            || echo "0")
+
+        if [[ "$group_status" == "completed" ]]; then
+            # 查找最后一个完成的任务时间
+            local last_completed_at=""
+            while IFS= read -r tid; do
+                [[ -z "$tid" ]] && continue
+                local cfile="$TASKS_DIR/completed/$tid.json"
+                [[ -f "$cfile" ]] || continue
+                local cat_val
+                cat_val=$(jq -r '.completed_at // ""' "$cfile" 2>/dev/null)
+                if [[ -n "$cat_val" && "$cat_val" != "null" ]]; then
+                    if [[ -z "$last_completed_at" || "$cat_val" > "$last_completed_at" ]]; then
+                        last_completed_at="$cat_val"
+                    fi
+                fi
+            done < <(jq -r '.tasks[]' "$group_file" 2>/dev/null)
+
+            if [[ -n "$last_completed_at" ]]; then
+                local end_epoch
+                end_epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$last_completed_at" +%s 2>/dev/null \
+                    || date -d "$last_completed_at" +%s 2>/dev/null \
+                    || echo "0")
+                if [[ "$created_epoch" != "0" && "$end_epoch" != "0" ]]; then
+                    local diff=$(( end_epoch - created_epoch ))
+                    duration_str=$(_format_duration "$diff")
+                fi
+            fi
+        else
+            now_epoch=$(date +%s)
+            if [[ "$created_epoch" != "0" ]]; then
+                local diff=$(( now_epoch - created_epoch ))
+                duration_str="$(_format_duration "$diff") (进行中)"
+            fi
+        fi
+    fi
+
+    # 计算进度百分比
+    local pct=0
+    if [[ "$total" -gt 0 ]]; then
+        pct=$(( completed * 100 / total ))
+    fi
+
+    # 输出报告头
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "任务组: $group_id \"$group_title\""
+    echo "发布者: $group_from | 状态: $group_status"
+    [[ -n "$created_at" && "$created_at" != "null" ]] && echo "创建: $created_at | 总耗时: $duration_str"
+    echo "进度: $completed/$total ($pct%)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    # 遍历组内每个任务
+    while IFS= read -r tid; do
+        [[ -z "$tid" ]] && continue
+
+        # 在各目录中查找任务
+        local task_file="" task_status="unknown"
+        for d in completed processing pending blocked paused failed; do
+            if [[ -f "$TASKS_DIR/$d/$tid.json" ]]; then
+                task_file="$TASKS_DIR/$d/$tid.json"
+                task_status="$d"
+                break
+            fi
+        done
+
+        if [[ -z "$task_file" ]]; then
+            echo "  [??] $tid (未找到)"
+            continue
+        fi
+
+        local icon
+        case "$task_status" in
+            completed)  icon="OK" ;;
+            processing) icon=">>" ;;
+            pending)    icon=".." ;;
+            blocked)    icon="!!" ;;
+            paused)     icon="||" ;;
+            failed)     icon="XX" ;;
+            *)          icon="??" ;;
+        esac
+
+        # 读取任务信息
+        local t_title t_claimed t_result
+        t_title=$(jq -r '.title' "$task_file")
+        t_claimed=$(jq -r '.claimed_by // ""' "$task_file")
+        t_result=$(jq -r '.result // ""' "$task_file")
+
+        # 计算单个任务耗时
+        local task_duration=""
+        local claimed_at completed_at
+        claimed_at=$(jq -r '.claimed_at // ""' "$task_file")
+        completed_at=$(jq -r '.completed_at // ""' "$task_file")
+
+        if [[ "$task_status" == "completed" && -n "$claimed_at" && "$claimed_at" != "null" && -n "$completed_at" && "$completed_at" != "null" ]]; then
+            local s_epoch e_epoch
+            s_epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$claimed_at" +%s 2>/dev/null \
+                || date -d "$claimed_at" +%s 2>/dev/null || echo "0")
+            e_epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$completed_at" +%s 2>/dev/null \
+                || date -d "$completed_at" +%s 2>/dev/null || echo "0")
+            if [[ "$s_epoch" != "0" && "$e_epoch" != "0" ]]; then
+                task_duration=$(_format_duration $(( e_epoch - s_epoch )))
+            fi
+        elif [[ "$task_status" == "processing" && -n "$claimed_at" && "$claimed_at" != "null" ]]; then
+            local s_epoch
+            s_epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$claimed_at" +%s 2>/dev/null \
+                || date -d "$claimed_at" +%s 2>/dev/null || echo "0")
+            if [[ "$s_epoch" != "0" ]]; then
+                task_duration="$(_format_duration $(( $(date +%s) - s_epoch )))+"
+            fi
+        elif [[ "$task_status" == "paused" ]]; then
+            task_duration="(暂停)"
+        fi
+
+        # 格式化输出
+        local claimed_str=""
+        [[ -n "$t_claimed" && "$t_claimed" != "null" ]] && claimed_str=" [$t_claimed]"
+        local duration_display=""
+        [[ -n "$task_duration" ]] && duration_display="  $task_duration"
+
+        printf "  [%s] %s%s  \"%s\"%s\n" "$icon" "$tid" "$claimed_str" "$t_title" "$duration_display"
+
+        # 显示结果摘要（仅已完成任务，截断过长内容）
+        if [[ -n "$t_result" && "$t_result" != "null" ]]; then
+            local result_short
+            if [[ ${#t_result} -gt 80 ]]; then
+                result_short="${t_result:0:77}..."
+            else
+                result_short="$t_result"
+            fi
+            echo "       结果: $result_short"
+        fi
+    done < <(jq -r '.tasks[]' "$group_file" 2>/dev/null)
+
+    echo ""
+}
+
+# 格式化秒数为人类可读的持续时间
+_format_duration() {
+    local seconds="$1"
+    if [[ $seconds -lt 60 ]]; then
+        echo "${seconds}s"
+    elif [[ $seconds -lt 3600 ]]; then
+        echo "$(( seconds / 60 ))m $(( seconds % 60 ))s"
+    else
+        local hours=$(( seconds / 3600 ))
+        local mins=$(( (seconds % 3600) / 60 ))
+        echo "${hours}h ${mins}m"
     fi
 }
 
@@ -1951,7 +2404,7 @@ cmd_group_status() {
 
         # 在各目录中查找任务
         local task_file="" task_status="unknown"
-        for d in completed processing pending blocked failed; do
+        for d in completed processing pending blocked paused failed; do
             if [[ -f "$TASKS_DIR/$d/$tid.json" ]]; then
                 task_file="$TASKS_DIR/$d/$tid.json"
                 task_status="$d"
@@ -1970,6 +2423,7 @@ cmd_group_status() {
             processing) icon=">>" ;;
             pending)    icon=".." ;;
             blocked)    icon="!!" ;;
+            paused)     icon="||" ;;
             failed)     icon="XX" ;;
             *)          icon="??" ;;
         esac

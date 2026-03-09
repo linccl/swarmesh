@@ -647,7 +647,11 @@ swarm-msg.sh - CLI-to-CLI 自主消息 & 任务队列工具
   split-task <parent-id> [选项]        拆分任务为子任务（支持多层嵌套，深度上限: SUBTASK_MAX_DEPTH）
   re-split <parent-id>                 重置拆分（保留已完成子任务，取消未完成的）
   expand-subtask <subtask-id> [选项]  展开子任务为更细粒度的子任务（打平到同层）
+  pause-task <task-id> ["<reason>"]    暂停任务（processing → paused）
+  resume-task <task-id>                恢复暂停的任务（paused → processing/pending）
+  cancel-task <task-id> ["<reason>"]   取消任务（级联取消依赖和子任务）
   group-status [group-id]              查看任务组进度
+  group-report <group-id>              任务组汇总报告（含耗时信息）
   story-view <group-id>                查看任务组 Story（渲染为 markdown）
   set-verify '<json>' --role <name>    设置角色级验证命令（质量门按角色执行）
   flow-log <task-id>                   查看任务流转审计记录
@@ -768,7 +772,7 @@ EOF
 main() {
     # 确保消息和任务目录存在
     mkdir -p "$INBOX_DIR" "$OUTBOX_DIR"
-    mkdir -p "$TASKS_DIR"/{pending,processing,completed,failed,blocked,groups}
+    mkdir -p "$TASKS_DIR"/{pending,processing,completed,failed,blocked,paused,groups}
 
     local subcmd="${1:-}"
     shift 2>/dev/null || true
@@ -822,6 +826,18 @@ main() {
             [[ $# -ge 1 ]] || die "用法: swarm-msg.sh fail-task <task-id> [\"<reason>\"]"
             cmd_fail_task "$1" "${2:-未指定原因}"
             ;;
+        pause-task)
+            [[ $# -ge 1 ]] || die "用法: swarm-msg.sh pause-task <task-id> [\"<reason>\"]"
+            cmd_pause_task "$1" "${2:-手动暂停}"
+            ;;
+        resume-task)
+            [[ $# -ge 1 ]] || die "用法: swarm-msg.sh resume-task <task-id>"
+            cmd_resume_task "$1"
+            ;;
+        cancel-task)
+            [[ $# -ge 1 ]] || die "用法: swarm-msg.sh cancel-task <task-id> [\"<reason>\"]"
+            cmd_cancel_task "$1" "${2:-手动取消}"
+            ;;
         escalate-task)
             [[ $# -ge 1 ]] || die "用法: swarm-msg.sh escalate-task <task-id> [\"<reason>\"]"
             cmd_escalate_task "$1" "${2:-任务过于复杂，需要拆分}"
@@ -840,6 +856,10 @@ main() {
             ;;
         group-status)
             cmd_group_status "${1:-}"
+            ;;
+        group-report)
+            [[ $# -ge 1 ]] || die "用法: swarm-msg.sh group-report <group-id>"
+            cmd_group_report "$1"
             ;;
         story-view)
             [[ $# -ge 1 ]] || die "用法: swarm-msg.sh story-view <group-id>"
