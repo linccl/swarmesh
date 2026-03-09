@@ -82,7 +82,12 @@ _auto_claim_next() {
     # 更新字段
     local tmp_file="$TASKS_DIR/processing/$next_id.json.tmp"
     jq --arg inst "$my_instance" --arg at "$claimed_at" \
-        '.status = "processing" | .claimed_by = $inst | .claimed_at = $at' \
+        '.status = "processing" | .claimed_by = $inst | .claimed_at = $at
+         | .flow_log = ((.flow_log // []) + [{
+             ts: $at, action: "auto_claimed",
+             from_status: "pending", to_status: "processing",
+             actor: $inst, detail: ""
+           }])' \
         "$TASKS_DIR/processing/$next_id.json" > "$tmp_file"
     mv "$tmp_file" "$TASKS_DIR/processing/$next_id.json"
 
@@ -161,7 +166,12 @@ _cascade_fail_blocked() {
         mkdir -p "$TASKS_DIR/failed"
         local tmp="$TASKS_DIR/blocked/${tid}.json.tmp"
         if jq --arg at "$now_ts" --arg dep "$failed_task_id" \
-            '.status = "failed" | .fail_reason = "依赖任务失败: " + $dep | .failed_at = $at' \
+            '.status = "failed" | .fail_reason = "依赖任务失败: " + $dep | .failed_at = $at
+             | .flow_log = ((.flow_log // []) + [{
+                 ts: $at, action: "cascade_failed",
+                 from_status: "blocked", to_status: "failed",
+                 actor: "system", detail: ("依赖任务失败: " + $dep)
+               }])' \
             "$blocked_file" > "$tmp" 2>/dev/null; then
             if mv "$tmp" "$TASKS_DIR/failed/$tid.json" 2>/dev/null; then
                 rm -f "$blocked_file"
@@ -204,8 +214,16 @@ _check_and_unblock() {
             tid=$(jq -r '.id' "$blocked_file")
             mkdir -p "$TASKS_DIR/pending"
             # 先更新字段到 tmp，再原子 mv 到 pending（避免中间状态可见）
+            local unblock_ts
+            unblock_ts=$(get_timestamp)
             local tmp_unblock="$TASKS_DIR/blocked/${tid}.json.tmp"
-            if jq '.blocked = false | .status = "pending"' "$blocked_file" > "$tmp_unblock" 2>/dev/null; then
+            if jq --arg at "$unblock_ts" \
+                '.blocked = false | .status = "pending"
+                 | .flow_log = ((.flow_log // []) + [{
+                     ts: $at, action: "unblocked",
+                     from_status: "blocked", to_status: "pending",
+                     actor: "system", detail: ""
+                   }])' "$blocked_file" > "$tmp_unblock" 2>/dev/null; then
                 if mv "$tmp_unblock" "$TASKS_DIR/pending/$tid.json" 2>/dev/null; then
                     rm -f "$blocked_file"
                 else
@@ -508,10 +526,16 @@ _compose_parent() {
         mkdir -p "$TASKS_DIR/completed"
         local compose_tmp="$TASKS_DIR/completed/${parent_id}.json.tmp"
         jq --arg result "$composed_result" --arg at "$completed_at" \
-            '.status = "completed" | .result = $result | .completed_at = $at | .split_status = "composed"' \
+            '.status = "completed" | .result = $result | .completed_at = $at | .split_status = "composed"
+             | .flow_log = ((.flow_log // []) + [{
+                 ts: $at, action: "composed",
+                 from_status: "processing", to_status: "completed",
+                 actor: "system", detail: "子任务全部完成，已归一"
+               }])' \
             "$parent_file" > "$compose_tmp"
         mv "$compose_tmp" "$TASKS_DIR/completed/$parent_id.json"
         rm -f "$parent_file"
+        rm -f "$TASKS_DIR/processing/${parent_id}.op.lock" "$TASKS_DIR/processing/${parent_id}.compose.lock" 2>/dev/null
 
         emit_event "task.composed" "" "parent_id=$parent_id"
 
@@ -690,7 +714,12 @@ cmd_publish() {
             parent_task: null,
             subtasks: [],
             split_status: null,
-            depth: 0
+            depth: 0,
+            flow_log: [{
+                ts: $created_at, action: "published",
+                from_status: "-", to_status: $status,
+                actor: $from, detail: $title
+            }]
         }' > "$TASKS_DIR/$target_dir/$task_id.json"
 
     # 如果属于某个 group，追加到 group 的任务列表
@@ -857,7 +886,12 @@ cmd_claim() {
     claimed_at=$(get_timestamp)
     local tmp_file="$TASKS_DIR/processing/$task_id.json.tmp"
     jq --arg inst "$my_instance" --arg at "$claimed_at" \
-        '.status = "processing" | .claimed_by = $inst | .claimed_at = $at' \
+        '.status = "processing" | .claimed_by = $inst | .claimed_at = $at
+         | .flow_log = ((.flow_log // []) + [{
+             ts: $at, action: "claimed",
+             from_status: "pending", to_status: "processing",
+             actor: $inst, detail: ""
+           }])' \
         "$TASKS_DIR/processing/$task_id.json" > "$tmp_file"
     mv "$tmp_file" "$TASKS_DIR/processing/$task_id.json"
 
@@ -921,11 +955,17 @@ cmd_complete_task() {
 
     mkdir -p "$TASKS_DIR/completed"
     local ctmp="$TASKS_DIR/processing/${task_id}.json.tmp"
-    if jq --arg result "$result" --arg at "$completed_at" \
-        '.status = "completed" | .result = $result | .completed_at = $at' \
+    if jq --arg result "$result" --arg at "$completed_at" --arg actor "$my_instance" \
+        '.status = "completed" | .result = $result | .completed_at = $at
+         | .flow_log = ((.flow_log // []) + [{
+             ts: $at, action: "completed",
+             from_status: "processing", to_status: "completed",
+             actor: $actor, detail: ""
+           }])' \
         "$task_file" > "$ctmp" 2>/dev/null; then
         mv "$ctmp" "$TASKS_DIR/completed/$task_id.json"
         rm -f "$task_file"
+        rm -f "$TASKS_DIR/processing/${task_id}.op.lock" "$TASKS_DIR/processing/${task_id}.compose.lock" 2>/dev/null
     else
         rm -f "$ctmp"
         die "complete-task: jq 处理失败: $task_id"
@@ -1012,6 +1052,7 @@ cmd_fail_task() {
             --arg now_ts "$now_ts" \
             --arg retry_after "$retry_after" \
             --argjson entry "$history_entry" \
+            --arg actor "$my_instance" \
             '
             .status = "pending"
             | .claimed_by = null
@@ -1021,6 +1062,11 @@ cmd_fail_task() {
             | .failed_at = $now_ts
             | .retry_after = $retry_after
             | .retry_history = ((.retry_history // []) + [$entry])
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "failed_retry",
+                from_status: "processing", to_status: "pending",
+                actor: $actor, detail: $reason
+              }])
             ' "$task_file" > "$tmp" 2>/dev/null; then
             rm -f "$tmp"
             die "fail-task: jq 更新失败"
@@ -1031,6 +1077,7 @@ cmd_fail_task() {
             die "fail-task: 移动到 pending 失败"
         fi
         rm -f "$task_file"
+        rm -f "$TASKS_DIR/processing/${task_id}.op.lock" "$TASKS_DIR/processing/${task_id}.compose.lock" 2>/dev/null
 
         emit_event "task.retry" "$my_instance" "task_id=$task_id" "retry_count=$new_count" "max_retries=$max_retries" "delay=${delay}s"
 
@@ -1053,12 +1100,18 @@ cmd_fail_task() {
             --arg reason "$reason" \
             --arg now_ts "$now_ts" \
             --argjson entry "$history_entry" \
+            --arg actor "$my_instance" \
             '
             .status = "failed"
             | .retry_count = $new_count
             | .fail_reason = $reason
             | .failed_at = $now_ts
             | .retry_history = ((.retry_history // []) + [$entry])
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "failed_exhausted",
+                from_status: "processing", to_status: "failed",
+                actor: $actor, detail: $reason
+              }])
             ' "$task_file" > "$tmp" 2>/dev/null; then
             rm -f "$tmp"
             die "fail-task: jq 更新失败"
@@ -1069,6 +1122,7 @@ cmd_fail_task() {
             die "fail-task: 移动到 failed 失败"
         fi
         rm -f "$task_file"
+        rm -f "$TASKS_DIR/processing/${task_id}.op.lock" "$TASKS_DIR/processing/${task_id}.compose.lock" 2>/dev/null
 
         emit_event "task.exhausted" "$my_instance" "task_id=$task_id" "retry_count=$new_count" "max_retries=$max_retries"
 
@@ -1120,25 +1174,34 @@ cmd_escalate_task() {
     local now_ts
     now_ts=$(get_timestamp)
 
-    # 更新任务: 释放认领 + 标记 escalated
-    local tmp="$task_file.tmp"
-    if ! jq --arg reason "$reason" \
-       --arg by "$my_instance" \
-       --arg at "$now_ts" \
-       '
-       .claimed_by = null
-       | .claimed_at = null
-       | .escalated = {
-           status: "pending",
-           reason: $reason,
-           escalated_by: $by,
-           escalated_at: $at
-         }
-       ' "$task_file" > "$tmp" 2>/dev/null; then
-        rm -f "$tmp"
-        die "escalate-task: 更新任务文件失败: $task_id"
-    fi
-    mv "$tmp" "$task_file"
+    # 更新任务: 释放认领 + 标记 escalated（加文件锁，防止与 watchdog 竞态）
+    local lock_file="$TASKS_DIR/processing/${task_id}.op.lock"
+    (
+        flock -x 200
+        local tmp="$task_file.tmp"
+        if ! jq --arg reason "$reason" \
+           --arg by "$my_instance" \
+           --arg at "$now_ts" \
+           '
+           .claimed_by = null
+           | .claimed_at = null
+           | .escalated = {
+               status: "pending",
+               reason: $reason,
+               escalated_by: $by,
+               escalated_at: $at
+             }
+           | .flow_log = ((.flow_log // []) + [{
+               ts: $at, action: "escalated",
+               from_status: "processing", to_status: "processing",
+               actor: $by, detail: $reason
+             }])
+           ' "$task_file" > "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            exit 1
+        fi
+        mv "$tmp" "$task_file"
+    ) 200>"$lock_file" || die "escalate-task: 更新任务文件失败: $task_id"
 
     emit_event "task.escalated" "$my_instance" "task_id=$task_id" "reason=$reason"
 
@@ -1346,7 +1409,12 @@ cmd_split_task() {
                 parent_task: $parent_task,
                 subtasks: [],
                 split_status: null,
-                depth: $depth
+                depth: $depth,
+                flow_log: [{
+                    ts: $created_at, action: "published",
+                    from_status: "-", to_status: $status,
+                    actor: $from, detail: ("子任务: " + $title)
+                }]
             }' > "$TASKS_DIR/$target_dir/$sub_id.json"
 
         created_files+=("$sub_id")
@@ -1364,14 +1432,26 @@ cmd_split_task() {
         fi
     done
 
-    # 更新父任务: subtasks = 保留的旧子任务 + 新子任务, split_status="split"
+    # 更新父任务: subtasks = 保留的旧子任务 + 新子任务, split_status="split"（加文件锁）
     local all_subtask_ids=("${existing_ids[@]}" "${subtask_ids[@]}")
     local subtasks_json
     subtasks_json=$(printf '%s\n' "${all_subtask_ids[@]}" | jq -R '.' | jq -s '.')
-    local ptmp="$parent_file.tmp"
-    jq --argjson subtasks "$subtasks_json" \
-        '.subtasks = $subtasks | .split_status = "split" | .escalated = null' \
-        "$parent_file" > "$ptmp" && mv "$ptmp" "$parent_file"
+    local split_ts
+    split_ts=$(get_timestamp)
+    local split_lock="$TASKS_DIR/processing/${parent_id}.op.lock"
+    (
+        flock -x 200
+        local ptmp="$parent_file.tmp"
+        jq --argjson subtasks "$subtasks_json" \
+            --arg at "$split_ts" --arg actor "${SWARM_INSTANCE:-${SWARM_ROLE:-system}}" \
+            '.subtasks = $subtasks | .split_status = "split" | .escalated = null
+             | .flow_log = ((.flow_log // []) + [{
+                 ts: $at, action: "split",
+                 from_status: "processing", to_status: "processing",
+                 actor: $actor, detail: ("拆分为 " + ($subtasks | length | tostring) + " 个子任务")
+               }])' \
+            "$parent_file" > "$ptmp" && mv "$ptmp" "$parent_file"
+    ) 200>"$split_lock" || die "split-task: 更新父任务文件失败: $parent_id"
 
     # 发射事件
     emit_event "task.split" "" "parent_id=$parent_id" "subtask_count=$subtask_count" \
@@ -1693,7 +1773,12 @@ cmd_expand_subtask() {
                 parent_task: $parent_task,
                 subtasks: [],
                 split_status: null,
-                depth: $depth
+                depth: $depth,
+                flow_log: [{
+                    ts: $created_at, action: "published",
+                    from_status: "-", to_status: $status,
+                    actor: $from, detail: ("展开子任务: " + $title)
+                }]
             }' > "$TASKS_DIR/$target_dir/$sub_id.json"
 
         # 如果属于 group，追加到 group 的任务列表
@@ -1945,8 +2030,17 @@ cmd_recover_tasks() {
             if ! mv "$f" "$TASKS_DIR/pending/$tid.json" 2>/dev/null; then
                 continue  # 被其他 recover-tasks 进程抢先处理了
             fi
+            rm -f "$TASKS_DIR/processing/${tid}.op.lock" "$TASKS_DIR/processing/${tid}.compose.lock" 2>/dev/null
+            local recover_ts
+            recover_ts=$(get_timestamp)
             local tmp_file="$TASKS_DIR/pending/$tid.json.tmp"
-            jq '.status = "pending" | .claimed_by = null | .claimed_at = null' \
+            jq --arg at "$recover_ts" --arg claimer "$claimed_by" \
+                '.status = "pending" | .claimed_by = null | .claimed_at = null
+                 | .flow_log = ((.flow_log // []) + [{
+                     ts: $at, action: "recovered",
+                     from_status: "processing", to_status: "pending",
+                     actor: "system", detail: ("原认领者离线: " + $claimer)
+                   }])' \
                 "$TASKS_DIR/pending/$tid.json" > "$tmp_file"
             mv "$tmp_file" "$TASKS_DIR/pending/$tid.json"
             recovered=$((recovered + 1))
@@ -2044,4 +2138,24 @@ cmd_set_limit() {
     _unified_notify "supervisor" \
         "[系统通知] CLI 上限已更新为 $new_limit（当前 $current_count 个）。如需扩容可继续使用 swarm-join.sh。" \
         "config.changed"
+}
+
+# =============================================================================
+# 子命令: flow-log (查看任务流转审计记录)
+# =============================================================================
+
+cmd_flow_log() {
+    local task_id="$1"
+
+    # 在所有状态目录中查找任务文件
+    local task_file=""
+    for dir in pending processing completed failed blocked; do
+        [[ -f "$TASKS_DIR/$dir/$task_id.json" ]] && task_file="$TASKS_DIR/$dir/$task_id.json" && break
+    done
+    [[ -n "$task_file" ]] || die "任务不存在: $task_id"
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "任务流转记录: $task_id"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    jq -r '.flow_log // [] | if length == 0 then "  (无流转记录)" else .[] | "[\(.ts)] \(.action): \(.from_status) → \(.to_status) | \(.actor)\(if .detail != "" then " | " + .detail else "" end)" end' "$task_file"
 }

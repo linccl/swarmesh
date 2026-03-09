@@ -650,6 +650,7 @@ swarm-msg.sh - CLI-to-CLI 自主消息 & 任务队列工具
   group-status [group-id]              查看任务组进度
   story-view <group-id>                查看任务组 Story（渲染为 markdown）
   set-verify '<json>' --role <name>    设置角色级验证命令（质量门按角色执行）
+  flow-log <task-id>                   查看任务流转审计记录
   recover-tasks                        恢复卡在 processing 的任务（认领者已离线）
   set-limit [N]                        查看/设置 CLI 数量上限 (0=不限制)
   cleanup [--ttl <秒>] [--gate-logs] [--dry-run]  清理过期消息/任务/质量门日志
@@ -848,6 +849,10 @@ main() {
             [[ $# -ge 2 ]] || die "用法: swarm-msg.sh set-prd <group-id> \"<prd-content>\""
             _story_set_prd "$1" "$2" "$(detect_my_instance)"
             echo "PRD 已关联到任务组 $1"
+            ;;
+        flow-log)
+            [[ $# -ge 1 ]] || die "用法: swarm-msg.sh flow-log <task-id>"
+            cmd_flow_log "$1"
             ;;
         recover-tasks)
             cmd_recover_tasks

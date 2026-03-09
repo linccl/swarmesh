@@ -75,6 +75,11 @@ _watchdog_recover_task() {
             | .failed_at = $now_ts
             | .fail_reason = "watchdog: 重试耗尽"
             | .retry_history = ((.retry_history // []) + [$entry])
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "watchdog_exhausted",
+                from_status: "processing", to_status: "failed",
+                actor: "watchdog", detail: "重试耗尽"
+              }])
             ' "$task_file" > "$tmp" 2>/dev/null; then
             rm -f "$tmp"
             return 1
@@ -85,6 +90,7 @@ _watchdog_recover_task() {
             return 0
         fi
         rm -f "$task_file"
+        rm -f "$TASKS_DIR/processing/${tid}.op.lock" "$TASKS_DIR/processing/${tid}.compose.lock" 2>/dev/null
 
         emit_event "task.exhausted" "" "task_id=$tid" "retry_count=$new_count" "max_retries=$max_retries" "reason=watchdog:$reason"
 
@@ -121,6 +127,11 @@ _watchdog_recover_task() {
             | .failed_at = $now_ts
             | .retry_after = $retry_after
             | .retry_history = ((.retry_history // []) + [$entry])
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "watchdog_retry",
+                from_status: "processing", to_status: "pending",
+                actor: "watchdog", detail: ("重试 " + ($new_count | tostring))
+              }])
             ' "$task_file" > "$tmp" 2>/dev/null; then
             rm -f "$tmp"
             return 1  # jq 失败，保留原文件不动
@@ -132,6 +143,7 @@ _watchdog_recover_task() {
             return 0  # 被其他进程抢先处理
         fi
         rm -f "$task_file"
+        rm -f "$TASKS_DIR/processing/${tid}.op.lock" "$TASKS_DIR/processing/${tid}.compose.lock" 2>/dev/null
 
         # 发射恢复事件（含 retry_count）
         emit_event "task.recovered.${reason}" "" "task_id=$tid" "original_claimer=$original_claimer" "retry_count=$new_count"
