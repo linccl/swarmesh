@@ -3026,3 +3026,198 @@ cmd_reject_task() {
     # 级联失败阻塞的任务
     _cascade_fail_blocked "$task_id"
 }
+
+# =============================================================================
+# 子命令: request-supervisor (请求扩展 supervisor)
+# =============================================================================
+
+# 生成 supervisor 上下文摘要（供新 supervisor 初始化使用）
+_generate_supervisor_context_summary() {
+    local summary="你是新加入的 supervisor，以下是当前蜂群状态摘要:\n\n"
+
+    # 团队成员
+    summary+="## 当前团队\n"
+    summary+="$(jq -r '.panes[] | "- \(.instance // .role) (\(.role), \(.cli))"' "$STATE_FILE" 2>/dev/null)\n\n"
+
+    # 任务队列概况
+    local pending_count=0 processing_count=0 blocked_count=0
+    [[ -d "$TASKS_DIR/pending" ]] && pending_count=$(find "$TASKS_DIR/pending" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+    [[ -d "$TASKS_DIR/processing" ]] && processing_count=$(find "$TASKS_DIR/processing" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+    [[ -d "$TASKS_DIR/blocked" ]] && blocked_count=$(find "$TASKS_DIR/blocked" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+
+    summary+="## 任务队列\n"
+    summary+="- Pending: $pending_count | Processing: $processing_count | Blocked: $blocked_count\n\n"
+
+    # 待认领任务列表（前 10 个，subshell 隔离 shopt）
+    summary+="## 待认领任务\n"
+    local task_lines
+    task_lines=$(
+        [[ -d "$TASKS_DIR/pending" ]] || exit 0
+        shopt -s nullglob
+        local c=0
+        for f in "$TASKS_DIR/pending/"*.json; do
+            [[ -f "$f" ]] || continue
+            if [[ $c -ge 10 ]]; then
+                printf '%s\n' "- ... (更多任务请用 list-tasks 查看)"
+                break
+            fi
+            local tid ttype ttitle tassign
+            tid=$(jq -r '.id' "$f" 2>/dev/null)
+            ttype=$(jq -r '.type' "$f" 2>/dev/null)
+            ttitle=$(jq -r '.title' "$f" 2>/dev/null)
+            tassign=$(jq -r '.assigned_to // "all"' "$f" 2>/dev/null)
+            printf '%s\n' "- [$tid] $ttype: $ttitle (指派: $tassign)"
+            ((c++)) || true
+        done
+    )
+    if [[ -n "$task_lines" ]]; then
+        summary+="$task_lines\n"
+    else
+        summary+="- (无待认领任务)\n"
+    fi
+
+    summary+="\n## 行动指南\n"
+    summary+="1. swarm-msg.sh list-roles — 了解完整团队\n"
+    summary+="2. swarm-msg.sh list-tasks --all — 了解任务全貌\n"
+    summary+="3. swarm-msg.sh read — 查看消息\n"
+    summary+="4. 认领 pending 中的编排任务: swarm-msg.sh claim <task-id>\n"
+
+    printf '%b' "$summary"
+}
+
+cmd_request_supervisor() {
+    local reason="${1:-任务负载过高}"
+
+    # === 权限检查: 仅 supervisor 或 human 可调用 ===
+    local my_instance
+    my_instance=$(detect_my_instance)
+    local my_role
+    my_role=$(jq -r --arg inst "$my_instance" \
+        '.panes[] | select(.instance == $inst) | .role // ""' \
+        "$STATE_FILE" 2>/dev/null | head -1)
+    [[ -n "$my_role" ]] || my_role="$my_instance"
+    if [[ "$my_role" != "supervisor" && "$my_instance" != "human" ]]; then
+        die "权限不足: 只有 supervisor 或 human 可以请求扩展 supervisor (当前: $my_role)"
+    fi
+
+    # === 检查 1: supervisor 数量上限 ===
+    local current_sup_count
+    current_sup_count=$(jq '[.panes[] | select(.role == "supervisor")] | length' "$STATE_FILE" 2>/dev/null)
+    local max_sup="${SUPERVISOR_MAX_COUNT:-5}"
+    if [[ "$current_sup_count" -ge "$max_sup" ]]; then
+        info "supervisor 数量已达上限 ($current_sup_count/$max_sup)，拒绝扩展"
+        echo "REJECTED: supervisor 数量已达上限 ($current_sup_count/$max_sup)"
+        return 1
+    fi
+
+    # === 检查 2: CLI 总数上限 ===
+    local max_cli current_cli_count
+    max_cli=$(jq -r '.max_cli // 0' "$STATE_FILE" 2>/dev/null)
+    if [[ "$max_cli" -gt 0 ]]; then
+        current_cli_count=$(jq '.panes | length' "$STATE_FILE" 2>/dev/null)
+        if [[ "$current_cli_count" -ge "$max_cli" ]]; then
+            _unified_notify "human" \
+                "[扩展受限] supervisor $my_instance 请求扩展，但 CLI 数量已达上限 ($current_cli_count/$max_cli)。原因: $reason。调整上限: swarm-msg.sh set-limit <新值>" \
+                "supervisor.scale_blocked" "high"
+            info "CLI 数量已达上限 ($current_cli_count/$max_cli)，拒绝扩展"
+            echo "REJECTED: CLI 数量已达上限 ($current_cli_count/$max_cli)"
+            return 1
+        fi
+    fi
+
+    # === 检查 3 + 执行: flock 保护冷却检查与扩展操作的原子性 ===
+    local cooldown_file="$RUNTIME_DIR/.supervisor-scale-cooldown"
+    local lock_file="${cooldown_file}.lock"
+    local cooldown="${SUPERVISOR_SCALE_COOLDOWN:-300}"
+
+    local _scale_result
+    _scale_result=$(
+        (
+            flock -x -w 10 200 || { echo "LOCK_FAILED"; exit 1; }
+
+            # 冷却检查
+            if [[ -f "$cooldown_file" ]]; then
+                local last_scale_epoch
+                last_scale_epoch=$(cat "$cooldown_file" 2>/dev/null || echo "0")
+                local now_epoch
+                now_epoch=$(date +%s)
+                local elapsed=$(( now_epoch - last_scale_epoch ))
+                if [[ $elapsed -lt $cooldown ]]; then
+                    local remaining=$(( cooldown - elapsed ))
+                    echo "COOLDOWN:${remaining}"
+                    exit 0
+                fi
+            fi
+
+            # 二次确认 supervisor 数量（防止并发通过前面的检查后数量已变）
+            local recheck_count
+            recheck_count=$(jq '[.panes[] | select(.role == "supervisor")] | length' "$STATE_FILE" 2>/dev/null)
+            if [[ "$recheck_count" -ge "$max_sup" ]]; then
+                echo "REJECTED_RECHECK:${recheck_count}"
+                exit 0
+            fi
+
+            # 记录冷却时间戳（在锁内写入，保证原子性）
+            date +%s > "$cooldown_file"
+            echo "PROCEED"
+        ) 200>"$lock_file"
+    )
+
+    case "$_scale_result" in
+        LOCK_FAILED)
+            warn "获取扩展锁超时"
+            echo "FAILED: 获取扩展锁超时"
+            return 1
+            ;;
+        COOLDOWN:*)
+            local remaining="${_scale_result#COOLDOWN:}"
+            info "冷却中: 剩余 ${remaining}s (冷却 ${cooldown}s)"
+            echo "COOLDOWN: 冷却中，剩余 ${remaining}s"
+            return 1
+            ;;
+        REJECTED_RECHECK:*)
+            local recheck_count="${_scale_result#REJECTED_RECHECK:}"
+            info "并发检查: supervisor 数量已达上限 ($recheck_count/$max_sup)"
+            echo "REJECTED: supervisor 数量已达上限 ($recheck_count/$max_sup)"
+            return 1
+            ;;
+    esac
+
+    # === 所有检查通过，执行扩展 ===
+    log_info "[request-supervisor] 开始扩展 (当前 $current_sup_count/$max_sup, 请求者: $my_instance, 原因: $reason)"
+
+    # 生成上下文摘要写入临时文件（避免超长命令行参数）
+    local context_tmp
+    context_tmp=$(mktemp "${RUNTIME_DIR}/sup-context-XXXXXX.txt")
+    _generate_supervisor_context_summary > "$context_tmp"
+
+    # 调用 swarm-join.sh（读取临时文件内容作为 --task）
+    local join_output
+    if join_output=$("$SCRIPTS_DIR/swarm-join.sh" supervisor \
+        --cli "claude chat" \
+        --config "management/supervisor.md" \
+        --task "$(cat "$context_tmp")" \
+        2>&1); then
+
+        rm -f "$context_tmp"
+
+        emit_event "supervisor.scaled" "$my_instance" \
+            "reason=$reason" \
+            "new_count=$((current_sup_count + 1))" \
+            "max=$max_sup"
+
+        _unified_notify "human" \
+            "[Supervisor 扩展] $my_instance 触发扩展 (${current_sup_count}→$((current_sup_count+1))/$max_sup)。原因: $reason" \
+            "supervisor.scaled"
+
+        info "supervisor 扩展成功 (${current_sup_count}→$((current_sup_count+1))/$max_sup)"
+        echo "OK: supervisor 扩展成功 (${current_sup_count}→$((current_sup_count+1))/$max_sup)"
+    else
+        rm -f "$context_tmp"
+        # 扩展失败，清除冷却（允许重试）
+        rm -f "$cooldown_file"
+        warn "supervisor 扩展失败: $join_output"
+        echo "FAILED: $join_output"
+        return 1
+    fi
+}

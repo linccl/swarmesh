@@ -279,7 +279,19 @@ swarm-msg.sh flow-log <task-id>
 
 #### Multi-Supervisor Orchestration
 
-For complex projects, the framework automatically injects multiple supervisors on startup (configurable via `DEFAULT_SUPERVISOR_COUNT`). When a supervisor splits a task into many subtasks (count >= `COUNCIL_THRESHOLD`), an orchestration bulletin is broadcast to all other supervisors for coordination.
+By default, swarm starts with a single supervisor. Supervisors can dynamically scale up based on workload:
+
+- **Watchdog detection**: When pending tasks exceed `PENDING_PILEUP_THRESHOLD`, the watchdog notifies supervisors
+- **Supervisor decision**: Supervisor evaluates the situation and decides whether to scale
+- **Controlled expansion**: `request-supervisor` command with built-in safeguards (max count, cooldown, CLI budget check)
+- **Context handoff**: New supervisors receive a task queue snapshot on join
+
+```bash
+# Supervisor requests scaling (only supervisor/human can call)
+swarm-msg.sh request-supervisor "Multiple task groups in parallel, overloaded"
+```
+
+When multiple supervisors are active, they coordinate through a shared task queue (claim-based). When a supervisor splits a task into many subtasks (count >= `COUNCIL_THRESHOLD`), an orchestration bulletin is broadcast to all other supervisors.
 
 #### Strict Quality Gate & Manual Approval
 
@@ -359,7 +371,11 @@ All parameters are centralized in `config/defaults.conf` with 3-tier priority: e
 | `RESUME_SUMMARY_MAX_TASKS` | 10 | Max completed/pending tasks in resume summary |
 | `RESUME_PANE_LINES` | 50 | Capture last N lines of each pane for resume |
 | `RESUME_SUMMARY_MAX_MESSAGES` | 10 | Max recent messages in resume summary |
-| `DEFAULT_SUPERVISOR_COUNT` | 3 | Auto-injected supervisor count on startup |
+| `DEFAULT_SUPERVISOR_COUNT` | 1 | Initial supervisor count on startup (scales dynamically) |
+| `SUPERVISOR_MAX_COUNT` | 5 | Max supervisor count (prevents unbounded scaling) |
+| `SUPERVISOR_SCALE_COOLDOWN` | 300 | Min interval between supervisor expansions (seconds) |
+| `PENDING_PILEUP_THRESHOLD` | 5 | Pending task count threshold to notify supervisor |
+| `PENDING_PILEUP_NOTIFY_INTERVAL` | 1800 | Dedup interval for pileup notifications (seconds) |
 | `COUNCIL_THRESHOLD` | 5 | Broadcast orchestration bulletin when subtask count >= this |
 | `PENDING_REVIEW_TTL` | 1800 | Pending review timeout (seconds, notify human on expiry) |
 | `PANES_PER_WINDOW` | 2 | Tmux panes per window |
@@ -721,7 +737,19 @@ swarm-msg.sh flow-log <task-id>
 
 #### 多 Supervisor 编排
 
-复杂项目启动时，框架自动注入多个 supervisor（通过 `DEFAULT_SUPERVISOR_COUNT` 配置）。当某个 supervisor 拆分任务产生大量子任务（数量 >= `COUNCIL_THRESHOLD`）时，会向其他 supervisor 广播编排通报，协调分工。
+蜂群默认启动 1 个 supervisor，按需动态扩展：
+
+- **看门狗检测**：pending 任务数超过 `PENDING_PILEUP_THRESHOLD` 时通知 supervisor
+- **supervisor 决策**：supervisor 评估后决定是否扩展
+- **可控扩展**：`request-supervisor` 命令内置安全检查（数量上限、冷却时间、CLI 预算）
+- **上下文传递**：新 supervisor 加入时自动收到任务队列快照
+
+```bash
+# supervisor 请求扩展（仅 supervisor/human 可调用）
+swarm-msg.sh request-supervisor "多任务组并行，编排负载过高"
+```
+
+多个 supervisor 通过共享任务队列协作（claim 竞争认领）。当 supervisor 拆分任务产生大量子任务（数量 >= `COUNCIL_THRESHOLD`）时，会向其他 supervisor 广播编排通报，协调分工。
 
 #### 质量门严格模式与人工审批
 
@@ -801,7 +829,11 @@ swarm-msg.sh set-limit 0      # 取消上限
 | `RESUME_SUMMARY_MAX_TASKS` | 10 | 恢复摘要中最多包含的已完成/未完成任务数 |
 | `RESUME_PANE_LINES` | 50 | 捕获 pane 最后 N 行用于恢复 |
 | `RESUME_SUMMARY_MAX_MESSAGES` | 10 | 恢复摘要中的最近消息数 |
-| `DEFAULT_SUPERVISOR_COUNT` | 3 | 自动注入 supervisor 的目标数量 |
+| `DEFAULT_SUPERVISOR_COUNT` | 1 | 启动时 supervisor 数量（按需动态扩展） |
+| `SUPERVISOR_MAX_COUNT` | 5 | supervisor 最大数量上限（防无限扩展） |
+| `SUPERVISOR_SCALE_COOLDOWN` | 300 | 两次扩展之间的最小间隔（秒） |
+| `PENDING_PILEUP_THRESHOLD` | 5 | pending 任务堆积阈值（超过通知 supervisor 评估） |
+| `PENDING_PILEUP_NOTIFY_INTERVAL` | 1800 | 堆积通知去重间隔（秒，默认 30min） |
 | `COUNCIL_THRESHOLD` | 5 | 子任务数 >= 此值时广播编排通报给其他 supervisor |
 | `PENDING_REVIEW_TTL` | 1800 | pending_review 超时阈值（秒，超时通知人类） |
 | `PANES_PER_WINDOW` | 2 | 每窗口 pane 数 |

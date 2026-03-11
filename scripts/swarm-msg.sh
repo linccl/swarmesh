@@ -741,6 +741,7 @@ swarm-msg.sh - CLI-to-CLI 自主消息 & 任务队列工具
   set-verify '<json>' --role <name>    设置角色级验证命令（质量门按角色执行）
   flow-log <task-id>                   查看任务流转审计记录
   recover-tasks                        恢复卡在 processing 的任务（认领者已离线）
+  request-supervisor ["<reason>"]      请求扩展新 supervisor（仅 supervisor/human 可调用）
   set-limit [N]                        查看/设置 CLI 数量上限 (0=不限制)
   cleanup [--ttl <秒>] [--gate-logs] [--dry-run]  清理过期消息/任务/质量门日志
 
@@ -977,6 +978,9 @@ main() {
         set-verify)
             [[ $# -ge 1 ]] || die "用法: swarm-msg.sh set-verify '<json>' --role <角色名>"
             cmd_set_verify "$@"
+            ;;
+        request-supervisor)
+            cmd_request_supervisor "${1:-}"
             ;;
         set-limit)
             cmd_set_limit "${1:-}"

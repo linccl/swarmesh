@@ -542,6 +542,70 @@ _watchdog_check_pending_review() {
 }
 
 # =============================================================================
+# Pending 任务堆积检测
+# =============================================================================
+
+# 检测 pending/ 中是否有大量任务堆积，超阈值时通知 supervisor 评估
+# 看门狗只负责检测和通知，不做扩展决策
+_watchdog_check_pending_pileup() {
+    [[ -d "$TASKS_DIR/pending" ]] || return 0
+
+    local pending_count=0
+    local now_epoch
+    now_epoch=$(date +%s)
+
+    shopt -s nullglob
+    for f in "$TASKS_DIR/pending/"*.json; do
+        [[ -f "$f" ]] || continue
+        # 排除 retry_after 尚未到期的任务
+        local retry_after
+        retry_after=$(jq -r '.retry_after // ""' "$f" 2>/dev/null)
+        if [[ -n "$retry_after" && "$retry_after" != "null" ]]; then
+            local clean_ts="${retry_after%% [A-Z]*}"
+            local retry_epoch
+            retry_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$clean_ts" +%s 2>/dev/null \
+                || date -d "$retry_after" +%s 2>/dev/null || echo "0")
+            [[ "$retry_epoch" -gt "$now_epoch" ]] && continue
+        fi
+        ((pending_count++)) || true
+    done
+    shopt -u nullglob
+
+    # 未超阈值，直接返回
+    [[ $pending_count -ge ${PENDING_PILEUP_THRESHOLD:-5} ]] || return 0
+
+    # 固定间隔去重: 同一窗口内不重复通知（默认 30min，可配置 PENDING_PILEUP_NOTIFY_INTERVAL）
+    local notify_interval="${PENDING_PILEUP_NOTIFY_INTERVAL:-1800}"
+    local notify_window=$(( now_epoch / notify_interval ))
+    local notify_id="sys-pending-pileup-${notify_window}"
+
+    # 通知所有 supervisor 实例
+    local notified=false
+    while IFS='|' read -r _pane _inst _role; do
+        [[ -n "$_inst" ]] || continue
+        local per_inst_id="${notify_id}-${_inst}"
+        mkdir -p "${MESSAGES_DIR}/inbox/${_inst}"
+        [[ -f "${MESSAGES_DIR}/inbox/${_inst}/${per_inst_id}.json" ]] && continue
+
+        jq -n \
+            --arg id "$per_inst_id" \
+            --arg from "watchdog" \
+            --arg to "$_inst" \
+            --arg content "[任务堆积] 当前有 ${pending_count} 个 pending 任务未被认领（阈值: ${PENDING_PILEUP_THRESHOLD:-5}）。请评估是否需要: 1) 加入更多工蜂角色 2) 扩展 supervisor 编排能力 (swarm-msg.sh request-supervisor \"原因\")" \
+            --arg timestamp "$(get_timestamp)" \
+            --arg status "pending" \
+            --arg priority "high" \
+            --arg category "task.pending_pileup" \
+            '{id:$id,from:$from,to:$to,content:$content,timestamp:$timestamp,status:$status,reply_to:null,priority:$priority,category:$category}' \
+            > "${MESSAGES_DIR}/inbox/${_inst}/${per_inst_id}.json"
+        notified=true
+    done < <(resolve_role_to_all_panes "supervisor")
+
+    [[ "$notified" == "true" ]] && \
+        log_info "[watchdog] 任务堆积告警: ${pending_count} 个 pending 任务 (阈值: ${PENDING_PILEUP_THRESHOLD:-5})"
+}
+
+# =============================================================================
 # 主函数: 启动看门狗守护进程
 # =============================================================================
 
@@ -569,6 +633,9 @@ start_task_watchdog() {
 
             # pending_review 审批超时检测
             _watchdog_check_pending_review
+
+            # pending 任务堆积检测（通知 supervisor 评估）
+            _watchdog_check_pending_pileup
 
             # 日志轮转检查（按 LOG_ROTATE_INTERVAL 频率）
             local now
