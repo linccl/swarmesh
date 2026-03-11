@@ -323,23 +323,52 @@ cmd_read() {
         return 0
     fi
 
-    local count
-    count=$(echo "$msg_files" | wc -l | tr -d ' ')
-    echo "收件箱有 ${count} 条未读消息:"
-    echo ""
+    # 加载已消费 ID 文件路径
+    local consumed_file="$CONSUMED_IDS_DIR/${my_instance}.log"
+
+    local display_count=0
+    local -a new_consumed_ids=()
+    local output=""
 
     while IFS= read -r msg_file; do
         [[ -f "$msg_file" ]] || continue
-        jq -r '
+        local msg_id
+        msg_id=$(jq -r '.id // ""' "$msg_file" 2>/dev/null)
+
+        # 去重: 已消费的消息静默移到 outbox
+        if [[ -n "$msg_id" ]] && _is_consumed "$consumed_file" "$msg_id"; then
+            mkdir -p "${OUTBOX_DIR}/${my_instance}"
+            mv "$msg_file" "${OUTBOX_DIR}/${my_instance}/" 2>/dev/null || true
+            continue
+        fi
+
+        display_count=$((display_count + 1))
+        [[ -n "$msg_id" ]] && new_consumed_ids+=("$msg_id")
+
+        output+=$(jq -r '
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n" +
             "  ID: \(.id)\n  来自: \(.from)\n  时间: \(.timestamp)\n" +
             (if .reply_to and .reply_to != "" and .reply_to != null then "  回复: \(.reply_to)\n" else "" end) +
             (if (.priority // "normal") != "normal" then "  优先级: \(.priority)\n" else "" end) +
             "  内容: \(.content)\n\n  回复: swarm-msg.sh reply \(.id) \"你的回复\""
-        ' "$msg_file"
+        ' "$msg_file")
+        output+=$'\n'
     done <<< "$msg_files"
 
+    if [[ $display_count -eq 0 ]]; then
+        echo "没有新消息。"
+        return 0
+    fi
+
+    echo "收件箱有 ${display_count} 条未读消息:"
+    echo ""
+    echo "$output"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # 批量标记已消费
+    if [[ ${#new_consumed_ids[@]} -gt 0 ]]; then
+        _mark_consumed "$my_instance" "${new_consumed_ids[@]}"
+    fi
 }
 
 # =============================================================================
@@ -531,6 +560,56 @@ cmd_mark_read() {
 }
 
 # =============================================================================
+# 消息去重辅助函数
+# =============================================================================
+
+# 已消费消息 ID 的存储目录
+CONSUMED_IDS_DIR="${RUNTIME_DIR}/.consumed_ids"
+
+# 消息去重: 检查 msg_id 是否已消费
+# 格式: 每行 "epoch\tmsg_id"
+# 参数: $1 - consumed_file, $2 - msg_id
+# 返回: 0=已消费, 1=未消费
+_is_consumed() {
+    local consumed_file="$1" msg_id="$2"
+    [[ -f "$consumed_file" ]] || return 1
+    # 第二列匹配 msg_id
+    awk -F'\t' -v id="$msg_id" '$2 == id { found=1; exit } END { exit !found }' "$consumed_file" 2>/dev/null
+}
+
+# 标记消息为已消费
+# 格式: "epoch\tmsg_id"
+# 参数: $1 - instance 名, $2... - msg_id 列表
+_mark_consumed() {
+    local instance="$1"; shift
+    mkdir -p "$CONSUMED_IDS_DIR"
+    local consumed_file="$CONSUMED_IDS_DIR/${instance}.log"
+    local now
+    now=$(date +%s)
+    local id
+    for id in "$@"; do
+        printf '%s\t%s\n' "$now" "$id" >> "$consumed_file"
+    done
+}
+
+# 清理已消费记录: 删除超过 TTL 的条目
+# 参数: $1 - TTL (秒)
+_cleanup_consumed_ids() {
+    local ttl="${1:-$CLEANUP_TTL}"
+    [[ -d "$CONSUMED_IDS_DIR" ]] || return 0
+    local now
+    now=$(date +%s)
+    local cutoff=$(( now - ttl ))
+    shopt -s nullglob
+    for f in "$CONSUMED_IDS_DIR"/*.log; do
+        [[ -f "$f" ]] || continue
+        # 保留 epoch >= cutoff 的行
+        awk -F'\t' -v cutoff="$cutoff" '$1 >= cutoff' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+    done
+    shopt -u nullglob
+}
+
+# =============================================================================
 # 子命令: cleanup (清理过期消息和已完成任务)
 # =============================================================================
 
@@ -609,6 +688,9 @@ cmd_cleanup() {
     fi
     shopt -u nullglob
 
+    # 清理过期的消息去重记录
+    _cleanup_consumed_ids "$ttl"
+
     local mode_label=""
     [[ "$dry_run" == true ]] && mode_label=" (dry-run)"
     local gate_label=""
@@ -653,6 +735,9 @@ swarm-msg.sh - CLI-to-CLI 自主消息 & 任务队列工具
   group-status [group-id]              查看任务组进度
   group-report <group-id>              任务组汇总报告（含耗时信息）
   story-view <group-id>                查看任务组 Story（渲染为 markdown）
+  set-priority <task-id> <level>       修改待处理任务的优先级 (high/normal/low)
+  approve-task <task-id> ["<comment>"] 人工审批通过（仅 inspector）
+  reject-task <task-id> ["<reason>"]   人工驳回（仅 inspector）
   set-verify '<json>' --role <name>    设置角色级验证命令（质量门按角色执行）
   flow-log <task-id>                   查看任务流转审计记录
   recover-tasks                        恢复卡在 processing 的任务（认领者已离线）
@@ -772,7 +857,7 @@ EOF
 main() {
     # 确保消息和任务目录存在
     mkdir -p "$INBOX_DIR" "$OUTBOX_DIR"
-    mkdir -p "$TASKS_DIR"/{pending,processing,completed,failed,blocked,paused,groups}
+    mkdir -p "$TASKS_DIR"/{pending,processing,completed,failed,blocked,paused,pending_review,groups}
 
     local subcmd="${1:-}"
     shift 2>/dev/null || true
@@ -876,6 +961,18 @@ main() {
             ;;
         recover-tasks)
             cmd_recover_tasks
+            ;;
+        set-priority)
+            [[ $# -ge 2 ]] || die "用法: swarm-msg.sh set-priority <task-id> <high|normal|low>"
+            cmd_set_priority "$1" "$2"
+            ;;
+        approve-task)
+            [[ $# -ge 1 ]] || die "用法: swarm-msg.sh approve-task <task-id> [\"<comment>\"]"
+            cmd_approve_task "$1" "${2:-}"
+            ;;
+        reject-task)
+            [[ $# -ge 1 ]] || die "用法: swarm-msg.sh reject-task <task-id> [\"<reason>\"]"
+            cmd_reject_task "$1" "${2:-人工驳回}"
             ;;
         set-verify)
             [[ $# -ge 1 ]] || die "用法: swarm-msg.sh set-verify '<json>' --role <角色名>"

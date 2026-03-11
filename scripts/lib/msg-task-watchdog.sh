@@ -454,24 +454,90 @@ _watchdog_check_subtask_stall() {
         now=$(date +%s)
         if [[ $((now - esc_epoch)) -ge ${ESCALATE_STALL_TTL:-3600} ]]; then
             local hour_window=$(( now / 3600 ))
-            local notify_id="sys-escalate-stall-${hour_window}-${tid}"
-            mkdir -p "${MESSAGES_DIR}/inbox/supervisor"
-            [[ -f "${MESSAGES_DIR}/inbox/supervisor/${notify_id}.json" ]] && continue
-            jq -n \
-                --arg id "$notify_id" \
-                --arg from "watchdog" \
-                --arg to "supervisor" \
-                --arg content "[上报超时] 任务 $tid 已上报超过 ${ESCALATE_STALL_TTL:-3600}s 未被处理。请尽快使用 expand-subtask 展开或用 claim 重新认领。" \
-                --arg timestamp "$(get_timestamp)" \
-                --arg status "pending" \
-                --arg priority "high" \
-                --arg category "task.escalate_stall" \
-                '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority, category:$category}' \
-                > "${MESSAGES_DIR}/inbox/supervisor/${notify_id}.json"
+            local base_notify_id="sys-escalate-stall-${hour_window}-${tid}"
+            # 通知所有 supervisor 实例
+            while IFS='|' read -r _p _inst; do
+                [[ -z "$_inst" ]] && continue
+                local per_inst_id="${base_notify_id}-${_inst}"
+                mkdir -p "${MESSAGES_DIR}/inbox/${_inst}"
+                [[ -f "${MESSAGES_DIR}/inbox/${_inst}/${per_inst_id}.json" ]] && continue
+                jq -n \
+                    --arg id "$per_inst_id" \
+                    --arg from "watchdog" \
+                    --arg to "$_inst" \
+                    --arg content "[上报超时] 任务 $tid 已上报超过 ${ESCALATE_STALL_TTL:-3600}s 未被处理。请尽快使用 expand-subtask 展开或用 claim 重新认领。" \
+                    --arg timestamp "$(get_timestamp)" \
+                    --arg status "pending" \
+                    --arg priority "high" \
+                    --arg category "task.escalate_stall" \
+                    '{id:$id,from:$from,to:$to,content:$content,timestamp:$timestamp,status:$status,reply_to:null,priority:$priority,category:$category}' \
+                    > "${MESSAGES_DIR}/inbox/${_inst}/${per_inst_id}.json"
+            done < <(resolve_role_to_all_panes "supervisor")
             log_info "[watchdog] 上报超时: 任务 $tid (上报超过 ${ESCALATE_STALL_TTL:-3600}s)"
         fi
     done
 
+    shopt -u nullglob
+}
+
+# =============================================================================
+# pending_review 超时检测
+# =============================================================================
+
+# 检查 pending_review/ 中任务是否超过 PENDING_REVIEW_TTL 未被审批
+# 超时后通知 human 介入
+_watchdog_check_pending_review() {
+    [[ -d "$TASKS_DIR/pending_review" ]] || return 0
+
+    shopt -s nullglob
+    for f in "$TASKS_DIR/pending_review/"*.json; do
+        [[ -f "$f" ]] || continue
+
+        local tid review_requested_at
+        tid=$(jq -r '.id' "$f" 2>/dev/null)
+        review_requested_at=$(jq -r '.review_requested_at // ""' "$f" 2>/dev/null)
+        [[ -n "$review_requested_at" && "$review_requested_at" != "null" ]] || continue
+
+        # 解析时间戳: 先尝试提取纯日期时间部分（去掉时区等后缀），再解析
+        local req_epoch=0
+        local clean_ts="${review_requested_at%% [A-Z]*}"  # "2025-01-01 12:00:00 CST" → "2025-01-01 12:00:00"
+        req_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$clean_ts" +%s 2>/dev/null \
+            || date -d "$review_requested_at" +%s 2>/dev/null || echo "0")
+        [[ "$req_epoch" -gt 0 ]] || continue
+
+        local now
+        now=$(date +%s)
+        if [[ $((now - req_epoch)) -ge ${PENDING_REVIEW_TTL:-1800} ]]; then
+            # 小时级去重
+            local hour_window=$(( now / 3600 ))
+            local notify_id="sys-review-timeout-${hour_window}-${tid}"
+            mkdir -p "${MESSAGES_DIR}/inbox/human"
+            [[ -f "${MESSAGES_DIR}/inbox/human/${notify_id}.json" ]] && continue
+
+            local task_title claimed_by
+            task_title=$(jq -r '.title // .id' "$f" 2>/dev/null)
+            claimed_by=$(jq -r '.claimed_by // "unknown"' "$f" 2>/dev/null)
+
+            jq -n \
+                --arg id "$notify_id" \
+                --arg from "watchdog" \
+                --arg to "human" \
+                --arg content "[审批超时] 任务 $tid ($task_title) 在 pending_review 状态超过 ${PENDING_REVIEW_TTL:-1800}s 未被审批。原工蜂: $claimed_by。请手动处理: swarm-msg.sh approve-task $tid 或 swarm-msg.sh reject-task $tid" \
+                --arg timestamp "$(get_timestamp)" \
+                --arg status "pending" \
+                --arg priority "high" \
+                --arg category "task.review_timeout" \
+                '{id:$id,from:$from,to:$to,content:$content,timestamp:$timestamp,status:$status,reply_to:null,priority:$priority,category:$category}' \
+                > "${MESSAGES_DIR}/inbox/human/${notify_id}.json"
+
+            # 也再次提醒 inspector
+            _unified_notify "inspector" \
+                "[审批超时] 任务 $tid ($task_title) 等待审批已超时。请尽快处理。" \
+                "task.review_timeout" "high"
+
+            log_info "[watchdog] 审批超时: 任务 $tid (等待超过 ${PENDING_REVIEW_TTL:-1800}s)"
+        fi
+    done
     shopt -u nullglob
 }
 
@@ -500,6 +566,9 @@ start_task_watchdog() {
 
             # 子任务停滞检测
             _watchdog_check_subtask_stall
+
+            # pending_review 审批超时检测
+            _watchdog_check_pending_review
 
             # 日志轮转检查（按 LOG_ROTATE_INTERVAL 频率）
             local now

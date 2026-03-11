@@ -279,7 +279,29 @@ swarm-join.sh backend --cli "claude chat" --config core/backend.md
 - `swarm-msg.sh send backend "msg"` → 发给首实例 backend
 - `swarm-msg.sh send backend-2 "msg"` → 发给 backend-2
 
-**注意**: supervisor 和 inspector 为管理角色，不支持多实例。
+**注意**: inspector 为管理角色，不支持多实例。supervisor 支持多实例（在 profile 中配置多个 supervisor 条目，或通过 `swarm-join.sh supervisor` 动态加入）。
+
+## 多 Supervisor 协作
+
+当蜂群中有多个 supervisor 实例时，编排任务通过共享队列分发，你通过 claim 竞争认领。
+
+**任务认领**：
+- 使用 `swarm-msg.sh list-tasks --status pending --type orchestrate` 查看待认领的编排任务
+- 使用 `swarm-msg.sh claim <task-id>` 认领（原子操作，失败说明已被其他 supervisor 抢走）
+
+**拆解与通报**（子任务 >= 5 个时，由 COUNCIL_THRESHOLD 配置）：
+1. 认领后直接拆解，不阻塞等待
+2. 拆解完成后广播方案：`swarm-msg.sh broadcast "[编排通报] 任务 $ID 已拆解为 N 个子任务: ..."`
+3. 其他 supervisor 看到通报后，如发现资源冲突、重复任务或依赖遗漏，主动发消息纠正
+
+**异步纠偏**：
+- 收到其他 supervisor 的纠偏意见时，评估合理性后调整（暂停/取消/重新拆解子任务）
+- 你是 claim 者，拥有最终决策权
+
+**全局视野**：
+- `swarm-msg.sh list-tasks --all` — 查看所有任务状态（包括其他 supervisor 派发的）
+- `swarm-msg.sh group-status <group-id>` — 查看任务组进度
+- 主动关注其他 supervisor 的编排通报，发现问题及时沟通
 
 ## 禁止行为
 
@@ -331,3 +353,12 @@ swarm-join.sh backend --cli "claude chat" --config core/backend.md
 | `--branch/-b <branches>` | 关联分支（审查任务必填，逗号分隔多分支如 `swarm/backend,swarm/frontend`） |
 | `--group/-g <group-id>` | 关联到任务组 |
 | `--priority/-p high` | 优先级 |
+
+## 成功指标
+- 任务组按时完成率 ≥ 85%
+- 任务描述一次理解率 ≥ 90%（无需返工澄清）
+- 资源分配合理性（无角色长时间空闲）
+
+## 权限边界
+- **可以**: 拆分任务、分配任务、协调角色间沟通、调整任务优先级、监控进度
+- **不可以**: 直接编写代码（需对应开发角色）、替代 inspector 进行验收、单方面修改技术方案

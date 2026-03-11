@@ -349,20 +349,25 @@ cmd_task() {
     online_roles=$(get_online_roles)
 
     if echo "$online_roles" | grep -qx "$first_word" 2>/dev/null; then
+        # 指定角色 → 直接发送（不变）
         target="$first_word"
         content="${args[*]:1}"
+        if [[ -z "$content" ]]; then
+            die "缺少任务内容"
+        fi
+        log_info "发送任务给 $target: $content"
+        "$SCRIPTS_DIR/swarm-msg.sh" send "$target" "$content"
     else
-        target="supervisor"
+        # 未指定角色 → 发布到队列，所有 supervisor 竞争认领
         content="${args[*]}"
+        if [[ -z "$content" ]]; then
+            die "缺少任务内容"
+        fi
+        log_info "发布编排任务到队列: $content"
+        "$SCRIPTS_DIR/swarm-msg.sh" publish orchestrate "$content" \
+            --assign supervisor \
+            --priority high
     fi
-
-    if [[ -z "$content" ]]; then
-        die "缺少任务内容"
-    fi
-
-    # 发送任务
-    log_info "发送任务给 $target: $content"
-    "$SCRIPTS_DIR/swarm-msg.sh" send "$target" "$content"
 
     if $no_wait; then
         log_ok "任务已发送（不等待结果）"
@@ -575,6 +580,131 @@ cmd_msg() {
 }
 
 # =============================================================================
+# 子命令: dag (任务依赖 DAG 可视化)
+# =============================================================================
+
+cmd_dag() {
+    local workflow_file="" group_filter=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                echo "用法: swarm-cli.sh dag [选项]"
+                echo ""
+                echo "生成任务依赖的 Mermaid DAG 图。"
+                echo ""
+                echo "选项:"
+                echo "  --workflow <file>    从工作流 JSON 静态生成"
+                echo "  --group <group-id>   按任务组过滤"
+                echo ""
+                echo "默认从 runtime/tasks/ 运行时数据生成。"
+                return 0
+                ;;
+            --workflow)
+                shift; workflow_file="${1:-}"; shift
+                ;;
+            --group)
+                shift; group_filter="${1:-}"; shift
+                ;;
+            *)
+                die "dag: 未知参数 $1"
+                ;;
+        esac
+    done
+
+    if [[ -n "$workflow_file" ]]; then
+        _dag_from_workflow "$workflow_file"
+    else
+        _dag_from_runtime "$group_filter"
+    fi
+}
+
+# 从工作流 JSON 生成 DAG
+_dag_from_workflow() {
+    local wf_file="$1"
+    [[ -f "$wf_file" ]] || die "工作流文件不存在: $wf_file"
+
+    echo "graph TD"
+
+    # 样式类定义
+    echo "    classDef default fill:#f9f9f9,stroke:#333,stroke-width:1px"
+
+    # 遍历所有阶段和任务
+    jq -r '
+        .stages[] | .tasks[] |
+        "    " + (.id | gsub("-";"_")) + "[\"" + .title + "\"]"
+    ' "$wf_file"
+
+    # 遍历依赖关系
+    jq -r '
+        .stages[] | .tasks[] |
+        select(.depends_on != null and (.depends_on | length) > 0) |
+        .id as $tid |
+        .depends_on[] |
+        "    " + (. | gsub("-";"_")) + " --> " + ($tid | gsub("-";"_"))
+    ' "$wf_file"
+}
+
+# 从运行时数据生成 DAG
+_dag_from_runtime() {
+    local group_filter="$1"
+    local tasks_dir="${RUNTIME_DIR}/tasks"
+
+    echo "graph TD"
+
+    # 样式类定义
+    echo "    classDef pending fill:#f9f9f9,stroke:#999,stroke-dasharray:5 5"
+    echo "    classDef processing fill:#e3f2fd,stroke:#1976d2,stroke-width:3px"
+    echo "    classDef completed fill:#e8f5e9,stroke:#388e3c,stroke-width:2px"
+    echo "    classDef failed fill:#ffebee,stroke:#d32f2f,stroke-width:2px"
+    echo "    classDef blocked fill:#fff8e1,stroke:#f9a825,stroke-width:2px"
+    echo "    classDef paused fill:#f3e5f5,stroke:#7b1fa2,stroke-dasharray:5 5"
+    echo "    classDef pending_review fill:#fff3e0,stroke:#e65100,stroke-width:2px"
+
+    local found=false
+
+    for status_dir in pending processing completed failed blocked paused pending_review; do
+        local dir="$tasks_dir/$status_dir"
+        [[ -d "$dir" ]] || continue
+        for f in "$dir"/task-*.json; do
+            [[ -f "$f" ]] || continue
+
+            # 按组过滤
+            if [[ -n "$group_filter" ]]; then
+                local gid
+                gid=$(jq -r '.group_id // ""' "$f" 2>/dev/null)
+                [[ "$gid" == "$group_filter" ]] || continue
+            fi
+
+            found=true
+            local tid title status
+            tid=$(jq -r '.id' "$f" 2>/dev/null)
+            title=$(jq -r '.title // .id' "$f" 2>/dev/null)
+            status=$(jq -r '.status // "pending"' "$f" 2>/dev/null)
+
+            local safe_id="${tid//-/_}"
+            echo "    ${safe_id}[\"${title}\"]"
+            echo "    class ${safe_id} ${status}"
+
+            # 输出依赖关系
+            local deps
+            deps=$(jq -r '.depends_on // [] | .[]' "$f" 2>/dev/null)
+            if [[ -n "$deps" ]]; then
+                while IFS= read -r dep; do
+                    [[ -n "$dep" ]] || continue
+                    local safe_dep="${dep//-/_}"
+                    echo "    ${safe_dep} --> ${safe_id}"
+                done <<< "$deps"
+            fi
+        done
+    done
+
+    if [[ "$found" == false ]]; then
+        log_warn "没有找到任务数据${group_filter:+ (group: $group_filter)}"
+    fi
+}
+
+# =============================================================================
 # 帮助信息
 # =============================================================================
 
@@ -593,6 +723,7 @@ HEADER
     echo -e "  ${C_GREEN}join${C_RESET}    [role] [选项]              动态添加角色"
     echo -e "  ${C_GREEN}leave${C_RESET}   [role] [选项]              移除角色"
     echo -e "  ${C_GREEN}msg${C_RESET}     <子命令> ...               透传消息系统命令"
+    echo -e "  ${C_GREEN}dag${C_RESET}     [选项]                     任务依赖 DAG 可视化 (Mermaid)"
     echo -e "  ${C_GREEN}help${C_RESET}                               显示此帮助"
     echo ""
     echo -e "${C_BOLD}示例:${C_RESET}"
@@ -635,6 +766,9 @@ case "${1:-}" in
         ;;
     msg)
         shift; cmd_msg "$@"
+        ;;
+    dag)
+        shift; cmd_dag "$@"
         ;;
     help|--help|-h)
         show_help

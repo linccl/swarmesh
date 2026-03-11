@@ -745,6 +745,13 @@ _unified_notify_multi() {
     done
 }
 
+# 通知所有 supervisor 实例
+# 参数: $1=content, $2=category(默认default), $3=priority(默认normal)
+_notify_all_supervisors() {
+    local content="$1" category="${2:-default}" priority="${3:-normal}"
+    resolve_role_to_all_panes "supervisor" | _unified_notify_multi "$content" "$category" "$priority"
+}
+
 # =============================================================================
 # state.json 原子更新（flock 文件锁）
 # =============================================================================
@@ -1234,42 +1241,37 @@ check_prompt() {
 # 任务完成自动通知 supervisor
 # =============================================================================
 
-# 当角色完成任务时，自动通知 supervisor 可分配新任务
+# 当角色完成任务时，自动通知所有 supervisor 实例可分配新任务
 # 双通道: inbox（可靠持久）+ paste-buffer（即时推送）
 _notify_supervisor_completion() {
     local instance="$1"
 
-    # supervisor 自身不需要通知
-    [[ "$instance" == "supervisor" ]] && return 0
-
+    # 所有 supervisor 实例自身不需要通知
     local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
+    local my_role
+    my_role=$(jq -r --arg inst "$instance" '.panes[] | select(.instance == $inst) | .role // ""' "$state_file" 2>/dev/null | head -1)
+    [[ "$my_role" == "supervisor" ]] && return 0
+
+    # 通知所有 supervisor 实例（双通道: inbox + paste-buffer）
     local messages_dir="${RUNTIME_DIR}/messages"
-
-    # 查找 supervisor 的 pane
-    local sup_pane
-    sup_pane=$(_resolve_pane_by_id "supervisor")
-    [[ -z "$sup_pane" || "$sup_pane" == "null" ]] && return 0
-
-    # 通道 1: 写入 supervisor 收件箱（supervisor 首实例 instance==role）
-    local notify_id="completion-${instance}-$(date +%s)-${RANDOM}"
-    mkdir -p "${messages_dir}/inbox/supervisor"
-    jq -n \
-        --arg id "$notify_id" \
-        --arg from "system" \
-        --arg to "supervisor" \
-        --arg content "[任务完成] 实例 ${instance} 已完成当前任务，可分配新工作。" \
-        --arg timestamp "$(get_timestamp)" \
-        --arg status "pending" \
-        --arg priority "normal" \
-        '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority}' \
-        > "${messages_dir}/inbox/supervisor/${notify_id}.json"
-
-    # 通道 2: paste-buffer 即时推送（尽力而为）
-    local notify_tmp
-    notify_tmp=$(mktemp "${RUNTIME_DIR}/.watcher-notify-XXXXXX")
-    printf '%s' "[系统通知] 实例 ${instance} 已完成任务，可分配新工作。" > "$notify_tmp"
-    _pane_locked_paste_enter "$sup_pane" "$notify_tmp" 2>/dev/null || true
-    rm -f "$notify_tmp"
+    while IFS='|' read -r sup_pane sup_inst; do
+        [[ -z "$sup_inst" ]] && continue
+        # 通道 1: inbox（可靠持久）
+        local notify_id="completion-${instance}-$(date +%s)-${RANDOM}"
+        mkdir -p "${messages_dir}/inbox/${sup_inst}"
+        jq -n \
+            --arg id "$notify_id" --arg from "system" --arg to "$sup_inst" \
+            --arg content "[任务完成] 实例 ${instance} 已完成当前任务，可分配新工作。" \
+            --arg timestamp "$(get_timestamp)" --arg status "pending" --arg priority "normal" \
+            '{id:$id,from:$from,to:$to,content:$content,timestamp:$timestamp,status:$status,reply_to:null,priority:$priority}' \
+            > "${messages_dir}/inbox/${sup_inst}/${notify_id}.json"
+        # 通道 2: paste-buffer 即时推送
+        local notify_tmp
+        notify_tmp=$(mktemp "${RUNTIME_DIR}/.watcher-notify-XXXXXX")
+        printf '%s' "[系统通知] 实例 ${instance} 已完成任务，可分配新工作。" > "$notify_tmp"
+        _pane_locked_paste_enter "$sup_pane" "$notify_tmp" 2>/dev/null || true
+        rm -f "$notify_tmp"
+    done < <(resolve_role_to_all_panes "supervisor")
 }
 
 # 通知 inspector 某角色已停滞

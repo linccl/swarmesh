@@ -1,0 +1,136 @@
+{
+  "name": "product-feature",
+  "description": "端到端产品特性开发工作流（需求→设计→开发→测试→部署）",
+  "version": "1.0.0",
+  "variables": {
+    "requirement": {
+      "description": "产品需求描述",
+      "required": true
+    }
+  },
+  "stages": [
+    {
+      "name": "需求分析",
+      "parallel": false,
+      "tasks": [
+        {
+          "id": "req-analysis",
+          "title": "需求分析与 PRD 编写",
+          "type": "analysis",
+          "assign_role": "prd",
+          "description": "基于 {{requirement}} 进行需求分析，输出完整的 PRD 文档，包含用户故事、验收标准和优先级排序。"
+        }
+      ]
+    },
+    {
+      "name": "架构设计",
+      "parallel": false,
+      "tasks": [
+        {
+          "id": "arch-design",
+          "title": "技术架构设计",
+          "type": "architecture",
+          "assign_role": "architect",
+          "depends_on": ["req-analysis"],
+          "description": "基于 {{req-analysis}} 的 PRD，设计技术架构方案，包含技术选型、模块划分、接口定义和数据流。",
+          "verify": {
+            "schema-check": "echo '架构文档完整性检查'"
+          }
+        }
+      ]
+    },
+    {
+      "name": "数据库设计",
+      "parallel": false,
+      "tasks": [
+        {
+          "id": "db-design",
+          "title": "数据库 Schema 设计",
+          "type": "develop",
+          "assign_role": "database",
+          "depends_on": ["arch-design"],
+          "description": "基于 {{arch-design}} 的架构方案，设计数据库 Schema，包含表结构、索引、迁移脚本和数据字典。"
+        }
+      ]
+    },
+    {
+      "name": "核心开发",
+      "parallel": true,
+      "tasks": [
+        {
+          "id": "backend-dev",
+          "title": "后端 API 开发",
+          "type": "develop",
+          "assign_role": "backend",
+          "depends_on": ["db-design", "arch-design"],
+          "description": "基于 {{arch-design}} 的接口定义和 {{db-design}} 的数据模型，实现后端 API 逻辑。",
+          "verify": {
+            "build": "echo '构建检查'",
+            "test": "echo '单元测试'"
+          },
+          "max_retries": 2
+        },
+        {
+          "id": "frontend-dev",
+          "title": "前端页面开发",
+          "type": "develop",
+          "assign_role": "frontend",
+          "depends_on": ["arch-design"],
+          "description": "基于 {{arch-design}} 的接口定义和 UI 设计稿，实现前端页面和交互逻辑。",
+          "verify": {
+            "build": "echo '前端构建检查'",
+            "lint": "echo '代码规范检查'"
+          },
+          "max_retries": 2
+        }
+      ]
+    },
+    {
+      "name": "质量保障",
+      "parallel": true,
+      "tasks": [
+        {
+          "id": "code-test",
+          "title": "集成测试与端到端测试",
+          "type": "test",
+          "assign_role": "tester",
+          "depends_on": ["backend-dev", "frontend-dev"],
+          "description": "对 {{backend-dev}} 和 {{frontend-dev}} 的实现进行集成测试和端到端测试，覆盖所有验收标准中的场景。",
+          "verify": {
+            "test-report": "echo '测试报告生成'"
+          }
+        },
+        {
+          "id": "code-review",
+          "title": "代码审查",
+          "type": "review",
+          "assign_role": "reviewer",
+          "depends_on": ["backend-dev", "frontend-dev"],
+          "description": "审查 {{backend-dev}} 和 {{frontend-dev}} 的代码质量，检查是否符合项目规范和最佳实践。"
+        },
+        {
+          "id": "security-audit",
+          "title": "安全审计",
+          "type": "security",
+          "assign_role": "security",
+          "depends_on": ["backend-dev", "frontend-dev"],
+          "description": "对 {{backend-dev}} 和 {{frontend-dev}} 进行安全审计，覆盖 OWASP Top 10 和业务逻辑安全。"
+        }
+      ]
+    },
+    {
+      "name": "部署就绪",
+      "parallel": false,
+      "tasks": [
+        {
+          "id": "deploy-prep",
+          "title": "部署准备与上线清单",
+          "type": "develop",
+          "assign_role": "devops",
+          "depends_on": ["code-test", "code-review", "security-audit"],
+          "description": "基于 {{code-test}}、{{code-review}} 和 {{security-audit}} 的结果，准备部署配置、CI/CD pipeline 和上线清单。"
+        }
+      ]
+    }
+  ]
+}

@@ -180,7 +180,7 @@ resume_swarm() {
     log_info "初始化运行时环境..."
 
     # 确保目录结构完整（保留已有数据）
-    mkdir -p "$RUNTIME_DIR" "$LOGS_DIR" "$TASKS_DIR"/{pending,processing,completed,failed,blocked,groups} \
+    mkdir -p "$RUNTIME_DIR" "$LOGS_DIR" "$TASKS_DIR"/{pending,processing,completed,failed,blocked,paused,pending_review,groups} \
         "$RUNTIME_DIR/stories" "$RUNTIME_DIR/gate-logs"
     MESSAGES_DIR="$RUNTIME_DIR/messages"
     mkdir -p "$MESSAGES_DIR/inbox" "$MESSAGES_DIR/outbox" "$MESSAGES_DIR/inbox/human" "$MESSAGES_DIR/outbox/human"
@@ -501,7 +501,7 @@ WORKTREE_DIR="$PROJECT_DIR/.swarm-worktrees"
 
 log_info "初始化运行时环境..."
 
-mkdir -p "$RUNTIME_DIR" "$LOGS_DIR" "$TASKS_DIR"/{pending,processing,completed,failed,blocked,groups} \
+mkdir -p "$RUNTIME_DIR" "$LOGS_DIR" "$TASKS_DIR"/{pending,processing,completed,failed,blocked,paused,pending_review,groups} \
     "$RUNTIME_DIR/stories" "$RUNTIME_DIR/gate-logs"
 
 # 初始化消息目录
@@ -569,12 +569,16 @@ log_info "描述: $DESCRIPTION"
 
 ROLES_JSON=$(echo "$PROFILE_JSON" | jq -c '.roles // []')
 
-# 自动注入 supervisor（编排者）——蜂群的大脑，必须存在
+# 自动注入 supervisor（编排者）——蜂群的大脑
+# profile 中已有的 supervisor 条目会被计入，不足目标数时自动补齐
 HAS_SUPERVISOR=$(echo "$ROLES_JSON" | jq '[.[] | select(.name == "supervisor")] | length')
-if [[ "$HAS_SUPERVISOR" -eq 0 ]]; then
-    log_info "自动注入 supervisor 角色（编排者）"
-    SUPERVISOR_ENTRY='{"name":"supervisor","cli":"claude chat","config":"management/supervisor.md","alias":"sup,supervisor","title":"编排者","description":"蜂群编排者，负责任务拆解、角色调度和进度监控"}'
-    ROLES_JSON=$(echo "$ROLES_JSON" | jq --argjson sup "$SUPERVISOR_ENTRY" '. + [$sup]')
+NEED_SUP=$(( DEFAULT_SUPERVISOR_COUNT - HAS_SUPERVISOR ))
+if [[ "$NEED_SUP" -gt 0 ]]; then
+    log_info "自动注入 ${NEED_SUP} 个 supervisor 角色（编排者，目标 ${DEFAULT_SUPERVISOR_COUNT} 个）"
+    for ((s=0; s<NEED_SUP; s++)); do
+        SUPERVISOR_ENTRY='{"name":"supervisor","cli":"claude chat","config":"management/supervisor.md","alias":"sup,supervisor","title":"编排者","description":"蜂群编排者，负责任务拆解、角色调度和进度监控"}'
+        ROLES_JSON=$(echo "$ROLES_JSON" | jq --argjson sup "$SUPERVISOR_ENTRY" '. + [$sup]')
+    done
 fi
 
 # 自动注入 inspector（督查员）——质量门守护者，必须存在
