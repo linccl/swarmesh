@@ -140,9 +140,9 @@ flock -x 201
 # 生成实例名（首实例 instance==role，后续 role-2, role-3, ...）
 INSTANCE=$(generate_instance_name "$ROLE" "$STATE_FILE")
 
-# 管理角色不允许多实例
-if [[ "$ROLE" == "supervisor" || "$ROLE" == "inspector" ]] && [[ "$INSTANCE" != "$ROLE" ]]; then
-    die "管理角色 '$ROLE' 不支持多实例"
+# inspector 不允许多实例（supervisor 多实例通过 profile 或 swarm-join.sh 添加）
+if [[ "$ROLE" == "inspector" ]] && [[ "$INSTANCE" != "$ROLE" ]]; then
+    die "管理角色 'inspector' 不支持多实例"
 fi
 
 log_info "实例名: $INSTANCE (角色: $ROLE)"

@@ -150,6 +150,25 @@ swarm-msg.sh complete-task <task-id> "Implemented and tested"
 
 # View task group status
 swarm-msg.sh group-status <group-id>
+
+# Task group summary report (with timing info)
+swarm-msg.sh group-report <group-id>
+
+# Pause task (processing → paused)
+swarm-msg.sh pause-task <task-id> "Waiting for external dependency"
+
+# Resume paused task (paused → processing/pending)
+swarm-msg.sh resume-task <task-id>
+
+# Cancel task (cascades to dependencies and subtasks)
+swarm-msg.sh cancel-task <task-id> "Requirements changed"
+
+# View task audit trail
+swarm-msg.sh flow-log <task-id>
+
+# Manual approval (inspector only, used in strict quality gate mode)
+swarm-msg.sh approve-task <task-id> "Approved after manual review"
+swarm-msg.sh reject-task <task-id> "Test coverage insufficient"
 ```
 
 Messages are persisted via the file system (inbox/outbox) and instantly pushed to target panes using tmux paste-buffer.
@@ -235,6 +254,62 @@ swarm-msg.sh recover-tasks
 
 Related configuration: `TASK_MAX_RETRIES` (max retries, 0 = fail immediately), `TASK_RETRY_BASE_DELAY` (base delay in seconds, actual delay = 2^retry_count * base), `ESCALATE_STALL_TTL` (escalation timeout).
 
+#### Task Intervention
+
+Running tasks can be paused, resumed, or cancelled at any time:
+
+```bash
+# Pause a processing task
+swarm-msg.sh pause-task <task-id> "Waiting for API spec finalization"
+
+# Resume a paused task
+swarm-msg.sh resume-task <task-id>
+
+# Cancel a task (cascades to dependent tasks and subtasks)
+swarm-msg.sh cancel-task <task-id> "Requirements changed"
+```
+
+#### Task Audit Trail
+
+Every task state transition is recorded in an audit log. Use `flow-log` to view the complete history of a task:
+
+```bash
+swarm-msg.sh flow-log <task-id>
+```
+
+#### Multi-Supervisor Orchestration
+
+By default, swarm starts with a single supervisor. Supervisors can dynamically scale up based on workload:
+
+- **Watchdog detection**: When pending tasks exceed `PENDING_PILEUP_THRESHOLD`, the watchdog notifies supervisors
+- **Supervisor decision**: Supervisor evaluates the situation and decides whether to scale
+- **Controlled expansion**: `request-supervisor` command with built-in safeguards (max count, cooldown, CLI budget check)
+- **Context handoff**: New supervisors receive a task queue snapshot on join
+
+```bash
+# Supervisor requests scaling (only supervisor/human can call)
+swarm-msg.sh request-supervisor "Multiple task groups in parallel, overloaded"
+```
+
+When multiple supervisors are active, they coordinate through a shared task queue (claim-based). When a supervisor splits a task into many subtasks (count >= `COUNCIL_THRESHOLD`), an orchestration bulletin is broadcast to all other supervisors.
+
+#### Strict Quality Gate & Manual Approval
+
+When `GATE_STRICT_MODE=true`, quality gates become stricter:
+- Commands exiting with code 127 (command not found) are treated as failures instead of being skipped
+- Failed quality gates move tasks to `pending_review` state instead of staying in `processing`
+- Tasks in `pending_review` require manual approval from an inspector:
+
+```bash
+# Inspector approves a task after manual review
+swarm-msg.sh approve-task <task-id> "Approved after manual review"
+
+# Inspector rejects a task back to the worker
+swarm-msg.sh reject-task <task-id> "Test coverage insufficient"
+```
+
+If a task stays in `pending_review` longer than `PENDING_REVIEW_TTL`, the watchdog notifies the human operator.
+
 #### System Maintenance
 
 ```bash
@@ -278,6 +353,7 @@ All parameters are centralized in `config/defaults.conf` with 3-tier priority: e
 | `GATE_TIMEOUT` | 120 | Quality gate check timeout per command (seconds) |
 | `GATE_LOG_TTL` | 86400 | Quality gate log retention (seconds) |
 | `SKIP_GATE_TYPES` | `review design architecture audit document plan` | Task types that skip quality gates |
+| `GATE_STRICT_MODE` | false | Strict mode: exit 127 = failure, failed gates → manual approval |
 | `WATCHDOG_INTERVAL` | 60 | Task watchdog patrol interval (seconds) |
 | `TASK_PROCESSING_TTL` | 21600 | Max task processing duration (seconds, 0 = disable) |
 | `TASK_MAX_RETRIES` | 3 | Max retry count (0 = fail immediately) |
@@ -295,6 +371,13 @@ All parameters are centralized in `config/defaults.conf` with 3-tier priority: e
 | `RESUME_SUMMARY_MAX_TASKS` | 10 | Max completed/pending tasks in resume summary |
 | `RESUME_PANE_LINES` | 50 | Capture last N lines of each pane for resume |
 | `RESUME_SUMMARY_MAX_MESSAGES` | 10 | Max recent messages in resume summary |
+| `DEFAULT_SUPERVISOR_COUNT` | 1 | Initial supervisor count on startup (scales dynamically) |
+| `SUPERVISOR_MAX_COUNT` | 5 | Max supervisor count (prevents unbounded scaling) |
+| `SUPERVISOR_SCALE_COOLDOWN` | 300 | Min interval between supervisor expansions (seconds) |
+| `PENDING_PILEUP_THRESHOLD` | 5 | Pending task count threshold to notify supervisor |
+| `PENDING_PILEUP_NOTIFY_INTERVAL` | 1800 | Dedup interval for pileup notifications (seconds) |
+| `COUNCIL_THRESHOLD` | 5 | Broadcast orchestration bulletin when subtask count >= this |
+| `PENDING_REVIEW_TTL` | 1800 | Pending review timeout (seconds, notify human on expiry) |
 | `PANES_PER_WINDOW` | 2 | Tmux panes per window |
 
 ### Project Structure
@@ -338,7 +421,8 @@ swarmesh/
 ├── workflows/               # Predefined workflows
 │   ├── quick-task.json
 │   ├── feature-complete.json
-│   └── relay-chain.json
+│   ├── relay-chain.json
+│   └── product-feature.json  # End-to-end product feature workflow
 └── runtime/                 # Runtime data (gitignored)
     ├── state.json           # Swarm state
     ├── project-info.json    # Project scan results
@@ -534,6 +618,25 @@ swarm-msg.sh complete-task <task-id> "已实现并测试通过"
 
 # 查看任务组状态
 swarm-msg.sh group-status <group-id>
+
+# 任务组汇总报告（含耗时信息）
+swarm-msg.sh group-report <group-id>
+
+# 暂停任务（processing → paused）
+swarm-msg.sh pause-task <task-id> "等待外部依赖"
+
+# 恢复暂停的任务（paused → processing/pending）
+swarm-msg.sh resume-task <task-id>
+
+# 取消任务（级联取消依赖和子任务）
+swarm-msg.sh cancel-task <task-id> "需求变更"
+
+# 查看任务流转审计记录
+swarm-msg.sh flow-log <task-id>
+
+# 人工审批（仅 inspector，质量门严格模式下使用）
+swarm-msg.sh approve-task <task-id> "审核通过"
+swarm-msg.sh reject-task <task-id> "测试覆盖率不足"
 ```
 
 消息通过文件系统（inbox/outbox）持久化，同时用 tmux paste-buffer 即时推送通知到目标 pane。
@@ -618,6 +721,62 @@ swarm-msg.sh recover-tasks
 
 相关配置：`TASK_MAX_RETRIES`（最大重试次数，0=不重试直接失败）、`TASK_RETRY_BASE_DELAY`（重试基础延迟秒数，实际延迟 = 2^重试次数 × 基础值）、`ESCALATE_STALL_TTL`（上报任务未处理超时阈值）。
 
+#### 任务干预
+
+运行中的任务可随时暂停、恢复或取消：
+
+```bash
+# 暂停正在处理的任务
+swarm-msg.sh pause-task <task-id> "等待 API 规范定稿"
+
+# 恢复暂停的任务
+swarm-msg.sh resume-task <task-id>
+
+# 取消任务（级联取消依赖任务和子任务）
+swarm-msg.sh cancel-task <task-id> "需求变更"
+```
+
+#### 任务流转审计链
+
+每次任务状态变更都记录在审计日志中，用 `flow-log` 查看完整流转历史：
+
+```bash
+swarm-msg.sh flow-log <task-id>
+```
+
+#### 多 Supervisor 编排
+
+蜂群默认启动 1 个 supervisor，按需动态扩展：
+
+- **看门狗检测**：pending 任务数超过 `PENDING_PILEUP_THRESHOLD` 时通知 supervisor
+- **supervisor 决策**：supervisor 评估后决定是否扩展
+- **可控扩展**：`request-supervisor` 命令内置安全检查（数量上限、冷却时间、CLI 预算）
+- **上下文传递**：新 supervisor 加入时自动收到任务队列快照
+
+```bash
+# supervisor 请求扩展（仅 supervisor/human 可调用）
+swarm-msg.sh request-supervisor "多任务组并行，编排负载过高"
+```
+
+多个 supervisor 通过共享任务队列协作（claim 竞争认领）。当 supervisor 拆分任务产生大量子任务（数量 >= `COUNCIL_THRESHOLD`）时，会向其他 supervisor 广播编排通报，协调分工。
+
+#### 质量门严格模式与人工审批
+
+当 `GATE_STRICT_MODE=true` 时，质量门检查更严格：
+- 命令返回 127（command not found）视为失败，不再跳过
+- 质量门失败的任务进入 `pending_review` 状态，而非停留在 `processing`
+- `pending_review` 状态的任务需要 inspector 人工审批：
+
+```bash
+# inspector 审批通过
+swarm-msg.sh approve-task <task-id> "审核通过"
+
+# inspector 驳回任务，退回给工蜂
+swarm-msg.sh reject-task <task-id> "测试覆盖率不足"
+```
+
+如果任务在 `pending_review` 状态超过 `PENDING_REVIEW_TTL`，看门狗会通知人类操作者。
+
 #### 系统维护
 
 ```bash
@@ -661,6 +820,7 @@ swarm-msg.sh set-limit 0      # 取消上限
 | `GATE_TIMEOUT` | 120 | 质量门单条命令超时（秒） |
 | `GATE_LOG_TTL` | 86400 | 质量门日志保留时间（秒） |
 | `SKIP_GATE_TYPES` | `review design architecture audit document plan` | 跳过质量门检查的任务类型 |
+| `GATE_STRICT_MODE` | false | 严格模式: exit 127 视为失败，失败后进入人工审批 |
 | `WATCHDOG_INTERVAL` | 60 | 任务看门狗巡检间隔（秒） |
 | `TASK_PROCESSING_TTL` | 21600 | 任务最大处理时长（秒，0=禁用） |
 | `TASK_MAX_RETRIES` | 3 | 最大重试次数（0=不重试直接失败） |
@@ -678,6 +838,13 @@ swarm-msg.sh set-limit 0      # 取消上限
 | `RESUME_SUMMARY_MAX_TASKS` | 10 | 恢复摘要中最多包含的已完成/未完成任务数 |
 | `RESUME_PANE_LINES` | 50 | 捕获 pane 最后 N 行用于恢复 |
 | `RESUME_SUMMARY_MAX_MESSAGES` | 10 | 恢复摘要中的最近消息数 |
+| `DEFAULT_SUPERVISOR_COUNT` | 1 | 启动时 supervisor 数量（按需动态扩展） |
+| `SUPERVISOR_MAX_COUNT` | 5 | supervisor 最大数量上限（防无限扩展） |
+| `SUPERVISOR_SCALE_COOLDOWN` | 300 | 两次扩展之间的最小间隔（秒） |
+| `PENDING_PILEUP_THRESHOLD` | 5 | pending 任务堆积阈值（超过通知 supervisor 评估） |
+| `PENDING_PILEUP_NOTIFY_INTERVAL` | 1800 | 堆积通知去重间隔（秒，默认 30min） |
+| `COUNCIL_THRESHOLD` | 5 | 子任务数 >= 此值时广播编排通报给其他 supervisor |
+| `PENDING_REVIEW_TTL` | 1800 | pending_review 超时阈值（秒，超时通知人类） |
 | `PANES_PER_WINDOW` | 2 | 每窗口 pane 数 |
 
 ### 项目结构
@@ -711,7 +878,6 @@ swarmesh/
 │   │   ├── codex-only.json  # 5 角色 Codex 专用团队
 │   │   ├── web-dev.json     # 6 角色 Web 开发团队
 │   │   └── full-stack.json  # 14 角色完整团队
-│   │   └── full-stack.json  # 13 角色完整团队
 │   ├── roles/               # 角色 system prompt
 │   │   ├── core/            # 核心开发（frontend, backend, database, devops）
 │   │   ├── quality/         # 质量保障（tester, reviewer, security, performance）
@@ -721,7 +887,8 @@ swarmesh/
 ├── workflows/               # 预定义工作流
 │   ├── quick-task.json
 │   ├── feature-complete.json
-│   └── relay-chain.json
+│   ├── relay-chain.json
+│   └── product-feature.json  # 端到端产品特性开发工作流
 └── runtime/                 # 运行时数据（gitignore）
     ├── state.json           # 蜂群状态
     ├── project-info.json    # 项目扫描结果

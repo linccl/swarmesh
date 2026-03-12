@@ -144,10 +144,18 @@ _run_quality_gate() {
             exit_code=$?
             # 区分 "命令不存在"(127) 和 "检查失败"
             if [[ $exit_code -eq 127 ]]; then
-                echo "[$(get_timestamp)] [SKIP] $check_name (命令不存在, exit=$exit_code)" >> "$log_file"
-                warn "[质量门] $check_name: 命令不存在，跳过（环境可能缺少依赖）"
-                skip_count=$((skip_count + 1))
-                skip_names+="$check_name "
+                if [[ "${GATE_STRICT_MODE:-false}" == "true" ]]; then
+                    # 严格模式: 命令不存在 = 失败
+                    echo "[$(get_timestamp)] [FAIL-STRICT] $check_name (命令不存在, exit=$exit_code, 严格模式)" >> "$log_file"
+                    info "[质量门] $check_name: 命令不存在，严格模式下视为失败"
+                    all_passed=false
+                else
+                    # 宽松模式（默认，旧行为）: 跳过
+                    echo "[$(get_timestamp)] [SKIP] $check_name (命令不存在, exit=$exit_code)" >> "$log_file"
+                    warn "[质量门] $check_name: 命令不存在，跳过（环境可能缺少依赖）"
+                    skip_count=$((skip_count + 1))
+                    skip_names+="$check_name "
+                fi
             else
                 echo "[$(get_timestamp)] [FAIL] $check_name (exit=$exit_code)" >> "$log_file"
                 info "[质量门] $check_name: 失败 (exit=$exit_code)"
@@ -190,14 +198,51 @@ _run_quality_gate() {
         emit_event "gate.failed" "$role" "task_id=$task_id"
         [[ -n "$group_id" ]] && _story_add_verification "$group_id" "$task_id" "Gate 失败" "自动"
 
-        # 任务保持在 processing（无需回退，本来就没移走）
-        # 推送失败日志给工蜂（role 参数实际上是 instance）
-        local fail_msg="[质量门失败] 任务 $task_id 未通过自动检查，仍在 processing 状态。"
-        fail_msg+=$'\n'"查看详情: cat $log_file"
-        fail_msg+=$'\n'"修复后重新执行: swarm-msg.sh complete-task $task_id \"修复说明\""
-        _unified_notify "$role" "$fail_msg" "gate.failed" "high"
+        if [[ "${GATE_STRICT_MODE:-false}" == "true" ]]; then
+            # 严格模式: processing → pending_review，等待人工审批
+            mkdir -p "$TASKS_DIR/pending_review"
+            local review_tmp="$TASKS_DIR/processing/${task_id}.json.tmp"
+            local review_ts
+            review_ts=$(get_timestamp)
+            if jq --arg now_ts "$review_ts" --arg actor "$role" \
+                '
+                .status = "pending_review"
+                | .review_status = "pending"
+                | .review_requested_at = $now_ts
+                | .flow_log = ((.flow_log // []) + [{
+                    ts: $now_ts, action: "gate_review_requested",
+                    from_status: "processing", to_status: "pending_review",
+                    actor: $actor, detail: "质量门失败，严格模式下进入人工审批"
+                  }])
+                ' "$TASKS_DIR/processing/$task_id.json" > "$review_tmp" 2>/dev/null; then
+                mv "$review_tmp" "$TASKS_DIR/pending_review/$task_id.json"
+                rm -f "$TASKS_DIR/processing/$task_id.json"
+            else
+                rm -f "$review_tmp"
+            fi
 
-        info "[质量门] 任务 $task_id 未通过检查，保持 processing"
+            # 高优先级通知 inspector
+            local review_msg="[需要人工审批] 任务 $task_id 质量门失败（严格模式）"
+            review_msg+=$'\n'"查看详情: cat $log_file"
+            review_msg+=$'\n'"审批通过: swarm-msg.sh approve-task $task_id \"审批意见\""
+            review_msg+=$'\n'"驳回: swarm-msg.sh reject-task $task_id \"驳回原因\""
+            _unified_notify "inspector" "$review_msg" "gate.review_requested" "high"
+
+            # 也通知工蜂
+            _unified_notify "$role" \
+                "[质量门失败] 任务 $task_id 已进入人工审批流程，等待 inspector 审批。" \
+                "gate.failed" "high"
+
+            info "[质量门] 任务 $task_id 未通过检查，严格模式下进入 pending_review"
+        else
+            # 宽松模式（默认）: 任务保持在 processing
+            local fail_msg="[质量门失败] 任务 $task_id 未通过自动检查，仍在 processing 状态。"
+            fail_msg+=$'\n'"查看详情: cat $log_file"
+            fail_msg+=$'\n'"修复后重新执行: swarm-msg.sh complete-task $task_id \"修复说明\""
+            _unified_notify "$role" "$fail_msg" "gate.failed" "high"
+
+            info "[质量门] 任务 $task_id 未通过检查，保持 processing"
+        fi
         return 1
     fi
 }

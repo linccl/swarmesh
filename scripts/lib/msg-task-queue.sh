@@ -11,6 +11,76 @@
 _MSG_TASK_QUEUE_LOADED=1
 
 # =============================================================================
+# CLI 路由匹配
+# =============================================================================
+
+# 路由缓存变量
+_ROUTING_CACHE=""
+_ROUTING_CACHE_MTIME=0
+
+# 加载 cli-routing.json 缓存（基于 mtime，文件不变不重新解析）
+_load_routing_cache() {
+    local routing_file="$CONFIG_DIR/cli-routing.json"
+    [[ -f "$routing_file" ]] || { _ROUTING_CACHE=""; return 0; }
+
+    local file_mtime
+    file_mtime=$(_file_mtime "$routing_file")
+    if [[ "$file_mtime" != "$_ROUTING_CACHE_MTIME" || -z "$_ROUTING_CACHE" ]]; then
+        _ROUTING_CACHE=$(cat "$routing_file" 2>/dev/null) || _ROUTING_CACHE=""
+        _ROUTING_CACHE_MTIME="$file_mtime"
+    fi
+}
+
+# 计算任务对当前 CLI 的匹配得分
+# 参数: $1=task_file, $2=cli_name (如 "claude", "gemini", "codex")
+# 返回 (echo): 0=不匹配, 1=fallback, 2=推荐, 3=无规则/兼容
+_get_routing_score() {
+    local task_file="$1"
+    local cli_name="$2"
+
+    # 无路由配置 → 所有得分=3（完全兼容旧行为）
+    if [[ -z "$_ROUTING_CACHE" ]]; then
+        echo 3
+        return 0
+    fi
+
+    # 提取任务的 type 和 assigned_to（角色名用于查 task_routing 子键）
+    local task_type task_assigned_role
+    task_type=$(jq -r '.type // ""' "$task_file" 2>/dev/null)
+    task_assigned_role=$(jq -r '.assigned_to // ""' "$task_file" 2>/dev/null)
+
+    # 在 task_routing 中查找匹配规则
+    local route_entry
+    route_entry=$(echo "$_ROUTING_CACHE" | jq -r --arg type "$task_type" --arg role "$task_assigned_role" '
+        .task_routing[$type] as $type_routes |
+        if $type_routes then
+            ($type_routes[$role] // $type_routes["*"] // null)
+        else
+            null
+        end
+    ' 2>/dev/null)
+
+    if [[ -z "$route_entry" || "$route_entry" == "null" ]]; then
+        # 无匹配路由规则 → 兼容
+        echo 3
+        return 0
+    fi
+
+    local recommended fallback
+    recommended=$(echo "$route_entry" | jq -r '.recommended // ""' 2>/dev/null)
+    fallback=$(echo "$route_entry" | jq -r '.fallback // ""' 2>/dev/null)
+
+    if [[ "$cli_name" == "$recommended" ]]; then
+        echo 2
+    elif [[ "$cli_name" == "$fallback" ]]; then
+        echo 1
+    else
+        echo 0
+    fi
+    return 0
+}
+
+# =============================================================================
 # 任务队列内部工具函数
 # =============================================================================
 
@@ -53,20 +123,61 @@ _auto_claim_next() {
 
     [[ ${#candidates[@]} -eq 0 ]] && return 0
 
-    # 按优先级选: high > normal > low
-    local next_file=""
-    for pri in high normal low; do
-        for f in "${candidates[@]}"; do
-            [[ -f "$f" ]] || continue
-            local p
-            p=$(jq -r '.priority // "normal"' "$f" 2>/dev/null) || continue
-            if [[ "$p" == "$pri" ]]; then
-                next_file="$f"
-                break 2
+    # === CLI 路由匹配 ===
+    # 从 state.json 获取当前实例的 CLI 名称
+    _load_routing_cache
+    local my_cli_name=""
+    if [[ -n "$_ROUTING_CACHE" ]]; then
+        local my_cli_cmd
+        my_cli_cmd=$(jq -r --arg inst "$my_instance" \
+            '.panes[] | select(.instance == $inst) | .cli // ""' "$STATE_FILE" 2>/dev/null | head -1)
+        # 提取第一个单词（"claude chat" → "claude"）
+        my_cli_name="${my_cli_cmd%% *}"
+    fi
+
+    # 综合得分排序: route_score * 10 + pri_val，取最高分
+    local next_file="" best_score=-1
+    for f in "${candidates[@]}"; do
+        [[ -f "$f" ]] || continue
+
+        # 路由得分
+        local route_score
+        if [[ -n "$my_cli_name" ]]; then
+            # 检查是否有精确指派（assigned_to 精确指派覆盖路由）
+            local f_assigned
+            f_assigned=$(jq -r '.assigned_to // ""' "$f" 2>/dev/null)
+            if [[ -n "$f_assigned" && ("$f_assigned" == "$my_instance" || "$f_assigned" == "$my_role") ]]; then
+                route_score=3  # 精确指派 → 最高路由分
+            else
+                route_score=$(_get_routing_score "$f" "$my_cli_name")
             fi
-        done
+            # 防空: 路由得分为空时默认兼容
+            route_score="${route_score:-3}"
+            # route_score=0 且无精确指派 → 跳过（不认领不匹配的任务）
+            if [[ "$route_score" -eq 0 ]]; then
+                continue
+            fi
+        else
+            route_score=3  # 无路由配置时兼容旧行为
+        fi
+
+        # 优先级分值
+        local p pri_val
+        p=$(jq -r '.priority // "normal"' "$f" 2>/dev/null) || continue
+        case "$p" in
+            high)   pri_val=3 ;;
+            normal) pri_val=2 ;;
+            low)    pri_val=1 ;;
+            *)      pri_val=2 ;;
+        esac
+
+        local total_score=$(( route_score * 10 + pri_val ))
+        if [[ $total_score -gt $best_score ]]; then
+            best_score=$total_score
+            next_file="$f"
+        fi
     done
-    [[ -z "$next_file" ]] && next_file="${candidates[0]}"
+    [[ -z "$next_file" ]] && return 0
 
     local next_id
     next_id=$(jq -r '.id' "$next_file")
@@ -82,7 +193,12 @@ _auto_claim_next() {
     # 更新字段
     local tmp_file="$TASKS_DIR/processing/$next_id.json.tmp"
     jq --arg inst "$my_instance" --arg at "$claimed_at" \
-        '.status = "processing" | .claimed_by = $inst | .claimed_at = $at' \
+        '.status = "processing" | .claimed_by = $inst | .claimed_at = $at
+         | .flow_log = ((.flow_log // []) + [{
+             ts: $at, action: "auto_claimed",
+             from_status: "pending", to_status: "processing",
+             actor: $inst, detail: ""
+           }])' \
         "$TASKS_DIR/processing/$next_id.json" > "$tmp_file"
     mv "$tmp_file" "$TASKS_DIR/processing/$next_id.json"
 
@@ -161,7 +277,12 @@ _cascade_fail_blocked() {
         mkdir -p "$TASKS_DIR/failed"
         local tmp="$TASKS_DIR/blocked/${tid}.json.tmp"
         if jq --arg at "$now_ts" --arg dep "$failed_task_id" \
-            '.status = "failed" | .fail_reason = "依赖任务失败: " + $dep | .failed_at = $at' \
+            '.status = "failed" | .fail_reason = "依赖任务失败: " + $dep | .failed_at = $at
+             | .flow_log = ((.flow_log // []) + [{
+                 ts: $at, action: "cascade_failed",
+                 from_status: "blocked", to_status: "failed",
+                 actor: "system", detail: ("依赖任务失败: " + $dep)
+               }])' \
             "$blocked_file" > "$tmp" 2>/dev/null; then
             if mv "$tmp" "$TASKS_DIR/failed/$tid.json" 2>/dev/null; then
                 rm -f "$blocked_file"
@@ -204,8 +325,16 @@ _check_and_unblock() {
             tid=$(jq -r '.id' "$blocked_file")
             mkdir -p "$TASKS_DIR/pending"
             # 先更新字段到 tmp，再原子 mv 到 pending（避免中间状态可见）
+            local unblock_ts
+            unblock_ts=$(get_timestamp)
             local tmp_unblock="$TASKS_DIR/blocked/${tid}.json.tmp"
-            if jq '.blocked = false | .status = "pending"' "$blocked_file" > "$tmp_unblock" 2>/dev/null; then
+            if jq --arg at "$unblock_ts" \
+                '.blocked = false | .status = "pending"
+                 | .flow_log = ((.flow_log // []) + [{
+                     ts: $at, action: "unblocked",
+                     from_status: "blocked", to_status: "pending",
+                     actor: "system", detail: ""
+                   }])' "$blocked_file" > "$tmp_unblock" 2>/dev/null; then
                 if mv "$tmp_unblock" "$TASKS_DIR/pending/$tid.json" 2>/dev/null; then
                     rm -f "$blocked_file"
                 else
@@ -390,7 +519,7 @@ _generate_subtask_ids() {
 _cancel_subtask_tree() {
     local task_id="$1" reason="${2:-re-split-cascade}"
     local task_file=""
-    for d in pending processing blocked; do
+    for d in pending processing blocked paused; do
         [[ -f "$TASKS_DIR/$d/$task_id.json" ]] && task_file="$TASKS_DIR/$d/$task_id.json" && break
     done
     [[ -n "$task_file" ]] || return 0
@@ -404,8 +533,15 @@ _cancel_subtask_tree() {
     # 取消当前任务
     mkdir -p "$TASKS_DIR/failed"
     local ftmp="$task_file.tmp"
-    jq --arg reason "$reason" --arg at "$(get_timestamp)" \
-        '.status = "failed" | .fail_reason = $reason | .failed_at = $at' \
+    local prev_status
+    prev_status=$(jq -r '.status // "unknown"' "$task_file" 2>/dev/null)
+    jq --arg reason "$reason" --arg at "$(get_timestamp)" --arg from "$prev_status" \
+        '.status = "failed" | .fail_reason = $reason | .failed_at = $at
+         | .flow_log = ((.flow_log // []) + [{
+             ts: $at, action: "cancelled",
+             from_status: $from, to_status: "failed",
+             actor: "system", detail: $reason
+           }])' \
         "$task_file" > "$ftmp" && mv "$ftmp" "$TASKS_DIR/failed/$task_id.json"
     rm -f "$task_file"
 
@@ -508,10 +644,16 @@ _compose_parent() {
         mkdir -p "$TASKS_DIR/completed"
         local compose_tmp="$TASKS_DIR/completed/${parent_id}.json.tmp"
         jq --arg result "$composed_result" --arg at "$completed_at" \
-            '.status = "completed" | .result = $result | .completed_at = $at | .split_status = "composed"' \
+            '.status = "completed" | .result = $result | .completed_at = $at | .split_status = "composed"
+             | .flow_log = ((.flow_log // []) + [{
+                 ts: $at, action: "composed",
+                 from_status: "processing", to_status: "completed",
+                 actor: "system", detail: "子任务全部完成，已归一"
+               }])' \
             "$parent_file" > "$compose_tmp"
         mv "$compose_tmp" "$TASKS_DIR/completed/$parent_id.json"
         rm -f "$parent_file"
+        rm -f "$TASKS_DIR/processing/${parent_id}.op.lock" "$TASKS_DIR/processing/${parent_id}.compose.lock" 2>/dev/null
 
         emit_event "task.composed" "" "parent_id=$parent_id"
 
@@ -690,7 +832,12 @@ cmd_publish() {
             parent_task: null,
             subtasks: [],
             split_status: null,
-            depth: 0
+            depth: 0,
+            flow_log: [{
+                ts: $created_at, action: "published",
+                from_status: "-", to_status: $status,
+                actor: $from, detail: $title
+            }]
         }' > "$TASKS_DIR/$target_dir/$task_id.json"
 
     # 如果属于某个 group，追加到 group 的任务列表
@@ -777,7 +924,7 @@ cmd_list_tasks() {
 
     local dirs=()
     if [[ "$filter_status" == "all" ]]; then
-        dirs=("pending" "blocked" "processing" "completed" "failed")
+        dirs=("pending" "blocked" "processing" "paused" "completed" "failed" "pending_review")
     else
         dirs=("$filter_status")
     fi
@@ -857,7 +1004,12 @@ cmd_claim() {
     claimed_at=$(get_timestamp)
     local tmp_file="$TASKS_DIR/processing/$task_id.json.tmp"
     jq --arg inst "$my_instance" --arg at "$claimed_at" \
-        '.status = "processing" | .claimed_by = $inst | .claimed_at = $at' \
+        '.status = "processing" | .claimed_by = $inst | .claimed_at = $at
+         | .flow_log = ((.flow_log // []) + [{
+             ts: $at, action: "claimed",
+             from_status: "pending", to_status: "processing",
+             actor: $inst, detail: ""
+           }])' \
         "$TASKS_DIR/processing/$task_id.json" > "$tmp_file"
     mv "$tmp_file" "$TASKS_DIR/processing/$task_id.json"
 
@@ -921,11 +1073,17 @@ cmd_complete_task() {
 
     mkdir -p "$TASKS_DIR/completed"
     local ctmp="$TASKS_DIR/processing/${task_id}.json.tmp"
-    if jq --arg result "$result" --arg at "$completed_at" \
-        '.status = "completed" | .result = $result | .completed_at = $at' \
+    if jq --arg result "$result" --arg at "$completed_at" --arg actor "$my_instance" \
+        '.status = "completed" | .result = $result | .completed_at = $at
+         | .flow_log = ((.flow_log // []) + [{
+             ts: $at, action: "completed",
+             from_status: "processing", to_status: "completed",
+             actor: $actor, detail: ""
+           }])' \
         "$task_file" > "$ctmp" 2>/dev/null; then
         mv "$ctmp" "$TASKS_DIR/completed/$task_id.json"
         rm -f "$task_file"
+        rm -f "$TASKS_DIR/processing/${task_id}.op.lock" "$TASKS_DIR/processing/${task_id}.compose.lock" 2>/dev/null
     else
         rm -f "$ctmp"
         die "complete-task: jq 处理失败: $task_id"
@@ -1012,6 +1170,7 @@ cmd_fail_task() {
             --arg now_ts "$now_ts" \
             --arg retry_after "$retry_after" \
             --argjson entry "$history_entry" \
+            --arg actor "$my_instance" \
             '
             .status = "pending"
             | .claimed_by = null
@@ -1021,6 +1180,11 @@ cmd_fail_task() {
             | .failed_at = $now_ts
             | .retry_after = $retry_after
             | .retry_history = ((.retry_history // []) + [$entry])
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "failed_retry",
+                from_status: "processing", to_status: "pending",
+                actor: $actor, detail: $reason
+              }])
             ' "$task_file" > "$tmp" 2>/dev/null; then
             rm -f "$tmp"
             die "fail-task: jq 更新失败"
@@ -1031,6 +1195,7 @@ cmd_fail_task() {
             die "fail-task: 移动到 pending 失败"
         fi
         rm -f "$task_file"
+        rm -f "$TASKS_DIR/processing/${task_id}.op.lock" "$TASKS_DIR/processing/${task_id}.compose.lock" 2>/dev/null
 
         emit_event "task.retry" "$my_instance" "task_id=$task_id" "retry_count=$new_count" "max_retries=$max_retries" "delay=${delay}s"
 
@@ -1053,12 +1218,18 @@ cmd_fail_task() {
             --arg reason "$reason" \
             --arg now_ts "$now_ts" \
             --argjson entry "$history_entry" \
+            --arg actor "$my_instance" \
             '
             .status = "failed"
             | .retry_count = $new_count
             | .fail_reason = $reason
             | .failed_at = $now_ts
             | .retry_history = ((.retry_history // []) + [$entry])
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "failed_exhausted",
+                from_status: "processing", to_status: "failed",
+                actor: $actor, detail: $reason
+              }])
             ' "$task_file" > "$tmp" 2>/dev/null; then
             rm -f "$tmp"
             die "fail-task: jq 更新失败"
@@ -1069,6 +1240,7 @@ cmd_fail_task() {
             die "fail-task: 移动到 failed 失败"
         fi
         rm -f "$task_file"
+        rm -f "$TASKS_DIR/processing/${task_id}.op.lock" "$TASKS_DIR/processing/${task_id}.compose.lock" 2>/dev/null
 
         emit_event "task.exhausted" "$my_instance" "task_id=$task_id" "retry_count=$new_count" "max_retries=$max_retries"
 
@@ -1099,6 +1271,456 @@ cmd_fail_task() {
 }
 
 # =============================================================================
+# 子命令: pause-task (暂停正在执行的任务)
+# =============================================================================
+
+cmd_pause_task() {
+    local task_id="$1"
+    local reason="${2:-手动暂停}"
+
+    local my_instance
+    my_instance=$(detect_my_instance)
+
+    local task_file="$TASKS_DIR/processing/$task_id.json"
+    [[ -f "$task_file" ]] || die "任务不在处理中: $task_id (只能暂停 processing 状态的任务)"
+
+    local now_ts
+    now_ts=$(get_timestamp)
+
+    # 更新状态（保留 claimed_by/claimed_at，resume 时恢复）
+    mkdir -p "$TASKS_DIR/paused"
+    local tmp="$task_file.tmp"
+    if ! jq \
+        --arg reason "$reason" \
+        --arg now_ts "$now_ts" \
+        --arg actor "$my_instance" \
+        '
+        .status = "paused"
+        | .paused_at = $now_ts
+        | .pause_reason = $reason
+        | .flow_log = ((.flow_log // []) + [{
+            ts: $now_ts, action: "paused",
+            from_status: "processing", to_status: "paused",
+            actor: $actor, detail: $reason
+          }])
+        ' "$task_file" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "pause-task: jq 更新失败"
+    fi
+
+    if ! mv "$tmp" "$TASKS_DIR/paused/$task_id.json" 2>/dev/null; then
+        rm -f "$tmp"
+        die "pause-task: 移动到 paused 失败"
+    fi
+    rm -f "$task_file"
+
+    # 清理锁文件
+    rm -f "$TASKS_DIR/processing/${task_id}.op.lock" "$TASKS_DIR/processing/${task_id}.compose.lock" 2>/dev/null
+
+    emit_event "task.paused" "$my_instance" "task_id=$task_id" "reason=$reason"
+
+    # 通知认领者 + supervisor
+    local claimed_by
+    claimed_by=$(jq -r '.claimed_by // ""' "$TASKS_DIR/paused/$task_id.json")
+    local task_title
+    task_title=$(jq -r '.title' "$TASKS_DIR/paused/$task_id.json")
+
+    if [[ -n "$claimed_by" && "$claimed_by" != "null" ]]; then
+        _unified_notify "$claimed_by" \
+            "[任务暂停] $task_id ($task_title) 已暂停。原因: $reason" "task.paused"
+    fi
+    _notify_all_supervisors \
+        "[任务暂停] $task_id ($task_title) 已暂停。原因: $reason" "task.paused"
+
+    _story_update_task "$task_id" "paused" "已暂停: $reason"
+
+    info "任务已暂停: $task_id (原因: $reason)"
+}
+
+# =============================================================================
+# 子命令: resume-task (恢复暂停的任务)
+# =============================================================================
+
+cmd_resume_task() {
+    local task_id="$1"
+
+    local my_instance
+    my_instance=$(detect_my_instance)
+
+    local task_file="$TASKS_DIR/paused/$task_id.json"
+    [[ -f "$task_file" ]] || die "任务不在暂停状态: $task_id (只能恢复 paused 状态的任务)"
+
+    local now_ts
+    now_ts=$(get_timestamp)
+
+    # 检查原认领者是否存活
+    local claimed_by
+    claimed_by=$(jq -r '.claimed_by // ""' "$task_file")
+    local pane_alive=false
+    if [[ -n "$claimed_by" && "$claimed_by" != "null" ]]; then
+        local pane_target
+        pane_target=$(_resolve_pane_by_id "$claimed_by")
+        if [[ -n "$pane_target" ]]; then
+            # 检查 pane 是否存活
+            if tmux display-message -t "$pane_target" -p '#{pane_id}' &>/dev/null; then
+                pane_alive=true
+            fi
+        fi
+    fi
+
+    if [[ "$pane_alive" == true ]]; then
+        # 原认领者存活 → 恢复到 processing
+        mkdir -p "$TASKS_DIR/processing"
+        local tmp="$task_file.tmp"
+        if ! jq \
+            --arg now_ts "$now_ts" \
+            --arg actor "$my_instance" \
+            '
+            .status = "processing"
+            | del(.paused_at, .pause_reason)
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "resumed",
+                from_status: "paused", to_status: "processing",
+                actor: $actor, detail: "原认领者存活，恢复处理"
+              }])
+            ' "$task_file" > "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            die "resume-task: jq 更新失败"
+        fi
+
+        if ! mv "$tmp" "$TASKS_DIR/processing/$task_id.json" 2>/dev/null; then
+            rm -f "$tmp"
+            die "resume-task: 移动到 processing 失败"
+        fi
+        rm -f "$task_file"
+
+        emit_event "task.resumed" "$my_instance" "task_id=$task_id" "target=processing"
+
+        _unified_notify "$claimed_by" \
+            "[任务恢复] $task_id 已恢复，请继续处理" "task.resumed"
+
+        _story_update_task "$task_id" "processing" "已恢复: 由 $claimed_by 继续处理"
+
+        info "任务已恢复到 processing: $task_id (认领者: $claimed_by)"
+    else
+        # 原认领者离线 → 放回 pending，清空认领信息
+        mkdir -p "$TASKS_DIR/pending"
+        local tmp="$task_file.tmp"
+        if ! jq \
+            --arg now_ts "$now_ts" \
+            --arg actor "$my_instance" \
+            --arg old_claimed "$claimed_by" \
+            '
+            .status = "pending"
+            | .claimed_by = null
+            | .claimed_at = null
+            | del(.paused_at, .pause_reason)
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "resumed",
+                from_status: "paused", to_status: "pending",
+                actor: $actor, detail: ("原认领者 " + $old_claimed + " 离线，放回待认领")
+              }])
+            ' "$task_file" > "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            die "resume-task: jq 更新失败"
+        fi
+
+        if ! mv "$tmp" "$TASKS_DIR/pending/$task_id.json" 2>/dev/null; then
+            rm -f "$tmp"
+            die "resume-task: 移动到 pending 失败"
+        fi
+        rm -f "$task_file"
+
+        emit_event "task.resumed" "$my_instance" "task_id=$task_id" "target=pending"
+
+        # 广播可认领通知
+        local task_title
+        task_title=$(jq -r '.title' "$TASKS_DIR/pending/$task_id.json")
+        _notify_all_supervisors \
+            "[任务恢复] $task_id ($task_title) 已放回待认领队列（原认领者离线）" "task.resumed"
+
+        _story_update_task "$task_id" "pending" "已恢复: 原认领者 $claimed_by 离线，放回待认领"
+
+        info "任务已恢复到 pending: $task_id (原认领者 $claimed_by 离线)"
+    fi
+}
+
+# =============================================================================
+# 子命令: cancel-task (取消任务，级联取消依赖和子任务)
+# =============================================================================
+
+cmd_cancel_task() {
+    local task_id="$1"
+    local reason="${2:-手动取消}"
+
+    local my_instance
+    my_instance=$(detect_my_instance)
+
+    # 在多个目录中查找任务
+    local task_file="" from_status=""
+    for d in pending processing blocked paused; do
+        if [[ -f "$TASKS_DIR/$d/$task_id.json" ]]; then
+            task_file="$TASKS_DIR/$d/$task_id.json"
+            from_status="$d"
+            break
+        fi
+    done
+    [[ -n "$task_file" ]] || die "任务不存在或已完成/已失败: $task_id"
+
+    local now_ts
+    now_ts=$(get_timestamp)
+
+    # 读取任务信息（取消前）
+    local claimed_by task_title from_id
+    claimed_by=$(jq -r '.claimed_by // ""' "$task_file")
+    task_title=$(jq -r '.title' "$task_file")
+    from_id=$(jq -r '.from' "$task_file")
+
+    # 更新状态
+    mkdir -p "$TASKS_DIR/failed"
+    local tmp="$task_file.tmp"
+    if ! jq \
+        --arg reason "$reason" \
+        --arg now_ts "$now_ts" \
+        --arg actor "$my_instance" \
+        --arg from "$from_status" \
+        '
+        .status = "failed"
+        | .fail_reason = ("cancelled: " + $reason)
+        | .cancelled_at = $now_ts
+        | .failed_at = $now_ts
+        | .flow_log = ((.flow_log // []) + [{
+            ts: $now_ts, action: "cancelled",
+            from_status: $from, to_status: "failed",
+            actor: $actor, detail: $reason
+          }])
+        ' "$task_file" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "cancel-task: jq 更新失败"
+    fi
+
+    if ! mv "$tmp" "$TASKS_DIR/failed/$task_id.json" 2>/dev/null; then
+        rm -f "$tmp"
+        die "cancel-task: 移动到 failed 失败"
+    fi
+    rm -f "$task_file"
+
+    # 清理锁文件
+    rm -f "$TASKS_DIR/processing/${task_id}.op.lock" "$TASKS_DIR/processing/${task_id}.compose.lock" 2>/dev/null
+    rm -f "$TASKS_DIR/paused/${task_id}.op.lock" "$TASKS_DIR/paused/${task_id}.compose.lock" 2>/dev/null
+
+    emit_event "task.cancelled" "$my_instance" "task_id=$task_id" "reason=$reason" "from_status=$from_status"
+
+    # 通知所有 supervisor + 原认领者
+    _notify_all_supervisors \
+        "[任务取消] $task_id ($task_title) 已取消。原因: $reason" "task.cancelled"
+    if [[ -n "$claimed_by" && "$claimed_by" != "null" && "$claimed_by" != "$my_instance" ]]; then
+        _unified_notify "$claimed_by" \
+            "[任务取消] $task_id ($task_title) 已取消。原因: $reason" "task.cancelled"
+    fi
+    local from_role=""
+    if [[ -n "$from_id" && "$from_id" != "null" ]]; then
+        from_role=$(jq -r --arg inst "$from_id" '.panes[] | select(.instance == $inst) | .role // ""' "$STATE_FILE" 2>/dev/null | head -1)
+    fi
+    if [[ -n "$from_id" && "$from_id" != "null" && "$from_id" != "$my_instance" && "$from_role" != "supervisor" ]]; then
+        _unified_notify "$from_id" \
+            "[任务取消] $task_id ($task_title) 已取消。原因: $reason" "task.cancelled"
+    fi
+
+    _story_update_task "$task_id" "failed" "已取消: $reason"
+
+    info "任务已取消: $task_id (原因: $reason)"
+
+    # 级联：取消依赖此任务的 blocked 任务
+    _cascade_fail_blocked "$task_id"
+
+    # 子任务级联：取消所有子任务
+    local subtasks
+    subtasks=$(jq -r '.subtasks // [] | .[]' "$TASKS_DIR/failed/$task_id.json" 2>/dev/null)
+    while IFS= read -r sub_id; do
+        [[ -z "$sub_id" ]] && continue
+        _cancel_subtask_tree "$sub_id" "父任务 $task_id 已取消: $reason"
+    done <<< "$subtasks"
+}
+
+# =============================================================================
+# 子命令: group-report (任务组汇总报告)
+# =============================================================================
+
+cmd_group_report() {
+    local group_id="${1:-}"
+    [[ -n "$group_id" ]] || die "用法: group-report <group-id>"
+
+    local group_file="$TASKS_DIR/groups/$group_id.json"
+    [[ -f "$group_file" ]] || die "任务组不存在: $group_id"
+
+    # 读取组信息
+    local group_title group_from group_status completed total created_at
+    group_title=$(jq -r '.title' "$group_file")
+    group_from=$(jq -r '.from' "$group_file")
+    group_status=$(jq -r '.status' "$group_file")
+    completed=$(jq -r '.completed_count' "$group_file")
+    total=$(jq -r '.total_count' "$group_file")
+    created_at=$(jq -r '.created_at // ""' "$group_file")
+
+    # 计算组级耗时
+    local duration_str="进行中"
+    if [[ -n "$created_at" && "$created_at" != "null" ]]; then
+        local created_epoch now_epoch
+        created_epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$created_at" +%s 2>/dev/null \
+            || date -d "$created_at" +%s 2>/dev/null \
+            || echo "0")
+
+        if [[ "$group_status" == "completed" ]]; then
+            # 查找最后一个完成的任务时间
+            local last_completed_at=""
+            while IFS= read -r tid; do
+                [[ -z "$tid" ]] && continue
+                local cfile="$TASKS_DIR/completed/$tid.json"
+                [[ -f "$cfile" ]] || continue
+                local cat_val
+                cat_val=$(jq -r '.completed_at // ""' "$cfile" 2>/dev/null)
+                if [[ -n "$cat_val" && "$cat_val" != "null" ]]; then
+                    if [[ -z "$last_completed_at" || "$cat_val" > "$last_completed_at" ]]; then
+                        last_completed_at="$cat_val"
+                    fi
+                fi
+            done < <(jq -r '.tasks[]' "$group_file" 2>/dev/null)
+
+            if [[ -n "$last_completed_at" ]]; then
+                local end_epoch
+                end_epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$last_completed_at" +%s 2>/dev/null \
+                    || date -d "$last_completed_at" +%s 2>/dev/null \
+                    || echo "0")
+                if [[ "$created_epoch" != "0" && "$end_epoch" != "0" ]]; then
+                    local diff=$(( end_epoch - created_epoch ))
+                    duration_str=$(_format_duration "$diff")
+                fi
+            fi
+        else
+            now_epoch=$(date +%s)
+            if [[ "$created_epoch" != "0" ]]; then
+                local diff=$(( now_epoch - created_epoch ))
+                duration_str="$(_format_duration "$diff") (进行中)"
+            fi
+        fi
+    fi
+
+    # 计算进度百分比
+    local pct=0
+    if [[ "$total" -gt 0 ]]; then
+        pct=$(( completed * 100 / total ))
+    fi
+
+    # 输出报告头
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "任务组: $group_id \"$group_title\""
+    echo "发布者: $group_from | 状态: $group_status"
+    [[ -n "$created_at" && "$created_at" != "null" ]] && echo "创建: $created_at | 总耗时: $duration_str"
+    echo "进度: $completed/$total ($pct%)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+
+    # 遍历组内每个任务
+    while IFS= read -r tid; do
+        [[ -z "$tid" ]] && continue
+
+        # 在各目录中查找任务
+        local task_file="" task_status="unknown"
+        for d in completed processing pending blocked paused failed; do
+            if [[ -f "$TASKS_DIR/$d/$tid.json" ]]; then
+                task_file="$TASKS_DIR/$d/$tid.json"
+                task_status="$d"
+                break
+            fi
+        done
+
+        if [[ -z "$task_file" ]]; then
+            echo "  [??] $tid (未找到)"
+            continue
+        fi
+
+        local icon
+        case "$task_status" in
+            completed)  icon="OK" ;;
+            processing) icon=">>" ;;
+            pending)    icon=".." ;;
+            blocked)    icon="!!" ;;
+            paused)     icon="||" ;;
+            failed)     icon="XX" ;;
+            *)          icon="??" ;;
+        esac
+
+        # 读取任务信息
+        local t_title t_claimed t_result
+        t_title=$(jq -r '.title' "$task_file")
+        t_claimed=$(jq -r '.claimed_by // ""' "$task_file")
+        t_result=$(jq -r '.result // ""' "$task_file")
+
+        # 计算单个任务耗时
+        local task_duration=""
+        local claimed_at completed_at
+        claimed_at=$(jq -r '.claimed_at // ""' "$task_file")
+        completed_at=$(jq -r '.completed_at // ""' "$task_file")
+
+        if [[ "$task_status" == "completed" && -n "$claimed_at" && "$claimed_at" != "null" && -n "$completed_at" && "$completed_at" != "null" ]]; then
+            local s_epoch e_epoch
+            s_epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$claimed_at" +%s 2>/dev/null \
+                || date -d "$claimed_at" +%s 2>/dev/null || echo "0")
+            e_epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$completed_at" +%s 2>/dev/null \
+                || date -d "$completed_at" +%s 2>/dev/null || echo "0")
+            if [[ "$s_epoch" != "0" && "$e_epoch" != "0" ]]; then
+                task_duration=$(_format_duration $(( e_epoch - s_epoch )))
+            fi
+        elif [[ "$task_status" == "processing" && -n "$claimed_at" && "$claimed_at" != "null" ]]; then
+            local s_epoch
+            s_epoch=$(date -j -f '%Y-%m-%d %H:%M:%S' "$claimed_at" +%s 2>/dev/null \
+                || date -d "$claimed_at" +%s 2>/dev/null || echo "0")
+            if [[ "$s_epoch" != "0" ]]; then
+                task_duration="$(_format_duration $(( $(date +%s) - s_epoch )))+"
+            fi
+        elif [[ "$task_status" == "paused" ]]; then
+            task_duration="(暂停)"
+        fi
+
+        # 格式化输出
+        local claimed_str=""
+        [[ -n "$t_claimed" && "$t_claimed" != "null" ]] && claimed_str=" [$t_claimed]"
+        local duration_display=""
+        [[ -n "$task_duration" ]] && duration_display="  $task_duration"
+
+        printf "  [%s] %s%s  \"%s\"%s\n" "$icon" "$tid" "$claimed_str" "$t_title" "$duration_display"
+
+        # 显示结果摘要（仅已完成任务，截断过长内容）
+        if [[ -n "$t_result" && "$t_result" != "null" ]]; then
+            local result_short
+            if [[ ${#t_result} -gt 80 ]]; then
+                result_short="${t_result:0:77}..."
+            else
+                result_short="$t_result"
+            fi
+            echo "       结果: $result_short"
+        fi
+    done < <(jq -r '.tasks[]' "$group_file" 2>/dev/null)
+
+    echo ""
+}
+
+# 格式化秒数为人类可读的持续时间
+_format_duration() {
+    local seconds="$1"
+    if [[ $seconds -lt 60 ]]; then
+        echo "${seconds}s"
+    elif [[ $seconds -lt 3600 ]]; then
+        echo "$(( seconds / 60 ))m $(( seconds % 60 ))s"
+    else
+        local hours=$(( seconds / 3600 ))
+        local mins=$(( (seconds % 3600) / 60 ))
+        echo "${hours}h ${mins}m"
+    fi
+}
+
+# =============================================================================
 # 子命令: escalate-task (上报任务给 supervisor 拆分，工蜂释放认领)
 # =============================================================================
 
@@ -1120,25 +1742,34 @@ cmd_escalate_task() {
     local now_ts
     now_ts=$(get_timestamp)
 
-    # 更新任务: 释放认领 + 标记 escalated
-    local tmp="$task_file.tmp"
-    if ! jq --arg reason "$reason" \
-       --arg by "$my_instance" \
-       --arg at "$now_ts" \
-       '
-       .claimed_by = null
-       | .claimed_at = null
-       | .escalated = {
-           status: "pending",
-           reason: $reason,
-           escalated_by: $by,
-           escalated_at: $at
-         }
-       ' "$task_file" > "$tmp" 2>/dev/null; then
-        rm -f "$tmp"
-        die "escalate-task: 更新任务文件失败: $task_id"
-    fi
-    mv "$tmp" "$task_file"
+    # 更新任务: 释放认领 + 标记 escalated（加文件锁，防止与 watchdog 竞态）
+    local lock_file="$TASKS_DIR/processing/${task_id}.op.lock"
+    (
+        flock -x 200
+        local tmp="$task_file.tmp"
+        if ! jq --arg reason "$reason" \
+           --arg by "$my_instance" \
+           --arg at "$now_ts" \
+           '
+           .claimed_by = null
+           | .claimed_at = null
+           | .escalated = {
+               status: "pending",
+               reason: $reason,
+               escalated_by: $by,
+               escalated_at: $at
+             }
+           | .flow_log = ((.flow_log // []) + [{
+               ts: $at, action: "escalated",
+               from_status: "processing", to_status: "processing",
+               actor: $by, detail: $reason
+             }])
+           ' "$task_file" > "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+            exit 1
+        fi
+        mv "$tmp" "$task_file"
+    ) 200>"$lock_file" || die "escalate-task: 更新任务文件失败: $task_id"
 
     emit_event "task.escalated" "$my_instance" "task_id=$task_id" "reason=$reason"
 
@@ -1149,7 +1780,7 @@ cmd_escalate_task() {
     local escalate_msg="[任务上报] $my_instance 上报任务 $task_id 需要拆分。原因: $reason。"
     escalate_msg+=$'\n'"请使用 split-task 拆分此任务: swarm-msg.sh split-task $task_id --subtask \"子任务1\" --assign 角色 [...]"
     escalate_msg+=$'\n'"（如需同层替换而非嵌套拆分，可用 expand-subtask）"
-    _unified_notify "supervisor" "$escalate_msg" "task.escalated" "high"
+    _notify_all_supervisors "$escalate_msg" "task.escalated" "high"
 
     info "任务已上报: $task_id → supervisor"
 
@@ -1346,7 +1977,12 @@ cmd_split_task() {
                 parent_task: $parent_task,
                 subtasks: [],
                 split_status: null,
-                depth: $depth
+                depth: $depth,
+                flow_log: [{
+                    ts: $created_at, action: "published",
+                    from_status: "-", to_status: $status,
+                    actor: $from, detail: ("子任务: " + $title)
+                }]
             }' > "$TASKS_DIR/$target_dir/$sub_id.json"
 
         created_files+=("$sub_id")
@@ -1364,14 +2000,26 @@ cmd_split_task() {
         fi
     done
 
-    # 更新父任务: subtasks = 保留的旧子任务 + 新子任务, split_status="split"
+    # 更新父任务: subtasks = 保留的旧子任务 + 新子任务, split_status="split"（加文件锁）
     local all_subtask_ids=("${existing_ids[@]}" "${subtask_ids[@]}")
     local subtasks_json
     subtasks_json=$(printf '%s\n' "${all_subtask_ids[@]}" | jq -R '.' | jq -s '.')
-    local ptmp="$parent_file.tmp"
-    jq --argjson subtasks "$subtasks_json" \
-        '.subtasks = $subtasks | .split_status = "split" | .escalated = null' \
-        "$parent_file" > "$ptmp" && mv "$ptmp" "$parent_file"
+    local split_ts
+    split_ts=$(get_timestamp)
+    local split_lock="$TASKS_DIR/processing/${parent_id}.op.lock"
+    (
+        flock -x 200
+        local ptmp="$parent_file.tmp"
+        jq --argjson subtasks "$subtasks_json" \
+            --arg at "$split_ts" --arg actor "${SWARM_INSTANCE:-${SWARM_ROLE:-system}}" \
+            '.subtasks = $subtasks | .split_status = "split" | .escalated = null
+             | .flow_log = ((.flow_log // []) + [{
+                 ts: $at, action: "split",
+                 from_status: "processing", to_status: "processing",
+                 actor: $actor, detail: ("拆分为 " + ($subtasks | length | tostring) + " 个子任务")
+               }])' \
+            "$parent_file" > "$ptmp" && mv "$ptmp" "$parent_file"
+    ) 200>"$split_lock" || die "split-task: 更新父任务文件失败: $parent_id"
 
     # 发射事件
     emit_event "task.split" "" "parent_id=$parent_id" "subtask_count=$subtask_count" \
@@ -1693,7 +2341,12 @@ cmd_expand_subtask() {
                 parent_task: $parent_task,
                 subtasks: [],
                 split_status: null,
-                depth: $depth
+                depth: $depth,
+                flow_log: [{
+                    ts: $created_at, action: "published",
+                    from_status: "-", to_status: $status,
+                    actor: $from, detail: ("展开子任务: " + $title)
+                }]
             }' > "$TASKS_DIR/$target_dir/$sub_id.json"
 
         # 如果属于 group，追加到 group 的任务列表
@@ -1866,7 +2519,7 @@ cmd_group_status() {
 
         # 在各目录中查找任务
         local task_file="" task_status="unknown"
-        for d in completed processing pending blocked failed; do
+        for d in completed processing pending blocked paused failed; do
             if [[ -f "$TASKS_DIR/$d/$tid.json" ]]; then
                 task_file="$TASKS_DIR/$d/$tid.json"
                 task_status="$d"
@@ -1885,6 +2538,7 @@ cmd_group_status() {
             processing) icon=">>" ;;
             pending)    icon=".." ;;
             blocked)    icon="!!" ;;
+            paused)     icon="||" ;;
             failed)     icon="XX" ;;
             *)          icon="??" ;;
         esac
@@ -1945,13 +2599,64 @@ cmd_recover_tasks() {
             if ! mv "$f" "$TASKS_DIR/pending/$tid.json" 2>/dev/null; then
                 continue  # 被其他 recover-tasks 进程抢先处理了
             fi
+            rm -f "$TASKS_DIR/processing/${tid}.op.lock" "$TASKS_DIR/processing/${tid}.compose.lock" 2>/dev/null
+            local recover_ts
+            recover_ts=$(get_timestamp)
             local tmp_file="$TASKS_DIR/pending/$tid.json.tmp"
-            jq '.status = "pending" | .claimed_by = null | .claimed_at = null' \
+            jq --arg at "$recover_ts" --arg claimer "$claimed_by" \
+                '.status = "pending" | .claimed_by = null | .claimed_at = null
+                 | .flow_log = ((.flow_log // []) + [{
+                     ts: $at, action: "recovered",
+                     from_status: "processing", to_status: "pending",
+                     actor: "system", detail: ("原认领者离线: " + $claimer)
+                   }])' \
                 "$TASKS_DIR/pending/$tid.json" > "$tmp_file"
             mv "$tmp_file" "$TASKS_DIR/pending/$tid.json"
             recovered=$((recovered + 1))
             emit_event "task.recovered" "" "task_id=$tid" "original_claimer=$claimed_by"
             info "已恢复任务: $tid (原认领者 $claimed_by 已离线)"
+        fi
+    done
+
+    # 扫描 pending_review: inspector 离线时回退到 pending 重新走流程
+    for f in "$TASKS_DIR/pending_review/"*.json; do
+        [[ -f "$f" ]] || continue
+
+        local tid claimed_by
+        tid=$(jq -r '.id' "$f")
+        claimed_by=$(jq -r '.claimed_by // ""' "$f")
+
+        # 检查 inspector 是否在线
+        local inspector_online=false
+        local inspector_pane
+        inspector_pane=$(_resolve_pane_by_id "inspector")
+        if [[ -n "$inspector_pane" && "$inspector_pane" != "null" ]] \
+            && tmux display-message -t "${session_name}:${inspector_pane}" -p '#{pane_id}' &>/dev/null; then
+            inspector_online=true
+        fi
+
+        if [[ "$inspector_online" == false ]]; then
+            # inspector 离线 → pending_review → pending
+            mkdir -p "$TASKS_DIR/pending"
+            if ! mv "$f" "$TASKS_DIR/pending/$tid.json" 2>/dev/null; then
+                continue
+            fi
+            local recover_ts
+            recover_ts=$(get_timestamp)
+            local tmp_file="$TASKS_DIR/pending/$tid.json.tmp"
+            jq --arg at "$recover_ts" \
+                '.status = "pending" | .claimed_by = null | .claimed_at = null
+                 | .review_status = null | .review_requested_at = null
+                 | .flow_log = ((.flow_log // []) + [{
+                     ts: $at, action: "recovered",
+                     from_status: "pending_review", to_status: "pending",
+                     actor: "system", detail: "inspector 离线，回退重新走流程"
+                   }])' \
+                "$TASKS_DIR/pending/$tid.json" > "$tmp_file"
+            mv "$tmp_file" "$TASKS_DIR/pending/$tid.json"
+            recovered=$((recovered + 1))
+            emit_event "task.recovered" "" "task_id=$tid" "from_status=pending_review"
+            info "已恢复审批中任务: $tid (inspector 离线，回退 pending)"
         fi
     done
     shopt -u nullglob
@@ -2040,8 +2745,479 @@ cmd_set_limit() {
     # 通知蜂群内所有角色（通过事件）
     emit_event "config.max_cli_changed" "human" "new_limit=$new_limit" "current_count=$current_count"
 
-    # 通知 supervisor（如果存在）
-    _unified_notify "supervisor" \
+    # 通知所有 supervisor 实例（如果存在）
+    _notify_all_supervisors \
         "[系统通知] CLI 上限已更新为 $new_limit（当前 $current_count 个）。如需扩容可继续使用 swarm-join.sh。" \
         "config.changed"
+}
+
+# =============================================================================
+# 子命令: flow-log (查看任务流转审计记录)
+# =============================================================================
+
+cmd_flow_log() {
+    local task_id="$1"
+
+    # 在所有状态目录中查找任务文件
+    local task_file=""
+    for dir in pending processing completed failed blocked paused pending_review; do
+        [[ -f "$TASKS_DIR/$dir/$task_id.json" ]] && task_file="$TASKS_DIR/$dir/$task_id.json" && break
+    done
+    [[ -n "$task_file" ]] || die "任务不存在: $task_id"
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "任务流转记录: $task_id"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    jq -r '.flow_log // [] | if length == 0 then "  (无流转记录)" else .[] | "[\(.ts)] \(.action): \(.from_status) → \(.to_status) | \(.actor)\(if .detail != "" then " | " + .detail else "" end)" end' "$task_file"
+}
+
+# =============================================================================
+# 子命令: set-priority (动态修改任务优先级)
+# =============================================================================
+
+cmd_set_priority() {
+    local task_id="$1"
+    local new_priority="$2"
+
+    # 权限检查: 仅 supervisor 和 human 可修改优先级
+    local my_instance
+    my_instance=$(detect_my_instance)
+    local my_role
+    my_role=$(jq -r --arg inst "$my_instance" '.panes[] | select(.instance == $inst) | .role // ""' "$STATE_FILE" 2>/dev/null | head -1)
+    [[ -n "$my_role" ]] || my_role="$my_instance"
+    if [[ "$my_role" != "supervisor" && "$my_instance" != "human" ]]; then
+        die "权限不足: 只有 supervisor 或 human 可以修改任务优先级 (当前: $my_role)"
+    fi
+
+    # 参数校验
+    case "$new_priority" in
+        high|normal|low) ;;
+        *) die "无效优先级: $new_priority (可选: high/normal/low)" ;;
+    esac
+
+    # 只允许修改 pending 状态的任务
+    local task_file="$TASKS_DIR/pending/$task_id.json"
+    [[ -f "$task_file" ]] || die "任务不在 pending 状态或不存在: $task_id (只能修改待处理任务的优先级)"
+
+    # 读旧优先级
+    local old_priority
+    old_priority=$(jq -r '.priority // "normal"' "$task_file")
+    if [[ "$old_priority" == "$new_priority" ]]; then
+        info "任务 $task_id 的优先级已经是 $new_priority，无需修改"
+        return 0
+    fi
+
+    # 原子更新（my_instance 已在权限检查中获取）
+    local now_ts
+    now_ts=$(get_timestamp)
+
+    local tmp="$TASKS_DIR/pending/${task_id}.json.tmp"
+    if ! jq \
+        --arg new_pri "$new_priority" \
+        --arg old_pri "$old_priority" \
+        --arg now_ts "$now_ts" \
+        --arg actor "$my_instance" \
+        '
+        .priority = $new_pri
+        | .flow_log = ((.flow_log // []) + [{
+            ts: $now_ts, action: "priority_changed",
+            from_status: "pending", to_status: "pending",
+            actor: $actor, detail: ($old_pri + " → " + $new_pri)
+          }])
+        ' "$task_file" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "set-priority: jq 更新失败"
+    fi
+    mv "$tmp" "$task_file"
+
+    emit_event "task.priority_changed" "$my_instance" "task_id=$task_id" "old=$old_priority" "new=$new_priority"
+
+    # 通知策略: 提升到 high 时广播所有实例，其他仅通知发布者
+    local from_id
+    from_id=$(jq -r '.from // ""' "$task_file")
+    if [[ "$new_priority" == "high" ]]; then
+        # 广播通知所有实例
+        local instances
+        instances=$(jq -r '.panes[].instance' "$STATE_FILE" 2>/dev/null)
+        while IFS= read -r inst; do
+            [[ -n "$inst" ]] && _unified_notify "$inst" \
+                "[优先级提升] 任务 $task_id 优先级已提升为 high (原: $old_priority)" \
+                "task.priority_changed" "high"
+        done <<< "$instances"
+    else
+        # 仅通知发布者
+        [[ -n "$from_id" && "$from_id" != "null" ]] && _unified_notify "$from_id" \
+            "[优先级变更] 任务 $task_id: $old_priority → $new_priority" \
+            "task.priority_changed"
+    fi
+
+    info "任务 $task_id 优先级已更新: $old_priority → $new_priority"
+}
+
+# =============================================================================
+# 子命令: approve-task (人工审批通过)
+# =============================================================================
+
+cmd_approve_task() {
+    local task_id="$1"
+    local comment="${2:-}"
+
+    local my_instance
+    my_instance=$(detect_my_instance)
+    local my_role
+    my_role=$(jq -r --arg inst "$my_instance" '.panes[] | select(.instance == $inst) | .role' "$STATE_FILE" 2>/dev/null | head -1)
+    [[ -n "$my_role" ]] || my_role="$my_instance"
+
+    # 权限检查: 仅 inspector 角色可执行
+    if [[ "$my_role" != "inspector" && "$my_instance" != "human" ]]; then
+        die "权限不足: 只有 inspector 角色可以审批任务 (当前: $my_role)"
+    fi
+
+    # 查找任务文件 (pending_review 或 processing)
+    local task_file="" from_status=""
+    if [[ -f "$TASKS_DIR/pending_review/$task_id.json" ]]; then
+        task_file="$TASKS_DIR/pending_review/$task_id.json"
+        from_status="pending_review"
+    elif [[ -f "$TASKS_DIR/processing/$task_id.json" ]]; then
+        task_file="$TASKS_DIR/processing/$task_id.json"
+        from_status="processing"
+    else
+        die "任务不在 pending_review 或 processing 状态: $task_id"
+    fi
+
+    local now_ts
+    now_ts=$(get_timestamp)
+
+    # 移入 completed（绕过自动质量门）
+    mkdir -p "$TASKS_DIR/completed"
+    local tmp="${task_file}.tmp"
+    if ! jq \
+        --arg now_ts "$now_ts" \
+        --arg actor "$my_instance" \
+        --arg comment "$comment" \
+        --arg from_st "$from_status" \
+        '
+        .status = "completed"
+        | .completed_at = $now_ts
+        | .review_status = "approved"
+        | .reviewed_by = $actor
+        | .review_comment = $comment
+        | .flow_log = ((.flow_log // []) + [{
+            ts: $now_ts, action: "approved",
+            from_status: $from_st, to_status: "completed",
+            actor: $actor, detail: (if $comment != "" then $comment else "人工审批通过" end)
+          }])
+        ' "$task_file" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "approve-task: jq 更新失败"
+    fi
+    mv "$tmp" "$TASKS_DIR/completed/$task_id.json"
+    rm -f "$task_file"
+
+    emit_event "task.approved" "$my_instance" "task_id=$task_id"
+
+    # 通知工蜂和发布者
+    local claimed_by from_id task_title
+    claimed_by=$(jq -r '.claimed_by // ""' "$TASKS_DIR/completed/$task_id.json")
+    from_id=$(jq -r '.from // ""' "$TASKS_DIR/completed/$task_id.json")
+    task_title=$(jq -r '.title // ""' "$TASKS_DIR/completed/$task_id.json")
+
+    [[ -n "$claimed_by" && "$claimed_by" != "null" ]] && _unified_notify "$claimed_by" \
+        "[审批通过] 任务 $task_title ($task_id) 已被 $my_instance 审批通过${comment:+: $comment}" \
+        "task.approved" "high"
+    [[ -n "$from_id" && "$from_id" != "null" && "$from_id" != "$claimed_by" ]] && _unified_notify "$from_id" \
+        "[审批通过] 任务 $task_title ($task_id) 已通过人工审批" \
+        "task.approved"
+
+    info "任务 $task_id 已审批通过"
+
+    # 触发后续流程
+    _check_and_unblock "$task_id"
+    _check_subtask_completion "$task_id"
+    _check_group_completion "$task_id"
+
+    # 更新 Story
+    _story_update_task "$task_id" "completed" "人工审批通过${comment:+: $comment}"
+
+    # 通知原工蜂自动拉取下一个任务
+    if [[ -n "$claimed_by" && "$claimed_by" != "null" ]]; then
+        _auto_claim_next "$claimed_by"
+    fi
+}
+
+# =============================================================================
+# 子命令: reject-task (人工驳回)
+# =============================================================================
+
+cmd_reject_task() {
+    local task_id="$1"
+    local reason="${2:-人工驳回}"
+
+    local my_instance
+    my_instance=$(detect_my_instance)
+    local my_role
+    my_role=$(jq -r --arg inst "$my_instance" '.panes[] | select(.instance == $inst) | .role' "$STATE_FILE" 2>/dev/null | head -1)
+    [[ -n "$my_role" ]] || my_role="$my_instance"
+
+    # 权限检查: 仅 inspector 角色可执行
+    if [[ "$my_role" != "inspector" && "$my_instance" != "human" ]]; then
+        die "权限不足: 只有 inspector 角色可以驳回任务 (当前: $my_role)"
+    fi
+
+    # 查找任务文件
+    local task_file="" from_status=""
+    if [[ -f "$TASKS_DIR/pending_review/$task_id.json" ]]; then
+        task_file="$TASKS_DIR/pending_review/$task_id.json"
+        from_status="pending_review"
+    elif [[ -f "$TASKS_DIR/processing/$task_id.json" ]]; then
+        task_file="$TASKS_DIR/processing/$task_id.json"
+        from_status="processing"
+    else
+        die "任务不在 pending_review 或 processing 状态: $task_id"
+    fi
+
+    local now_ts
+    now_ts=$(get_timestamp)
+
+    # 移入 failed
+    mkdir -p "$TASKS_DIR/failed"
+    local tmp="${task_file}.tmp"
+    if ! jq \
+        --arg now_ts "$now_ts" \
+        --arg actor "$my_instance" \
+        --arg reason "$reason" \
+        --arg from_st "$from_status" \
+        '
+        .status = "failed"
+        | .failed_at = $now_ts
+        | .fail_reason = $reason
+        | .review_status = "rejected"
+        | .reviewed_by = $actor
+        | .flow_log = ((.flow_log // []) + [{
+            ts: $now_ts, action: "rejected",
+            from_status: $from_st, to_status: "failed",
+            actor: $actor, detail: $reason
+          }])
+        ' "$task_file" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "reject-task: jq 更新失败"
+    fi
+    mv "$tmp" "$TASKS_DIR/failed/$task_id.json"
+    rm -f "$task_file"
+
+    emit_event "task.rejected" "$my_instance" "task_id=$task_id"
+
+    # 通知工蜂
+    local claimed_by task_title
+    claimed_by=$(jq -r '.claimed_by // ""' "$TASKS_DIR/failed/$task_id.json")
+    task_title=$(jq -r '.title // ""' "$TASKS_DIR/failed/$task_id.json")
+
+    if [[ -n "$claimed_by" && "$claimed_by" != "null" ]]; then
+        _unified_notify "$claimed_by" \
+            "[审批驳回] 任务 $task_title ($task_id) 被驳回: $reason"$'\n'"修复后请 supervisor 重新发布任务，或由 inspector 使用 approve-task 通过。" \
+            "task.rejected" "high"
+    fi
+
+    info "任务 $task_id 已驳回: $reason"
+
+    # 更新 Story
+    _story_update_task "$task_id" "failed" "人工驳回: $reason"
+
+    # 级联失败阻塞的任务
+    _cascade_fail_blocked "$task_id"
+}
+
+# =============================================================================
+# 子命令: request-supervisor (请求扩展 supervisor)
+# =============================================================================
+
+# 生成 supervisor 上下文摘要（供新 supervisor 初始化使用）
+_generate_supervisor_context_summary() {
+    local summary="你是新加入的 supervisor，以下是当前蜂群状态摘要:\n\n"
+
+    # 团队成员
+    summary+="## 当前团队\n"
+    summary+="$(jq -r '.panes[] | "- \(.instance // .role) (\(.role), \(.cli))"' "$STATE_FILE" 2>/dev/null)\n\n"
+
+    # 任务队列概况
+    local pending_count=0 processing_count=0 blocked_count=0
+    [[ -d "$TASKS_DIR/pending" ]] && pending_count=$(find "$TASKS_DIR/pending" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+    [[ -d "$TASKS_DIR/processing" ]] && processing_count=$(find "$TASKS_DIR/processing" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+    [[ -d "$TASKS_DIR/blocked" ]] && blocked_count=$(find "$TASKS_DIR/blocked" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+
+    summary+="## 任务队列\n"
+    summary+="- Pending: $pending_count | Processing: $processing_count | Blocked: $blocked_count\n\n"
+
+    # 待认领任务列表（前 10 个，subshell 隔离 shopt）
+    summary+="## 待认领任务\n"
+    local task_lines
+    task_lines=$(
+        [[ -d "$TASKS_DIR/pending" ]] || exit 0
+        shopt -s nullglob
+        local c=0
+        for f in "$TASKS_DIR/pending/"*.json; do
+            [[ -f "$f" ]] || continue
+            if [[ $c -ge 10 ]]; then
+                printf '%s\n' "- ... (更多任务请用 list-tasks 查看)"
+                break
+            fi
+            local tid ttype ttitle tassign
+            tid=$(jq -r '.id' "$f" 2>/dev/null)
+            ttype=$(jq -r '.type' "$f" 2>/dev/null)
+            ttitle=$(jq -r '.title' "$f" 2>/dev/null)
+            tassign=$(jq -r '.assigned_to // "all"' "$f" 2>/dev/null)
+            printf '%s\n' "- [$tid] $ttype: $ttitle (指派: $tassign)"
+            ((c++)) || true
+        done
+    )
+    if [[ -n "$task_lines" ]]; then
+        summary+="$task_lines\n"
+    else
+        summary+="- (无待认领任务)\n"
+    fi
+
+    summary+="\n## 行动指南\n"
+    summary+="1. swarm-msg.sh list-roles — 了解完整团队\n"
+    summary+="2. swarm-msg.sh list-tasks --all — 了解任务全貌\n"
+    summary+="3. swarm-msg.sh read — 查看消息\n"
+    summary+="4. 认领 pending 中的编排任务: swarm-msg.sh claim <task-id>\n"
+
+    printf '%b' "$summary"
+}
+
+cmd_request_supervisor() {
+    local reason="${1:-任务负载过高}"
+
+    # === 权限检查: 仅 supervisor 或 human 可调用 ===
+    local my_instance
+    my_instance=$(detect_my_instance)
+    local my_role
+    my_role=$(jq -r --arg inst "$my_instance" \
+        '.panes[] | select(.instance == $inst) | .role // ""' \
+        "$STATE_FILE" 2>/dev/null | head -1)
+    [[ -n "$my_role" ]] || my_role="$my_instance"
+    if [[ "$my_role" != "supervisor" && "$my_instance" != "human" ]]; then
+        die "权限不足: 只有 supervisor 或 human 可以请求扩展 supervisor (当前: $my_role)"
+    fi
+
+    # === 检查 1: supervisor 数量上限 ===
+    local current_sup_count
+    current_sup_count=$(jq '[.panes[] | select(.role == "supervisor")] | length' "$STATE_FILE" 2>/dev/null)
+    local max_sup="${SUPERVISOR_MAX_COUNT:-5}"
+    if [[ "$current_sup_count" -ge "$max_sup" ]]; then
+        info "supervisor 数量已达上限 ($current_sup_count/$max_sup)，拒绝扩展"
+        echo "REJECTED: supervisor 数量已达上限 ($current_sup_count/$max_sup)"
+        return 1
+    fi
+
+    # === 检查 2: CLI 总数上限 ===
+    local max_cli current_cli_count
+    max_cli=$(jq -r '.max_cli // 0' "$STATE_FILE" 2>/dev/null)
+    if [[ "$max_cli" -gt 0 ]]; then
+        current_cli_count=$(jq '.panes | length' "$STATE_FILE" 2>/dev/null)
+        if [[ "$current_cli_count" -ge "$max_cli" ]]; then
+            _unified_notify "human" \
+                "[扩展受限] supervisor $my_instance 请求扩展，但 CLI 数量已达上限 ($current_cli_count/$max_cli)。原因: $reason。调整上限: swarm-msg.sh set-limit <新值>" \
+                "supervisor.scale_blocked" "high"
+            info "CLI 数量已达上限 ($current_cli_count/$max_cli)，拒绝扩展"
+            echo "REJECTED: CLI 数量已达上限 ($current_cli_count/$max_cli)"
+            return 1
+        fi
+    fi
+
+    # === 检查 3 + 执行: flock 保护冷却检查与扩展操作的原子性 ===
+    local cooldown_file="$RUNTIME_DIR/.supervisor-scale-cooldown"
+    local lock_file="${cooldown_file}.lock"
+    local cooldown="${SUPERVISOR_SCALE_COOLDOWN:-300}"
+
+    local _scale_result
+    _scale_result=$(
+        (
+            flock -x -w 10 200 || { echo "LOCK_FAILED"; exit 1; }
+
+            # 冷却检查
+            if [[ -f "$cooldown_file" ]]; then
+                local last_scale_epoch
+                last_scale_epoch=$(cat "$cooldown_file" 2>/dev/null || echo "0")
+                local now_epoch
+                now_epoch=$(date +%s)
+                local elapsed=$(( now_epoch - last_scale_epoch ))
+                if [[ $elapsed -lt $cooldown ]]; then
+                    local remaining=$(( cooldown - elapsed ))
+                    echo "COOLDOWN:${remaining}"
+                    exit 0
+                fi
+            fi
+
+            # 二次确认 supervisor 数量（防止并发通过前面的检查后数量已变）
+            local recheck_count
+            recheck_count=$(jq '[.panes[] | select(.role == "supervisor")] | length' "$STATE_FILE" 2>/dev/null)
+            if [[ "$recheck_count" -ge "$max_sup" ]]; then
+                echo "REJECTED_RECHECK:${recheck_count}"
+                exit 0
+            fi
+
+            # 记录冷却时间戳（在锁内写入，保证原子性）
+            date +%s > "$cooldown_file"
+            echo "PROCEED"
+        ) 200>"$lock_file"
+    )
+
+    case "$_scale_result" in
+        LOCK_FAILED)
+            warn "获取扩展锁超时"
+            echo "FAILED: 获取扩展锁超时"
+            return 1
+            ;;
+        COOLDOWN:*)
+            local remaining="${_scale_result#COOLDOWN:}"
+            info "冷却中: 剩余 ${remaining}s (冷却 ${cooldown}s)"
+            echo "COOLDOWN: 冷却中，剩余 ${remaining}s"
+            return 1
+            ;;
+        REJECTED_RECHECK:*)
+            local recheck_count="${_scale_result#REJECTED_RECHECK:}"
+            info "并发检查: supervisor 数量已达上限 ($recheck_count/$max_sup)"
+            echo "REJECTED: supervisor 数量已达上限 ($recheck_count/$max_sup)"
+            return 1
+            ;;
+    esac
+
+    # === 所有检查通过，执行扩展 ===
+    log_info "[request-supervisor] 开始扩展 (当前 $current_sup_count/$max_sup, 请求者: $my_instance, 原因: $reason)"
+
+    # 生成上下文摘要写入临时文件（避免超长命令行参数）
+    local context_tmp
+    context_tmp=$(mktemp "${RUNTIME_DIR}/sup-context-XXXXXX.txt")
+    _generate_supervisor_context_summary > "$context_tmp"
+
+    # 调用 swarm-join.sh（读取临时文件内容作为 --task）
+    local join_output
+    if join_output=$("$SCRIPTS_DIR/swarm-join.sh" supervisor \
+        --cli "claude chat" \
+        --config "management/supervisor.md" \
+        --task "$(cat "$context_tmp")" \
+        2>&1); then
+
+        rm -f "$context_tmp"
+
+        emit_event "supervisor.scaled" "$my_instance" \
+            "reason=$reason" \
+            "new_count=$((current_sup_count + 1))" \
+            "max=$max_sup"
+
+        _unified_notify "human" \
+            "[Supervisor 扩展] $my_instance 触发扩展 (${current_sup_count}→$((current_sup_count+1))/$max_sup)。原因: $reason" \
+            "supervisor.scaled"
+
+        info "supervisor 扩展成功 (${current_sup_count}→$((current_sup_count+1))/$max_sup)"
+        echo "OK: supervisor 扩展成功 (${current_sup_count}→$((current_sup_count+1))/$max_sup)"
+    else
+        rm -f "$context_tmp"
+        # 扩展失败，清除冷却（允许重试）
+        rm -f "$cooldown_file"
+        warn "supervisor 扩展失败: $join_output"
+        echo "FAILED: $join_output"
+        return 1
+    fi
 }

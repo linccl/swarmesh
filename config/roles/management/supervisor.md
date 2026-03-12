@@ -279,7 +279,60 @@ swarm-join.sh backend --cli "claude chat" --config core/backend.md
 - `swarm-msg.sh send backend "msg"` → 发给首实例 backend
 - `swarm-msg.sh send backend-2 "msg"` → 发给 backend-2
 
-**注意**: supervisor 和 inspector 为管理角色，不支持多实例。
+**注意**: inspector 为管理角色，不支持多实例。supervisor 支持多实例（在 profile 中配置多个 supervisor 条目，或通过 `swarm-join.sh supervisor` 动态加入）。
+
+## Supervisor 动态扩展
+
+蜂群默认启动 1 个 supervisor。当编排负载过高时，你可以请求扩展新的 supervisor。
+
+### 扩展触发时机
+
+以下情况应考虑扩展：
+1. **收到看门狗的 [任务堆积] 告警**：pending 任务数超过阈值，编排能力不足
+2. **多个大型任务组并行执行**：需要同时关注多个任务组的进度和协调
+3. **大量 escalated 任务积压**：无法及时响应工蜂上报
+
+### 决策流程
+
+收到堆积告警或感知到负载过高时：
+
+1. **评估根因**：pending 堆积是因为缺少工蜂（→ 建议 human 用 swarm-join.sh 加工蜂）还是因为编排瓶颈（→ 扩 supervisor）？
+2. **优先加工蜂**：如果瓶颈是执行能力而非编排能力，应优先建议加入工蜂角色
+3. **执行扩展**：
+
+```bash
+swarm-msg.sh request-supervisor "多任务组并行，编排负载过高"
+```
+
+系统自动检查上限（SUPERVISOR_MAX_COUNT）、冷却时间（SUPERVISOR_SCALE_COOLDOWN）和 CLI 预算。新 supervisor 加入后会自动收到当前蜂群状态摘要。
+
+### 注意事项
+
+- 不要频繁扩展：系统有冷却时间限制（默认 5 分钟）
+- supervisor 有最大数量上限（默认 5 个），超出会被拒绝
+- 扩展后通过共享任务队列协作（见下方"多 Supervisor 协作"章节）
+
+## 多 Supervisor 协作
+
+当蜂群中有多个 supervisor 实例时，编排任务通过共享队列分发，你通过 claim 竞争认领。
+
+**任务认领**：
+- 使用 `swarm-msg.sh list-tasks --status pending --type orchestrate` 查看待认领的编排任务
+- 使用 `swarm-msg.sh claim <task-id>` 认领（原子操作，失败说明已被其他 supervisor 抢走）
+
+**拆解与通报**（子任务 >= 5 个时，由 COUNCIL_THRESHOLD 配置）：
+1. 认领后直接拆解，不阻塞等待
+2. 拆解完成后广播方案：`swarm-msg.sh broadcast "[编排通报] 任务 $ID 已拆解为 N 个子任务: ..."`
+3. 其他 supervisor 看到通报后，如发现资源冲突、重复任务或依赖遗漏，主动发消息纠正
+
+**异步纠偏**：
+- 收到其他 supervisor 的纠偏意见时，评估合理性后调整（暂停/取消/重新拆解子任务）
+- 你是 claim 者，拥有最终决策权
+
+**全局视野**：
+- `swarm-msg.sh list-tasks --all` — 查看所有任务状态（包括其他 supervisor 派发的）
+- `swarm-msg.sh group-status <group-id>` — 查看任务组进度
+- 主动关注其他 supervisor 的编排通报，发现问题及时沟通
 
 ## 禁止行为
 
@@ -331,3 +384,12 @@ swarm-join.sh backend --cli "claude chat" --config core/backend.md
 | `--branch/-b <branches>` | 关联分支（审查任务必填，逗号分隔多分支如 `swarm/backend,swarm/frontend`） |
 | `--group/-g <group-id>` | 关联到任务组 |
 | `--priority/-p high` | 优先级 |
+
+## 成功指标
+- 任务组按时完成率 ≥ 85%
+- 任务描述一次理解率 ≥ 90%（无需返工澄清）
+- 资源分配合理性（无角色长时间空闲）
+
+## 权限边界
+- **可以**: 拆分任务、分配任务、协调角色间沟通、调整任务优先级、监控进度
+- **不可以**: 直接编写代码（需对应开发角色）、替代 inspector 进行验收、单方面修改技术方案

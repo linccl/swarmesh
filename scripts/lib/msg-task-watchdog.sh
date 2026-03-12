@@ -75,6 +75,11 @@ _watchdog_recover_task() {
             | .failed_at = $now_ts
             | .fail_reason = "watchdog: 重试耗尽"
             | .retry_history = ((.retry_history // []) + [$entry])
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "watchdog_exhausted",
+                from_status: "processing", to_status: "failed",
+                actor: "watchdog", detail: "重试耗尽"
+              }])
             ' "$task_file" > "$tmp" 2>/dev/null; then
             rm -f "$tmp"
             return 1
@@ -85,6 +90,7 @@ _watchdog_recover_task() {
             return 0
         fi
         rm -f "$task_file"
+        rm -f "$TASKS_DIR/processing/${tid}.op.lock" "$TASKS_DIR/processing/${tid}.compose.lock" 2>/dev/null
 
         emit_event "task.exhausted" "" "task_id=$tid" "retry_count=$new_count" "max_retries=$max_retries" "reason=watchdog:$reason"
 
@@ -121,6 +127,11 @@ _watchdog_recover_task() {
             | .failed_at = $now_ts
             | .retry_after = $retry_after
             | .retry_history = ((.retry_history // []) + [$entry])
+            | .flow_log = ((.flow_log // []) + [{
+                ts: $now_ts, action: "watchdog_retry",
+                from_status: "processing", to_status: "pending",
+                actor: "watchdog", detail: ("重试 " + ($new_count | tostring))
+              }])
             ' "$task_file" > "$tmp" 2>/dev/null; then
             rm -f "$tmp"
             return 1  # jq 失败，保留原文件不动
@@ -132,6 +143,7 @@ _watchdog_recover_task() {
             return 0  # 被其他进程抢先处理
         fi
         rm -f "$task_file"
+        rm -f "$TASKS_DIR/processing/${tid}.op.lock" "$TASKS_DIR/processing/${tid}.compose.lock" 2>/dev/null
 
         # 发射恢复事件（含 retry_count）
         emit_event "task.recovered.${reason}" "" "task_id=$tid" "original_claimer=$original_claimer" "retry_count=$new_count"
@@ -442,25 +454,155 @@ _watchdog_check_subtask_stall() {
         now=$(date +%s)
         if [[ $((now - esc_epoch)) -ge ${ESCALATE_STALL_TTL:-3600} ]]; then
             local hour_window=$(( now / 3600 ))
-            local notify_id="sys-escalate-stall-${hour_window}-${tid}"
-            mkdir -p "${MESSAGES_DIR}/inbox/supervisor"
-            [[ -f "${MESSAGES_DIR}/inbox/supervisor/${notify_id}.json" ]] && continue
-            jq -n \
-                --arg id "$notify_id" \
-                --arg from "watchdog" \
-                --arg to "supervisor" \
-                --arg content "[上报超时] 任务 $tid 已上报超过 ${ESCALATE_STALL_TTL:-3600}s 未被处理。请尽快使用 expand-subtask 展开或用 claim 重新认领。" \
-                --arg timestamp "$(get_timestamp)" \
-                --arg status "pending" \
-                --arg priority "high" \
-                --arg category "task.escalate_stall" \
-                '{id:$id, from:$from, to:$to, content:$content, timestamp:$timestamp, status:$status, reply_to:null, priority:$priority, category:$category}' \
-                > "${MESSAGES_DIR}/inbox/supervisor/${notify_id}.json"
+            local base_notify_id="sys-escalate-stall-${hour_window}-${tid}"
+            # 通知所有 supervisor 实例
+            while IFS='|' read -r _p _inst; do
+                [[ -z "$_inst" ]] && continue
+                local per_inst_id="${base_notify_id}-${_inst}"
+                mkdir -p "${MESSAGES_DIR}/inbox/${_inst}"
+                [[ -f "${MESSAGES_DIR}/inbox/${_inst}/${per_inst_id}.json" ]] && continue
+                jq -n \
+                    --arg id "$per_inst_id" \
+                    --arg from "watchdog" \
+                    --arg to "$_inst" \
+                    --arg content "[上报超时] 任务 $tid 已上报超过 ${ESCALATE_STALL_TTL:-3600}s 未被处理。请尽快使用 expand-subtask 展开或用 claim 重新认领。" \
+                    --arg timestamp "$(get_timestamp)" \
+                    --arg status "pending" \
+                    --arg priority "high" \
+                    --arg category "task.escalate_stall" \
+                    '{id:$id,from:$from,to:$to,content:$content,timestamp:$timestamp,status:$status,reply_to:null,priority:$priority,category:$category}' \
+                    > "${MESSAGES_DIR}/inbox/${_inst}/${per_inst_id}.json"
+            done < <(resolve_role_to_all_panes "supervisor")
             log_info "[watchdog] 上报超时: 任务 $tid (上报超过 ${ESCALATE_STALL_TTL:-3600}s)"
         fi
     done
 
     shopt -u nullglob
+}
+
+# =============================================================================
+# pending_review 超时检测
+# =============================================================================
+
+# 检查 pending_review/ 中任务是否超过 PENDING_REVIEW_TTL 未被审批
+# 超时后通知 human 介入
+_watchdog_check_pending_review() {
+    [[ -d "$TASKS_DIR/pending_review" ]] || return 0
+
+    shopt -s nullglob
+    for f in "$TASKS_DIR/pending_review/"*.json; do
+        [[ -f "$f" ]] || continue
+
+        local tid review_requested_at
+        tid=$(jq -r '.id' "$f" 2>/dev/null)
+        review_requested_at=$(jq -r '.review_requested_at // ""' "$f" 2>/dev/null)
+        [[ -n "$review_requested_at" && "$review_requested_at" != "null" ]] || continue
+
+        # 解析时间戳: 先尝试提取纯日期时间部分（去掉时区等后缀），再解析
+        local req_epoch=0
+        local clean_ts="${review_requested_at%% [A-Z]*}"  # "2025-01-01 12:00:00 CST" → "2025-01-01 12:00:00"
+        req_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$clean_ts" +%s 2>/dev/null \
+            || date -d "$review_requested_at" +%s 2>/dev/null || echo "0")
+        [[ "$req_epoch" -gt 0 ]] || continue
+
+        local now
+        now=$(date +%s)
+        if [[ $((now - req_epoch)) -ge ${PENDING_REVIEW_TTL:-1800} ]]; then
+            # 小时级去重
+            local hour_window=$(( now / 3600 ))
+            local notify_id="sys-review-timeout-${hour_window}-${tid}"
+            mkdir -p "${MESSAGES_DIR}/inbox/human"
+            [[ -f "${MESSAGES_DIR}/inbox/human/${notify_id}.json" ]] && continue
+
+            local task_title claimed_by
+            task_title=$(jq -r '.title // .id' "$f" 2>/dev/null)
+            claimed_by=$(jq -r '.claimed_by // "unknown"' "$f" 2>/dev/null)
+
+            jq -n \
+                --arg id "$notify_id" \
+                --arg from "watchdog" \
+                --arg to "human" \
+                --arg content "[审批超时] 任务 $tid ($task_title) 在 pending_review 状态超过 ${PENDING_REVIEW_TTL:-1800}s 未被审批。原工蜂: $claimed_by。请手动处理: swarm-msg.sh approve-task $tid 或 swarm-msg.sh reject-task $tid" \
+                --arg timestamp "$(get_timestamp)" \
+                --arg status "pending" \
+                --arg priority "high" \
+                --arg category "task.review_timeout" \
+                '{id:$id,from:$from,to:$to,content:$content,timestamp:$timestamp,status:$status,reply_to:null,priority:$priority,category:$category}' \
+                > "${MESSAGES_DIR}/inbox/human/${notify_id}.json"
+
+            # 也再次提醒 inspector
+            _unified_notify "inspector" \
+                "[审批超时] 任务 $tid ($task_title) 等待审批已超时。请尽快处理。" \
+                "task.review_timeout" "high"
+
+            log_info "[watchdog] 审批超时: 任务 $tid (等待超过 ${PENDING_REVIEW_TTL:-1800}s)"
+        fi
+    done
+    shopt -u nullglob
+}
+
+# =============================================================================
+# Pending 任务堆积检测
+# =============================================================================
+
+# 检测 pending/ 中是否有大量任务堆积，超阈值时通知 supervisor 评估
+# 看门狗只负责检测和通知，不做扩展决策
+_watchdog_check_pending_pileup() {
+    [[ -d "$TASKS_DIR/pending" ]] || return 0
+
+    local pending_count=0
+    local now_epoch
+    now_epoch=$(date +%s)
+
+    shopt -s nullglob
+    for f in "$TASKS_DIR/pending/"*.json; do
+        [[ -f "$f" ]] || continue
+        # 排除 retry_after 尚未到期的任务
+        local retry_after
+        retry_after=$(jq -r '.retry_after // ""' "$f" 2>/dev/null)
+        if [[ -n "$retry_after" && "$retry_after" != "null" ]]; then
+            local clean_ts="${retry_after%% [A-Z]*}"
+            local retry_epoch
+            retry_epoch=$(date -j -f "%Y-%m-%d %H:%M:%S" "$clean_ts" +%s 2>/dev/null \
+                || date -d "$retry_after" +%s 2>/dev/null || echo "0")
+            [[ "$retry_epoch" -gt "$now_epoch" ]] && continue
+        fi
+        ((pending_count++)) || true
+    done
+    shopt -u nullglob
+
+    # 未超阈值，直接返回
+    [[ $pending_count -ge ${PENDING_PILEUP_THRESHOLD:-5} ]] || return 0
+
+    # 固定间隔去重: 同一窗口内不重复通知（默认 30min，可配置 PENDING_PILEUP_NOTIFY_INTERVAL）
+    local notify_interval="${PENDING_PILEUP_NOTIFY_INTERVAL:-1800}"
+    local notify_window=$(( now_epoch / notify_interval ))
+    local notify_id="sys-pending-pileup-${notify_window}"
+
+    # 通知所有 supervisor 实例
+    local notified=false
+    while IFS='|' read -r _pane _inst _role; do
+        [[ -n "$_inst" ]] || continue
+        local per_inst_id="${notify_id}-${_inst}"
+        mkdir -p "${MESSAGES_DIR}/inbox/${_inst}"
+        [[ -f "${MESSAGES_DIR}/inbox/${_inst}/${per_inst_id}.json" ]] && continue
+
+        jq -n \
+            --arg id "$per_inst_id" \
+            --arg from "watchdog" \
+            --arg to "$_inst" \
+            --arg content "[任务堆积] 当前有 ${pending_count} 个 pending 任务未被认领（阈值: ${PENDING_PILEUP_THRESHOLD:-5}）。请评估是否需要: 1) 加入更多工蜂角色 2) 扩展 supervisor 编排能力 (swarm-msg.sh request-supervisor \"原因\")" \
+            --arg timestamp "$(get_timestamp)" \
+            --arg status "pending" \
+            --arg priority "high" \
+            --arg category "task.pending_pileup" \
+            '{id:$id,from:$from,to:$to,content:$content,timestamp:$timestamp,status:$status,reply_to:null,priority:$priority,category:$category}' \
+            > "${MESSAGES_DIR}/inbox/${_inst}/${per_inst_id}.json"
+        notified=true
+    done < <(resolve_role_to_all_panes "supervisor")
+
+    [[ "$notified" == "true" ]] && \
+        log_info "[watchdog] 任务堆积告警: ${pending_count} 个 pending 任务 (阈值: ${PENDING_PILEUP_THRESHOLD:-5})"
 }
 
 # =============================================================================
@@ -486,6 +628,12 @@ _watchdog_main_loop() {
 
         # 子任务停滞检测
         _watchdog_check_subtask_stall
+
+        # pending_review 审批超时检测
+        _watchdog_check_pending_review
+
+        # pending 任务堆积检测（通知 supervisor 评估）
+        _watchdog_check_pending_pileup
 
         # 日志轮转检查（按 LOG_ROTATE_INTERVAL 频率）
         local now
