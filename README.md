@@ -409,7 +409,7 @@ swarmesh/
 │   ├── defaults.conf        # Framework defaults (logging/gates/watchdog/tmux)
 │   ├── profiles/            # Team profile presets
 │   │   ├── minimal.json     # 3-role minimal team
-│   │   ├── codex-only.json  # 5-role Codex-only team
+│   │   ├── codex-only.json  # 9-role Codex-only core team
 │   │   ├── web-dev.json     # 6-role web dev team
 │   │   └── full-stack.json  # 14-role full team
 │   ├── roles/               # Role system prompts
@@ -472,7 +472,7 @@ Supports mixing different AI CLIs — frontend uses Gemini, backend uses Claude,
 
 ## 本仓库变更点（linccl 版本）
 
-- 新增 `codex-only` profile：提供 `config/profiles/codex-only.json`，仅使用 Codex CLI 的最小团队配置（含 supervisor/inspector），适合“本机只装 Codex/统一 CLI 行为”的场景
+- 新增 `codex-only` profile：提供 `config/profiles/codex-only.json`，仅使用 Codex CLI 的 9 角色核心团队配置，适合“本机只装 Codex/统一 CLI 行为”的场景；默认以 `codex -a never -s danger-full-access chat` 启动
 - 默认等待时间调整：将 `swarm-cli.sh task` 与 `swarm-msg.sh wait` 的默认等待超时统一为 `6000s`，减少长任务被误判超时的情况
 - macOS 兼容性增强：修正 BSD `mktemp` 模板用法，并在缺少 `flock`/`timeout` 时提供 polyfill（优先使用 `gtimeout`），保证状态文件更新与等待逻辑可用
 - 扫描日志时间戳统一：`swarm-scan.sh` 支持读取 `config/defaults.conf` 的时间戳格式（`LOG_TIMESTAMP_FORMAT`），便于统一日志展示
@@ -875,7 +875,7 @@ swarmesh/
 ├── config/
 │   ├── defaults.conf        # 框架默认配置（日志/质量门/看门狗/tmux 等）
 │   │   ├── minimal.json     # 3 角色最小团队
-│   │   ├── codex-only.json  # 5 角色 Codex 专用团队
+│   │   ├── codex-only.json  # 9 角色 Codex 核心团队
 │   │   ├── web-dev.json     # 6 角色 Web 开发团队
 │   │   └── full-stack.json  # 14 角色完整团队
 │   ├── roles/               # 角色 system prompt
@@ -908,7 +908,7 @@ swarmesh/
 | Profile | 角色数 | 适用场景 |
 |---------|--------|---------|
 | `minimal` | 3 | 快速验证、小功能开发 |
-| `codex-only` | 5 | 仅使用 Codex CLI 的最小团队（含 supervisor/inspector） |
+| `codex-only` | 9 | 仅使用 Codex CLI 的核心团队 |
 | `web-dev` | 6 | Web 应用开发 |
 | `full-stack` | 14 | 大型项目、企业级开发 |
 

@@ -655,10 +655,33 @@ _pane_locked_paste_enter() {
     )
 }
 
+# Codex 首次进入新 worktree 时会先询问是否信任目录。
+# 如果此时直接 paste 初始化提示词，会把整段提示词打进确认界面，导致 Codex 退出。
+_accept_codex_trust_prompt_if_needed() {
+    local pane_target="$1"
+    local pane_ref="${SESSION_NAME}:${pane_target}"
+    local attempt pane_text
+
+    for attempt in 1 2 3 4 5; do
+        pane_text=$(tmux capture-pane -t "$pane_ref" -p -S -80 2>/dev/null || true)
+
+        if [[ "$pane_text" == *"Do you trust the contents of this directory?"* ]] \
+            || [[ "$pane_text" == *"Press enter to continue"* ]]; then
+            tmux send-keys -t "$pane_ref" Enter
+            sleep 1
+            continue
+        fi
+
+        break
+    done
+}
+
 # 通过 tmux paste-buffer 发送初始化消息到 pane
 send_init_to_pane() {
     local pane_target="$1"
     local init_msg="$2"
+
+    _accept_codex_trust_prompt_if_needed "$pane_target"
 
     local init_tmp
     init_tmp=$(mktemp "${RUNTIME_DIR}/.init-XXXXXX")
