@@ -1,6 +1,6 @@
 {
   "name": "Codex Only 核心团队",
-  "description": "仅使用 Codex CLI 的核心团队配置",
+  "description": "仅使用 Codex CLI 的 5 角色精简团队配置",
   "version": "1.0.0",
   "created": "2026-02-27",
   "roles": [
@@ -21,50 +21,18 @@
       "description": "后端开发专家（用 Codex 执行）"
     },
     {
-      "name": "database",
-      "cli": "codex -a never -s danger-full-access chat",
-      "config": "core/database.md",
-      "alias": "db,database,2",
-      "title": "🗄️ 数据库专家",
-      "description": "数据库设计和优化专家（用 Codex 执行）"
-    },
-    {
-      "name": "devops",
-      "cli": "codex -a never -s danger-full-access chat",
-      "config": "core/devops.md",
-      "alias": "ops,devops,3",
-      "title": "🚀 DevOps专家",
-      "description": "CI/CD 和自动化专家（用 Codex 执行）"
-    },
-    {
       "name": "reviewer",
       "cli": "codex -a never -s danger-full-access chat",
       "config": "quality/reviewer.md",
-      "alias": "review,rv,reviewer,4",
+      "alias": "review,rv,reviewer,2",
       "title": "🔍 代码审查员",
       "description": "代码质量审查专家（用 Codex 执行）"
-    },
-    {
-      "name": "architect",
-      "cli": "codex -a never -s danger-full-access chat",
-      "config": "management/architect.md",
-      "alias": "arch,architect,5",
-      "title": "🏗️ 系统架构师",
-      "description": "架构设计和技术选型专家（用 Codex 执行）"
-    },
-    {
-      "name": "prd",
-      "cli": "codex -a never -s danger-full-access chat",
-      "config": "management/prd.md",
-      "alias": "pm,prd,product,6",
-      "title": "📝 产品经理",
-      "description": "需求分析和 PRD 编写专家（用 Codex 执行）"
     },
     {
       "name": "supervisor",
       "cli": "codex -a never -s danger-full-access chat",
       "config": "management/supervisor.md",
-      "alias": "sup,supervisor,7",
+      "alias": "sup,supervisor,3",
       "title": "🧭 编排者",
       "description": "蜂群编排者，负责任务拆解、角色调度和进度监控（用 Codex 执行）"
     },
@@ -72,7 +40,7 @@
       "name": "inspector",
       "cli": "codex -a never -s danger-full-access chat",
       "config": "management/inspector.md",
-      "alias": "insp,inspector,8",
+      "alias": "insp,inspector,4",
       "title": "✅ 督查员",
       "description": "任务验收和产出质量把关专家（用 Codex 执行）"
     }
@@ -89,6 +57,6 @@
     "author": "tmux-swarm-dev",
     "purpose": "codex-only",
     "use_cases": ["本机只装了 codex", "统一 CLI 行为", "日常开发协作"],
-    "limitations": ["tester/security/performance/ui-designer/auditor 默认不启用，需要时可用 join 加入"]
+    "limitations": ["database/devops/prd/architect/tester/security/performance/ui-designer/auditor 默认不启用，需要时可用 join 加入"]
   }
 }
