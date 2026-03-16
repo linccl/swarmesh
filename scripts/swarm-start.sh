@@ -27,6 +27,7 @@ PROFILES_DIR="${PROFILES_DIR:-$CONFIG_DIR/profiles}"
 
 # CLI 启动等待时间（秒）
 CLI_STARTUP_WAIT="${CLI_STARTUP_WAIT:-3}"
+SWARM_ENABLE_SETTLED_SEND="${SWARM_ENABLE_SETTLED_SEND:-true}"
 
 # =============================================================================
 # 参数解析
@@ -85,6 +86,12 @@ EOF
             ;;
     esac
 done
+
+if _is_truthy "$SWARM_ENABLE_SETTLED_SEND"; then
+    SETTLED_SEND_FEATURE_JSON=true
+else
+    SETTLED_SEND_FEATURE_JSON=false
+fi
 
 # =============================================================================
 # 会话恢复
@@ -263,7 +270,7 @@ resume_swarm() {
         local BRANCH="${R_BRANCHES[$i]}"
 
         # 兜底：branch 字段不存在（旧版本 state.json）
-        [[ -n "$BRANCH" && "$BRANCH" != "null" ]] || BRANCH="swarm/$INSTANCE"
+        [[ -n "$BRANCH" && "$BRANCH" != "null" ]] || BRANCH=$(swarm_role_branch_name "$r_project" "$INSTANCE")
 
         local WINDOW_IDX=$((i / r_panes_per_window))
         local PANE_IN_WINDOW=$((i % r_panes_per_window))
@@ -324,7 +331,7 @@ resume_swarm() {
             INIT_MSG=$(build_resume_init_message "$CONFIG_FILE" "$BRANCH" "$TEAM_INFO" "$RESUME_FILE")
 
             # --- 9e. 发送初始化消息 ---
-            send_init_to_pane "$PANE_TARGET" "$INIT_MSG"
+            send_init_to_pane "$PANE_TARGET" "$INIT_MSG" "$CLI"
         fi
 
         # --- 9f. 启动日志管道 ---
@@ -381,6 +388,7 @@ resume_swarm() {
         --argjson window_count "$WINDOW_COUNT" \
         --argjson max_cli "$r_max_cli" \
         --argjson watchdog_pid "$WATCHDOG_PID" \
+        --argjson settled_send "$SETTLED_SEND_FEATURE_JSON" \
         --argjson panes "$PANES_JSON" \
         '{
             session: $session,
@@ -394,6 +402,9 @@ resume_swarm() {
             window_count: $window_count,
             max_cli: $max_cli,
             watchdog_pid: $watchdog_pid,
+            features: {
+                codex_settled_submit: $settled_send
+            },
             panes: $panes
         }' > "$STATE_FILE"
 
@@ -677,7 +688,7 @@ for ((i=0; i<ROLES_COUNT; i++)); do
     INSTANCE="$ROLE"
 
     # 创建角色的 git worktree（独立工作目录 + 独立分支）
-    ROLE_BRANCH="swarm/$INSTANCE"
+    ROLE_BRANCH=$(swarm_role_branch_name "$PROJECT_DIR" "$INSTANCE")
     ROLE_WORKTREE="$WORKTREE_DIR/$INSTANCE"
     mkdir -p "$WORKTREE_DIR"
     if git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/heads/$ROLE_BRANCH" 2>/dev/null; then
@@ -719,7 +730,10 @@ for ((i=0; i<ROLES_COUNT; i++)); do
 
         INIT_TMP=$(mktemp "${RUNTIME_DIR}/.init-XXXXXX")
         printf '%s' "$INIT_MSG" > "$INIT_TMP"
-        _pane_locked_paste_enter "$PANE_TARGET" "$INIT_TMP"
+        if ! _pane_locked_paste_enter "$PANE_TARGET" "$INIT_TMP" "$CLI"; then
+            rm -f "$INIT_TMP"
+            die "初始化消息发送失败: instance=$INSTANCE pane=$PANE_TARGET"
+        fi
         rm -f "$INIT_TMP"
         sleep 1
     fi
@@ -781,6 +795,7 @@ STATE_JSON=$(jq -n \
     --argjson window_count "$WINDOW_COUNT" \
     --argjson max_cli "$MAX_CLI" \
     --argjson watchdog_pid "$WATCHDOG_PID" \
+    --argjson settled_send "$SETTLED_SEND_FEATURE_JSON" \
     --argjson panes "$PANES_JSON" \
     '{
         session: $session,
@@ -793,6 +808,9 @@ STATE_JSON=$(jq -n \
         window_count: $window_count,
         max_cli: $max_cli,
         watchdog_pid: $watchdog_pid,
+        features: {
+            codex_settled_submit: $settled_send
+        },
         panes: $panes
     }')
 

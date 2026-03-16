@@ -161,6 +161,13 @@ log_error()   { echo -e "${_C_RED}[$(get_timestamp)] [ERROR]${_C_RESET} $*" >&2;
 log_success() { echo -e "${_C_GREEN}[$(get_timestamp)] [SUCCESS]${_C_RESET} $*" >&2; }
 die()         { log_error "$*"; exit 1; }
 
+_is_truthy() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 get_timestamp() {
     date "+$LOG_TIMESTAMP_FORMAT"
 }
@@ -216,6 +223,29 @@ check_dependencies() {
     if [[ ${#missing[@]} -gt 0 ]]; then
         die "缺少必要的命令: ${missing[*]}（请通过系统包管理器安装）"
     fi
+}
+
+_sanitize_branch_component() {
+    local value="${1:-}"
+    value=$(printf '%s' "$value" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//; s/-{2,}/-/g')
+    [[ -n "$value" ]] || value="default"
+    printf '%s' "$value"
+}
+
+swarm_role_branch_name() {
+    local project_dir="$1"
+    local instance="$2"
+    local resolved_project project_slug project_hash instance_slug
+
+    resolved_project=$(cd "$project_dir" 2>/dev/null && pwd -P) || resolved_project="$project_dir"
+    project_slug=$(_sanitize_branch_component "$(basename "$resolved_project")")
+    project_hash=$(printf '%s' "$resolved_project" | cksum | awk '{print $1}')
+    project_hash="${project_hash:0:8}"
+    instance_slug=$(_sanitize_branch_component "$instance")
+
+    printf 'swarm/%s-%s/%s' "$project_slug" "$project_hash" "$instance_slug"
 }
 
 # 确保项目目录是 git 仓库（git worktree 依赖）
@@ -577,7 +607,7 @@ save_all_resume_summaries() {
     while IFS='|' read -r inst branch; do
         [[ -n "$inst" ]] || continue
         # 兜底：state.json 无 branch 字段（旧版本）
-        [[ -n "$branch" && "$branch" != "null" ]] || branch="swarm/$inst"
+        [[ -n "$branch" && "$branch" != "null" ]] || branch=$(swarm_role_branch_name "$project_dir" "$inst")
         generate_instance_resume_summary \
             "$inst" "$branch" "$project_dir" \
             "${RESUME_SUMMARY_DIR:-$RUNTIME_DIR/resume}/${inst}.md"
@@ -631,13 +661,98 @@ RESUME_EOF
 # Pane 级原子发送: flock 保护 paste-buffer + Enter 序列
 # 防止并发发送同一 pane 时消息交错（命名 buffer + 互斥锁）
 # =============================================================================
+# 新版 Codex 提交能力按 session feature 开关启用，避免影响已在运行的旧蜂群。
+_settled_send_enabled() {
+    if [[ -n "${SWARM_ENABLE_SETTLED_SEND:-}" ]]; then
+        _is_truthy "$SWARM_ENABLE_SETTLED_SEND"
+        return $?
+    fi
+
+    local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
+    [[ -f "$state_file" ]] || return 1
+
+    jq -e '.features.codex_settled_submit == true' "$state_file" >/dev/null 2>&1
+}
+
+_cli_uses_codex() {
+    [[ "${1:-}" == *"codex"* ]]
+}
+
+_pane_cli_command() {
+    local pane_target="$1"
+    local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
+    [[ -f "$state_file" ]] || return 0
+
+    jq -r --arg pane "$pane_target" '
+        .panes[] | select(.pane == $pane) | .cli // ""
+    ' "$state_file" 2>/dev/null | head -1
+}
+
+_capture_pane_tail() {
+    local pane_target="$1"
+    local capture_lines="${SEND_SETTLE_CAPTURE_LINES:-80}"
+    tmux capture-pane -t "${SESSION_NAME}:${pane_target}" -p -S "-${capture_lines}" 2>/dev/null || true
+}
+
+_wait_for_pane_settle() {
+    local pane_target="$1"
+    local stable_polls="${SEND_SETTLE_STABLE_POLLS:-3}"
+    local max_polls="${SEND_SETTLE_MAX_POLLS:-20}"
+    local interval="${SEND_SETTLE_POLL_INTERVAL:-0.15}"
+    local snapshot="" previous="" stable_count=0 poll=0
+
+    for ((poll=0; poll<max_polls; poll++)); do
+        snapshot=$(_capture_pane_tail "$pane_target")
+
+        if [[ "$snapshot" == "$previous" ]]; then
+            ((stable_count++))
+            if (( stable_count >= stable_polls )); then
+                printf '%s' "$snapshot"
+                return 0
+            fi
+        else
+            previous="$snapshot"
+            stable_count=0
+        fi
+
+        sleep "$interval"
+    done
+
+    printf '%s' "$previous"
+    return 1
+}
+
+_submit_until_pane_changes() {
+    local pane_target="$1"
+    local baseline_snapshot="$2"
+    local retries="${SEND_SUBMIT_RETRIES:-2}"
+    local delay="${SEND_SUBMIT_CHECK_DELAY:-0.2}"
+    local attempt=0 current_snapshot=""
+
+    for ((attempt=0; attempt<=retries; attempt++)); do
+        tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
+        sleep "$delay"
+
+        current_snapshot=$(_capture_pane_tail "$pane_target")
+        if [[ "$current_snapshot" != "$baseline_snapshot" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # 参数:
 #   $1 - pane target (如 0.1)
 #   $2 - 要发送的临时文件路径
+#   $3 - CLI 命令提示（可选；pane 尚未写入 state.json 时使用）
 _pane_locked_paste_enter() {
     local pane_target="$1"
     local content_file="$2"
+    local cli_hint="${3:-}"
     local buf_name="pane-$$-$RANDOM"
+    local cli_cmd="$cli_hint"
+    local settle_snapshot=""
 
     # 锁文件按 pane 目标命名（. 替换为 - 避免路径问题）
     local lock_file="${RUNTIME_DIR}/.pane-send-lock-${pane_target//./-}"
@@ -650,8 +765,21 @@ _pane_locked_paste_enter() {
 
         tmux load-buffer -b "$buf_name" "$content_file"
         tmux paste-buffer -b "$buf_name" -t "${SESSION_NAME}:${pane_target}" -d
-        sleep "${PASTE_DELAY:-0.3}"
-        tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
+
+        [[ -n "$cli_cmd" ]] || cli_cmd=$(_pane_cli_command "$pane_target")
+        if _settled_send_enabled && _cli_uses_codex "$cli_cmd"; then
+            if ! settle_snapshot=$(_wait_for_pane_settle "$pane_target"); then
+                log_warn "[_pane_locked_paste_enter] pane 输入在超时前未稳定: pane=$pane_target cli=${cli_cmd%% *}"
+            fi
+
+            if ! _submit_until_pane_changes "$pane_target" "$settle_snapshot"; then
+                log_warn "[_pane_locked_paste_enter] 自动提交未生效: pane=$pane_target cli=${cli_cmd%% *}"
+                return 1
+            fi
+        else
+            sleep "${PASTE_DELAY:-0.3}"
+            tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
+        fi
     )
 }
 
@@ -680,13 +808,17 @@ _accept_codex_trust_prompt_if_needed() {
 send_init_to_pane() {
     local pane_target="$1"
     local init_msg="$2"
+    local cli_hint="${3:-}"
 
     _accept_codex_trust_prompt_if_needed "$pane_target"
 
     local init_tmp
     init_tmp=$(mktemp "${RUNTIME_DIR}/.init-XXXXXX")
     printf '%s' "$init_msg" > "$init_tmp"
-    _pane_locked_paste_enter "$pane_target" "$init_tmp"
+    if ! _pane_locked_paste_enter "$pane_target" "$init_tmp" "$cli_hint"; then
+        rm -f "$init_tmp"
+        return 1
+    fi
     rm -f "$init_tmp"
     sleep 1
 }

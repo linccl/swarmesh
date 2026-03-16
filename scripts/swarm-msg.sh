@@ -146,7 +146,10 @@ push_to_pane() {
 
     if ! _pane_locked_paste_enter "$pane_target" "$tmp_file" 2>/dev/null; then
         log_warn "[push_to_pane] paste-buffer 失败: pane=$pane_target"
+        return 1
     fi
+
+    return 0
 }
 
 # =============================================================================
@@ -210,7 +213,9 @@ ${content}
 
 $(build_reply_guidance "$msg_id")"
 
-        push_to_pane "$target_pane" "$notification"
+        if ! push_to_pane "$target_pane" "$notification"; then
+            warn "消息已写入 inbox，但即时推送失败: $target_instance ($msg_id)"
+        fi
     fi
 
     info "消息已发送: $my_instance -> $target_instance (${msg_id})"
@@ -293,7 +298,9 @@ ${content}
 
 $(build_reply_guidance "$reply_id")"
 
-        push_to_pane "$target_pane" "$notification"
+        if ! push_to_pane "$target_pane" "$notification"; then
+            warn "回复已写入 inbox，但即时推送失败: $target_instance ($reply_id)"
+        fi
     fi
 
     info "回复已发送: $my_instance -> $target_instance (${reply_id})"

@@ -228,7 +228,7 @@ log_success "Pane 已创建: $SESSION_NAME:$PANE_TARGET"
 log_info "启动 CLI: $CLI_CMD"
 
 # 创建角色的 git worktree（独立工作目录 + 独立分支）
-ROLE_BRANCH="swarm/$INSTANCE"
+ROLE_BRANCH=$(swarm_role_branch_name "$PROJECT_DIR" "$INSTANCE")
 ROLE_WORKTREE="$WORKTREE_DIR/$INSTANCE"
 mkdir -p "$WORKTREE_DIR"
 if git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/heads/$ROLE_BRANCH" 2>/dev/null; then
@@ -266,7 +266,7 @@ done < <(jq -r '.panes[] | "\(.instance // .role)|\(.role)|\(.alias // "")"' "$S
 
 # 使用共享函数构建并发送初始化消息
 INIT_MSG=$(build_init_message "$CONFIG_FILE" "$ROLE_BRANCH" "$TEAM_INFO")
-send_init_to_pane "$PANE_TARGET" "$INIT_MSG"
+send_init_to_pane "$PANE_TARGET" "$INIT_MSG" "$CLI_CMD"
 
 # =============================================================================
 # 启用日志 + Watcher
@@ -351,7 +351,10 @@ if [[ -n "$INITIAL_TASK" ]]; then
 
     TASK_TMP=$(mktemp "${RUNTIME_DIR}/.task-XXXXXX")
     printf '%s' "$INITIAL_TASK" > "$TASK_TMP"
-    _pane_locked_paste_enter "$PANE_TARGET" "$TASK_TMP"
+    if ! _pane_locked_paste_enter "$PANE_TARGET" "$TASK_TMP" "$CLI_CMD"; then
+        rm -f "$TASK_TMP"
+        die "初始任务发送失败: instance=$INSTANCE pane=$PANE_TARGET"
+    fi
     rm -f "$TASK_TMP"
 
     log_success "初始任务已派发"

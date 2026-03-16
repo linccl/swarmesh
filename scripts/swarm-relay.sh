@@ -203,7 +203,10 @@ ${response}"
     echo "$message" > "$tmp_file"
 
     # 使用原子发送（flock 保护 paste-buffer + Enter 序列）
-    _pane_locked_paste_enter "$to_pane" "$tmp_file"
+    if ! _pane_locked_paste_enter "$to_pane" "$tmp_file"; then
+        rm -f "$tmp_file"
+        die "中继发送失败: from=$from_name to=$to_name pane=$to_pane"
+    fi
 
     rm -f "$tmp_file"
 
