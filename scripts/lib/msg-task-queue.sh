@@ -84,6 +84,24 @@ _get_routing_score() {
 # 任务队列内部工具函数
 # =============================================================================
 
+_build_execution_plan_guidance() {
+    local target_instance="$1"
+    local task_id="$2"
+    local task_title="$3"
+
+    [[ -n "$target_instance" && "$target_instance" != "null" ]] || return 0
+
+    cat <<EOF
+先同步计划，不要等待确认:
+  swarm-msg.sh send $target_instance "[执行计划] $task_id $task_title
+- 步骤1: ...
+- 步骤2: ...
+- 验证: ...
+- 阻塞: 无 / 具体问题"
+发完就直接开工。除非对方明确要求“只出方案”或“等确认”，否则不要停在“如果你确认，我就开始”。
+EOF
+}
+
 # 自动认领下一个任务（工蜂完成任务后自动拉取）
 # 扫描 pending/，找本角色能接的任务，按优先级认领
 # 参数: $1 - 当前角色名
@@ -179,8 +197,9 @@ _auto_claim_next() {
     done
     [[ -z "$next_file" ]] && return 0
 
-    local next_id
+    local next_id next_title
     next_id=$(jq -r '.id' "$next_file")
+    next_title=$(jq -r '.title // ""' "$next_file")
 
     # 原子认领: pending → processing（mv 只有一个进程能成功）
     local claimed_at
@@ -194,6 +213,7 @@ _auto_claim_next() {
     local tmp_file="$TASKS_DIR/processing/$next_id.json.tmp"
     jq --arg inst "$my_instance" --arg at "$claimed_at" \
         '.status = "processing" | .claimed_by = $inst | .claimed_at = $at
+         | .plan_sync = {status: "pending", reported_at: null, reminded_at: null}
          | .flow_log = ((.flow_log // []) + [{
              ts: $at, action: "auto_claimed",
              from_status: "pending", to_status: "processing",
@@ -217,6 +237,8 @@ _auto_claim_next() {
     echo ""
     echo "任务详情:"
     jq '.' "$TASKS_DIR/processing/$next_id.json"
+    echo ""
+    _build_execution_plan_guidance "$from_id" "$next_id" "$next_title"
     echo ""
     echo "完成后执行: swarm-msg.sh complete-task $next_id --result \"完成说明\""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -871,6 +893,7 @@ cmd_publish() {
             notify_msg+=$'\n'"$description"
         fi
         notify_msg+=$'\n'$'\n'"👉 认领: swarm-msg.sh claim $task_id"
+        notify_msg+=$'\n'"👉 认领后先同步计划给 $my_instance，再直接开工，不要等待确认"
         notify_msg+=$'\n'"👉 完成后: swarm-msg.sh complete-task $task_id --result \"完成说明\""
         notify_msg+=$'\n'"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -1005,6 +1028,7 @@ cmd_claim() {
     local tmp_file="$TASKS_DIR/processing/$task_id.json.tmp"
     jq --arg inst "$my_instance" --arg at "$claimed_at" \
         '.status = "processing" | .claimed_by = $inst | .claimed_at = $at
+         | .plan_sync = {status: "pending", reported_at: null, reminded_at: null}
          | .flow_log = ((.flow_log // []) + [{
              ts: $at, action: "claimed",
              from_status: "pending", to_status: "processing",
@@ -1030,6 +1054,10 @@ cmd_claim() {
     echo ""
     echo "任务详情:"
     jq '.' "$TASKS_DIR/processing/$task_id.json"
+    echo ""
+    local task_title
+    task_title=$(jq -r '.title // ""' "$TASKS_DIR/processing/$task_id.json")
+    _build_execution_plan_guidance "$from_id" "$task_id" "$task_title"
 
     # 提示审核命令
     local branch

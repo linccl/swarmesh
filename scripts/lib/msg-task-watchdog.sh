@@ -174,6 +174,83 @@ _watchdog_idle_warning() {
     log_info "[watchdog] 空闲告警: 任务 $tid, 认领者 $claimer"
 }
 
+_watchdog_parse_task_epoch() {
+    local ts="$1"
+    [[ -n "$ts" && "$ts" != "null" ]] || { echo "0"; return 0; }
+
+    date -j -f "${LOG_TIMESTAMP_FORMAT:-%Y-%m-%d %H:%M:%S}" "$ts" +%s 2>/dev/null \
+        || date -d "$ts" +%s 2>/dev/null \
+        || echo "0"
+}
+
+_watchdog_find_plan_sync_message() {
+    local target_instance="$1"
+    local claimer="$2"
+    local task_id="$3"
+    local msg_dir msg_file matched_ts=""
+
+    for msg_dir in "${INBOX_DIR}/${target_instance}" "${OUTBOX_DIR}/${target_instance}"; do
+        [[ -d "$msg_dir" ]] || continue
+        for msg_file in "$msg_dir"/*.json; do
+            [[ -f "$msg_file" ]] || continue
+            matched_ts=$(jq -r --arg from "$claimer" --arg tid "$task_id" '
+                select((.from // "") == $from)
+                | select(((.content // "") | contains($tid)))
+                | select((((.content // "") | contains("[执行计划]"))) or (((.content // "") | contains("执行计划"))))
+                | .timestamp // ""
+            ' "$msg_file" 2>/dev/null)
+            if [[ -n "$matched_ts" && "$matched_ts" != "null" ]]; then
+                echo "$matched_ts"
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
+_watchdog_update_plan_sync() {
+    local task_file="$1"
+    local status="$2"
+    local reported_at="$3"
+    local reminded_at="$4"
+
+    [[ -f "$task_file" ]] || return 0
+
+    local tmp="${task_file}.tmp"
+    if jq \
+        --arg status "$status" \
+        --arg reported_at "$reported_at" \
+        --arg reminded_at "$reminded_at" \
+        '
+        .plan_sync = ((.plan_sync // {}) + {
+            status: $status,
+            reported_at: (if $reported_at == "" then (.plan_sync.reported_at // null) else $reported_at end),
+            reminded_at: (if $reminded_at == "" then (.plan_sync.reminded_at // null) else $reminded_at end)
+        })
+        ' "$task_file" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$task_file"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+_watchdog_plan_sync_warning() {
+    local tid="$1"
+    local task_title="$2"
+    local claimer="$3"
+    local recipient="$4"
+    local overdue_seconds="$5"
+
+    emit_event "task.plan_sync_missing" "" "task_id=$tid" "claimer=$claimer" "to=$recipient"
+
+    _unified_notify "$recipient" \
+        "[计划超时] 任务 $tid ($task_title) 已认领超过 ${overdue_seconds}s，但 ${claimer} 仍未向你同步执行计划。请主动跟进，或提醒其先发送 [执行计划] 再继续。" \
+        "task.plan_sync_missing" "high"
+
+    log_info "[watchdog] 计划同步超时: 任务 $tid, 认领者 $claimer, 接收者 $recipient"
+}
+
 # 检查单个 processing 任务（提取为函数，确保 local 变量作用域正确）
 # 参数:
 #   $1 - 任务文件路径
@@ -188,6 +265,10 @@ _watchdog_check_one_task() {
     IFS=$'\001' read -r tid claimed_by claimed_at <<< "$meta"
 
     [[ -n "$tid" && -n "$claimed_by" ]] || return 0
+
+    local now claimed_epoch
+    now=$(date +%s)
+    claimed_epoch=$(_watchdog_parse_task_epoch "$claimed_at")
 
     # --- 检测 1: pane 存活检测 ---（claimed_by 存储的是 instance）
     local pane_target=""
@@ -209,12 +290,6 @@ _watchdog_check_one_task() {
 
     # --- 检测 2: TTL 超时检测 ---
     if [[ "$TASK_PROCESSING_TTL" -gt 0 && -n "$claimed_at" ]]; then
-        local now claimed_epoch
-        now=$(date +%s)
-        # macOS: date -j -f, Linux: date -d
-        claimed_epoch=$(date -j -f "${LOG_TIMESTAMP_FORMAT:-%Y-%m-%d %H:%M:%S}" "$claimed_at" +%s 2>/dev/null \
-            || date -d "$claimed_at" +%s 2>/dev/null \
-            || echo "0")
         # 时间解析失败（epoch=0）时跳过 TTL 检测，避免误触发恢复
         if [[ "$claimed_epoch" != "0" && $((now - claimed_epoch)) -ge $TASK_PROCESSING_TTL ]]; then
             _watchdog_recover_task "$f" "$tid" "ttl" "$claimed_by"
@@ -222,7 +297,29 @@ _watchdog_check_one_task() {
         fi
     fi
 
-    # --- 检测 3: 空闲检测（pane 存活但 idle） ---
+    # --- 检测 3: 计划同步超时 ---
+    if [[ "${PLAN_SYNC_TTL:-0}" -gt 0 && "$claimed_epoch" != "0" ]]; then
+        local plan_meta
+        plan_meta=$(jq -r '[.title, (.from // ""), (.plan_sync.status // ""), (.plan_sync.reported_at // ""), (.plan_sync.reminded_at // "")] | join("\u0001")' "$f" 2>/dev/null) || plan_meta=""
+        local task_title from_id plan_status plan_reported_at plan_reminded_at
+        IFS=$'\001' read -r task_title from_id plan_status plan_reported_at plan_reminded_at <<< "$plan_meta"
+
+        if [[ -n "$from_id" && "$from_id" != "null" && "$from_id" != "$claimed_by" && $((now - claimed_epoch)) -ge ${PLAN_SYNC_TTL:-1800} ]]; then
+            if [[ "$plan_status" != "reported" ]]; then
+                local matched_plan_ts=""
+                matched_plan_ts=$(_watchdog_find_plan_sync_message "$from_id" "$claimed_by" "$tid" || true)
+
+                if [[ -n "$matched_plan_ts" && "$matched_plan_ts" != "null" ]]; then
+                    _watchdog_update_plan_sync "$f" "reported" "$matched_plan_ts" ""
+                elif [[ -z "$plan_reminded_at" || "$plan_reminded_at" == "null" ]]; then
+                    _watchdog_plan_sync_warning "$tid" "$task_title" "$claimed_by" "$from_id" "${PLAN_SYNC_TTL:-1800}"
+                    _watchdog_update_plan_sync "$f" "pending" "" "$(get_timestamp)"
+                fi
+            fi
+        fi
+    fi
+
+    # --- 检测 4: 空闲检测（pane 存活但 idle） ---
     if [[ -n "$pane_target" ]] && check_prompt "$pane_target" 2>/dev/null; then
         _watchdog_idle_warning "$tid" "$claimed_by"
     fi
