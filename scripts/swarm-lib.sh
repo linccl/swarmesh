@@ -226,12 +226,12 @@ _resolve_pane_by_id() {
 }
 
 # 按角色查找全部实例
-# 输出: 每行 pane|instance
+# 输出: 每行 pane|instance|cli
 resolve_role_to_all_panes() {
     local role="$1"
     local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
     jq -r --arg q "$role" '
-        .panes[] | select(.role == $q) | "\(.pane)|\(.instance)"
+        .panes[] | select(.role == $q) | "\(.pane)|\(.instance)|\(.cli // "unknown")"
     ' "$state_file" 2>/dev/null
 }
 
@@ -271,14 +271,14 @@ resolve_role_full() {
     local result
     # 优先精确匹配 instance
     result=$(jq -r --arg q "$query" '
-        .panes[] | select(.instance == $q) | "\(.pane)|\(.instance)|\(.cli)|\(.log)"
+        .panes[] | select(.instance == $q) | "\(.pane)|\(.instance)|\(.cli // "unknown")|\(.log)"
     ' "$state_file" 2>/dev/null | head -1)
 
     if [[ -z "$result" ]]; then
         result=$(jq -r --arg q "$query" '
             .panes[] |
             select(.role == $q or (.alias // "" | split(",") | map(gsub("^\\s+|\\s+$"; "")) | index($q) != null)) |
-            "\(.pane)|\(.instance)|\(.cli)|\(.log)"
+            "\(.pane)|\(.instance)|\(.cli // "unknown")|\(.log)"
         ' "$state_file" 2>/dev/null | head -1)
     fi
 
@@ -576,16 +576,75 @@ RESUME_EOF
 }
 
 # =============================================================================
-# Pane 级原子发送: flock 保护 paste-buffer + Enter 序列
+# Pane → CLI 类型解析
+# =============================================================================
+# 从 state.json 中根据 pane target 查找对应 CLI 类型
+# 参数: $1 - pane target (如 0.1)
+# 输出: cli 命令字符串 (如 "claude chat", "codex chat", "gemini ...")，未知返回 "unknown"
+_resolve_cli_from_pane() {
+    local pane_target="$1"
+    if [[ -f "$STATE_FILE" ]]; then
+        jq -r --arg pane "$pane_target" \
+            '[.panes[] | select(.pane == $pane) | .cli // "unknown"] | first // "unknown"' \
+            "$STATE_FILE" 2>/dev/null || echo "unknown"
+    else
+        echo "unknown"
+    fi
+}
+
+# 判断 CLI 类型字符串是否为 Codex CLI
+# 参数: $1 - CLI 命令字符串 (如 "codex chat", "claude chat")
+# 返回: 0 (是 Codex) / 1 (不是)
+_is_codex_cli() {
+    [[ "${1:-}" == *codex* ]]
+}
+
+# 向 pane 发送 shell 命令并提交（Codex 兼容）
+# CLI 启动阶段 state.json 尚未写入，不能用 _resolve_cli_from_pane，
+# 必须由调用方传入 CLI 命令字符串直接判断。
+# 参数:
+#   $1 - pane target (如 0.1)
+#   $2 - 要执行的 shell 命令
+#   $3 - CLI 命令字符串 (用于判断是否 Codex)
+_send_keys_enter() {
+    local pane_target="$1"
+    local cmd="$2"
+    local cli_type="${3:-}"
+
+    if _is_codex_cli "$cli_type"; then
+        # Codex CLI: Kitty keyboard protocol 导致 C-m / Enter 被静默忽略，
+        # 先发送命令文本，再用 -l 发送原始 CR 字节 (0x0D)
+        tmux send-keys -t "${SESSION_NAME}:${pane_target}" "$cmd"
+        sleep "${CODEX_PASTE_DELAY:-0.5}"
+        tmux send-keys -l -t "${SESSION_NAME}:${pane_target}" $'\r'
+    else
+        tmux send-keys -t "${SESSION_NAME}:${pane_target}" "$cmd" C-m
+    fi
+}
+
+# =============================================================================
+# Pane 级原子发送: flock 保护 paste-buffer + submit 序列
 # 防止并发发送同一 pane 时消息交错（命名 buffer + 互斥锁）
 # =============================================================================
 # 参数:
 #   $1 - pane target (如 0.1)
 #   $2 - 要发送的临时文件路径
+#   $3 - (可选) CLI 类型，省略时自动从 state.json 推断
+#
+# Codex CLI (Rust/crossterm) 启用了 Kitty Keyboard Enhancement Protocol，
+# tmux 对此支持有限 (tmux/tmux#4196)，导致 `send-keys Enter` 被静默忽略。
+# 解决方案: 对 Codex 使用 `send-keys -l` 发送原始 CR 字节 (\r / 0x0D)。
+# 参考: openai/codex#12645
 _pane_locked_paste_enter() {
     local pane_target="$1"
     local content_file="$2"
+    local cli_type="${3:-}"
     local buf_name="pane-$$-$RANDOM"
+
+    # 自动推断 CLI 类型
+    if [[ -z "$cli_type" ]]; then
+        cli_type=$(_resolve_cli_from_pane "$pane_target")
+    fi
 
     # 锁文件按 pane 目标命名（. 替换为 - 避免路径问题）
     local lock_file="${RUNTIME_DIR}/.pane-send-lock-${pane_target//./-}"
@@ -598,20 +657,30 @@ _pane_locked_paste_enter() {
 
         tmux load-buffer -b "$buf_name" "$content_file"
         tmux paste-buffer -b "$buf_name" -t "${SESSION_NAME}:${pane_target}" -d
-        sleep "${PASTE_DELAY:-0.3}"
-        tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
+
+        if _is_codex_cli "$cli_type"; then
+            # Codex CLI: Kitty keyboard protocol 导致 Enter 关键字失效，
+            # 必须用 -l 发送原始 CR 字节 (0x0D)
+            sleep "${CODEX_PASTE_DELAY:-0.5}"
+            tmux send-keys -l -t "${SESSION_NAME}:${pane_target}" $'\r'
+        else
+            sleep "${PASTE_DELAY:-0.3}"
+            tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
+        fi
     )
 }
 
 # 通过 tmux paste-buffer 发送初始化消息到 pane
+# 参数: $1 - pane target, $2 - 初始化消息, $3 - (可选) CLI 类型
 send_init_to_pane() {
     local pane_target="$1"
     local init_msg="$2"
+    local cli_type="${3:-}"
 
     local init_tmp
     init_tmp=$(mktemp "${RUNTIME_DIR}/.init-XXXXXX")
     printf '%s' "$init_msg" > "$init_tmp"
-    _pane_locked_paste_enter "$pane_target" "$init_tmp"
+    _pane_locked_paste_enter "$pane_target" "$init_tmp" "$cli_type"
     rm -f "$init_tmp"
     sleep 1
 }
@@ -633,7 +702,7 @@ notify_all_roles() {
     local exclude="${4:-}"
     local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
 
-    while IFS='|' read -r inst_name inst_pane; do
+    while IFS='|' read -r inst_name inst_pane inst_cli; do
         [[ -z "$inst_name" ]] && continue
         [[ "$inst_name" == "$exclude" ]] && continue
 
@@ -656,10 +725,10 @@ notify_all_roles() {
         local notify_tmp
         notify_tmp=$(mktemp "${RUNTIME_DIR}/.notify-XXXXXX")
         printf '%s' "$pane_content" > "$notify_tmp"
-        _pane_locked_paste_enter "$inst_pane" "$notify_tmp" 2>/dev/null || true
+        _pane_locked_paste_enter "$inst_pane" "$notify_tmp" "$inst_cli" 2>/dev/null || true
         rm -f "$notify_tmp"
 
-    done < <(jq -r '.panes[] | "\(.instance)|\(.pane)"' "$state_file" 2>/dev/null)
+    done < <(jq -r '.panes[] | "\(.instance)|\(.pane)|\(.cli // "unknown")"' "$state_file" 2>/dev/null)
 }
 
 # =============================================================================
@@ -725,7 +794,11 @@ _unified_notify() {
         local delivery
         delivery=$(_get_delivery_rule "$category")
         if [[ "$delivery" == "dual" ]]; then
-            push_to_pane "$target_pane" "$content" 2>/dev/null || true
+            if command -v push_to_pane &>/dev/null; then
+                push_to_pane "$target_pane" "$content" 2>/dev/null || true
+            else
+                log_warn "[_unified_notify] push_to_pane 未定义，跳过 paste-buffer 推送 (to=$to)"
+            fi
         fi
     fi
 }
@@ -1254,7 +1327,7 @@ _notify_supervisor_completion() {
 
     # 通知所有 supervisor 实例（双通道: inbox + paste-buffer）
     local messages_dir="${RUNTIME_DIR}/messages"
-    while IFS='|' read -r sup_pane sup_inst; do
+    while IFS='|' read -r sup_pane sup_inst sup_cli; do
         [[ -z "$sup_inst" ]] && continue
         # 通道 1: inbox（可靠持久）
         local notify_id="completion-${instance}-$(date +%s)-${RANDOM}"
@@ -1269,7 +1342,7 @@ _notify_supervisor_completion() {
         local notify_tmp
         notify_tmp=$(mktemp "${RUNTIME_DIR}/.watcher-notify-XXXXXX")
         printf '%s' "[系统通知] 实例 ${instance} 已完成任务，可分配新工作。" > "$notify_tmp"
-        _pane_locked_paste_enter "$sup_pane" "$notify_tmp" 2>/dev/null || true
+        _pane_locked_paste_enter "$sup_pane" "$notify_tmp" "$sup_cli" 2>/dev/null || true
         rm -f "$notify_tmp"
     done < <(resolve_role_to_all_panes "supervisor")
 }

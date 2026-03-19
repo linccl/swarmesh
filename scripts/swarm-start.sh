@@ -294,8 +294,9 @@ resume_swarm() {
         log_info "      Worktree: $ROLE_WORKTREE (branch: $BRANCH)"
 
         # --- 9c. 启动 CLI ---（导出 RUNTIME_DIR 和 SWARM_SESSION 确保 pane 内脚本找到正确路径）
-        tmux send-keys -t "$SESSION_NAME:$PANE_TARGET" \
-            "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && export RUNTIME_DIR=\"$RUNTIME_DIR\" && export SWARM_SESSION=\"$SESSION_NAME\" && $CLI" C-m
+        _send_keys_enter "$PANE_TARGET" \
+            "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && export RUNTIME_DIR=\"$RUNTIME_DIR\" && export SWARM_SESSION=\"$SESSION_NAME\" && $CLI" \
+            "$CLI"
         sleep "$CLI_STARTUP_WAIT"
         sleep 0.5
 
@@ -683,7 +684,9 @@ for ((i=0; i<ROLES_COUNT; i++)); do
     log_info "      Worktree: $ROLE_WORKTREE (branch: $ROLE_BRANCH)"
 
     # 在角色的 worktree 目录启动 CLI（导出 RUNTIME_DIR 和 SWARM_SESSION 确保 pane 内脚本找到正确路径）
-    tmux send-keys -t "$SESSION_NAME:$PANE_TARGET" "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && export RUNTIME_DIR=\"$RUNTIME_DIR\" && export SWARM_SESSION=\"$SESSION_NAME\" && $CLI" C-m
+    _send_keys_enter "$PANE_TARGET" \
+        "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && export RUNTIME_DIR=\"$RUNTIME_DIR\" && export SWARM_SESSION=\"$SESSION_NAME\" && $CLI" \
+        "$CLI"
 
     # 等待 CLI 启动
     sleep "$CLI_STARTUP_WAIT"
@@ -712,7 +715,7 @@ for ((i=0; i<ROLES_COUNT; i++)); do
 
         INIT_TMP=$(mktemp "${RUNTIME_DIR}/.init-XXXXXX")
         printf '%s' "$INIT_MSG" > "$INIT_TMP"
-        _pane_locked_paste_enter "$PANE_TARGET" "$INIT_TMP"
+        _pane_locked_paste_enter "$PANE_TARGET" "$INIT_TMP" "$CLI"
         rm -f "$INIT_TMP"
         sleep 1
     fi

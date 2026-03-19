@@ -202,8 +202,8 @@ ${response}"
     tmp_file=$(mktemp "${SWARM_ROOT}/runtime/.relay-XXXXXX")
     echo "$message" > "$tmp_file"
 
-    # 使用原子发送（flock 保护 paste-buffer + Enter 序列）
-    _pane_locked_paste_enter "$to_pane" "$tmp_file"
+    # 使用原子发送（flock 保护 paste-buffer + submit 序列）
+    _pane_locked_paste_enter "$to_pane" "$tmp_file" "$to_cli"
 
     rm -f "$tmp_file"
 
