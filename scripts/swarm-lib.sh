@@ -51,6 +51,7 @@ _reinit_runtime_paths() {
     OUTBOX_DIR="$MESSAGES_DIR/outbox"
     LOGS_DIR="$RUNTIME_DIR/logs"
     TASKS_DIR="$RUNTIME_DIR/tasks"
+    PANE_SUBMIT_DIR="$RUNTIME_DIR/pane-submit"
     STATE_FILE="$RUNTIME_DIR/state.json"
     EVENTS_LOG="$RUNTIME_DIR/events.jsonl"
     SESSION_NAME="${SWARM_SESSION:-swarm-$(basename "$PROJECT_DIR")}"
@@ -83,6 +84,7 @@ INBOX_DIR="${INBOX_DIR:-$MESSAGES_DIR/inbox}"
 OUTBOX_DIR="${OUTBOX_DIR:-$MESSAGES_DIR/outbox}"
 LOGS_DIR="${LOGS_DIR:-$RUNTIME_DIR/logs}"
 TASKS_DIR="${TASKS_DIR:-$RUNTIME_DIR/tasks}"
+PANE_SUBMIT_DIR="${PANE_SUBMIT_DIR:-$RUNTIME_DIR/pane-submit}"
 STATE_FILE="${STATE_FILE:-$RUNTIME_DIR/state.json}"
 EVENTS_LOG="${EVENTS_LOG:-$RUNTIME_DIR/events.jsonl}"
 
@@ -678,20 +680,267 @@ _cli_uses_codex() {
     [[ "${1:-}" == *"codex"* ]]
 }
 
-_pane_cli_command() {
+_pane_state_field() {
     local pane_target="$1"
+    local field="$2"
     local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
     [[ -f "$state_file" ]] || return 0
 
-    jq -r --arg pane "$pane_target" '
-        .panes[] | select(.pane == $pane) | .cli // ""
+    jq -r --arg pane "$pane_target" --arg field "$field" '
+        .panes[] | select(.pane == $pane) | .[$field] // ""
     ' "$state_file" 2>/dev/null | head -1
+}
+
+_pane_cli_command() {
+    _pane_state_field "$1" "cli"
+}
+
+_pane_log_file() {
+    _pane_state_field "$1" "log"
+}
+
+_pane_instance_name() {
+    _pane_state_field "$1" "instance"
+}
+
+_pane_log_size() {
+    local log_file
+    log_file=$(_pane_log_file "$1")
+    _file_size "$log_file"
 }
 
 _capture_pane_tail() {
     local pane_target="$1"
     local capture_lines="${SEND_SETTLE_CAPTURE_LINES:-80}"
     tmux capture-pane -t "${SESSION_NAME}:${pane_target}" -p -S "-${capture_lines}" 2>/dev/null || true
+}
+
+_normalize_inline_text() {
+    sed -E '
+        s/\x1b\[[0-9;]*[a-zA-Z]//g
+        s/\x1b\([0-9;]*[a-zA-Z]//g
+        s/\x1b\].*\x07//g
+        s/\x0f//g
+        s/[[:cntrl:]]//g
+    ' | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+_codex_anchor_from_file() {
+    local content_file="$1"
+    local max_len="${CODEX_PENDING_INPUT_ANCHOR_MAXLEN:-120}"
+    [[ -f "$content_file" ]] || return 0
+
+    local anchor
+    anchor=$(awk '
+        {
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line == "") next
+            if (line ~ /^\[Swarm 消息\]/) next
+            if (line ~ /^消息ID:/) next
+            if (line ~ /^仅在需要/) next
+            if (line ~ /^--- /) next
+            print line
+            exit
+        }
+    ' "$content_file" 2>/dev/null || true)
+
+    if [[ -z "$anchor" ]]; then
+        anchor=$(awk '
+            {
+                line=$0
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+                if (line != "") {
+                    print line
+                    exit
+                }
+            }
+        ' "$content_file" 2>/dev/null || true)
+    fi
+
+    anchor=$(printf '%s' "$anchor" | _normalize_inline_text)
+    printf '%s' "${anchor:0:max_len}"
+}
+
+_codex_tail_anchor_from_file() {
+    local content_file="$1"
+    local max_len="${CODEX_PENDING_INPUT_ANCHOR_MAXLEN:-120}"
+    [[ -f "$content_file" ]] || return 0
+
+    local anchor
+    anchor=$(awk '
+        {
+            line=$0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line == "") next
+            if (line ~ /^\[Swarm 消息\]/) next
+            if (line ~ /^消息ID:/) next
+            if (line ~ /^仅在需要/) next
+            if (line ~ /^--- /) next
+            candidate = line
+        }
+        END {
+            if (candidate != "") print candidate
+        }
+    ' "$content_file" 2>/dev/null || true)
+
+    if [[ -z "$anchor" ]]; then
+        anchor=$(awk '
+            {
+                line=$0
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+                if (line != "") candidate = line
+            }
+            END {
+                if (candidate != "") print candidate
+            }
+        ' "$content_file" 2>/dev/null || true)
+    fi
+
+    anchor=$(printf '%s' "$anchor" | _normalize_inline_text)
+    printf '%s' "${anchor:0:max_len}"
+}
+
+_pane_tail_contains_text() {
+    local pane_target="$1"
+    local needle="$2"
+    [[ -n "$needle" ]] || return 1
+
+    local capture_lines="${CODEX_PENDING_INPUT_CAPTURE_LINES:-20}"
+    local snapshot normalized_snapshot normalized_needle
+    snapshot=$(tmux capture-pane -t "${SESSION_NAME}:${pane_target}" -p -S "-${capture_lines}" 2>/dev/null || true)
+    normalized_snapshot=$(printf '%s' "$snapshot" | _normalize_inline_text)
+    normalized_needle=$(printf '%s' "$needle" | _normalize_inline_text)
+
+    [[ -n "$normalized_needle" && "$normalized_snapshot" == *"$normalized_needle"* ]]
+}
+
+_pane_tail_matches_pending_submit() {
+    local pane_target="$1"
+    local anchor_head="$2"
+    local anchor_tail="$3"
+
+    if [[ -n "$anchor_head" ]] && _pane_tail_contains_text "$pane_target" "$anchor_head"; then
+        return 0
+    fi
+
+    if [[ -n "$anchor_tail" && "$anchor_tail" != "$anchor_head" ]] \
+        && _pane_tail_contains_text "$pane_target" "$anchor_tail"; then
+        return 0
+    fi
+
+    return 1
+}
+
+_pane_submit_state_file() {
+    local pane_safe="${1//./-}"
+    printf '%s/%s.json' "$PANE_SUBMIT_DIR" "$pane_safe"
+}
+
+_clear_codex_pending_submit() {
+    local pane_target="$1"
+    rm -f "$(_pane_submit_state_file "$pane_target")" 2>/dev/null || true
+}
+
+_record_codex_pending_submit() {
+    local pane_target="$1"
+    local content_file="$2"
+    local cli_hint="${3:-}"
+    local cli_cmd="$cli_hint"
+
+    [[ -n "$cli_cmd" ]] || cli_cmd=$(_pane_cli_command "$pane_target")
+    if ! _cli_uses_codex "$cli_cmd"; then
+        _clear_codex_pending_submit "$pane_target"
+        return 0
+    fi
+
+    mkdir -p "$PANE_SUBMIT_DIR"
+
+    local anchor_head anchor_tail instance log_file log_size created_at created_epoch state_file tmp_file
+    anchor_head=$(_codex_anchor_from_file "$content_file")
+    anchor_tail=$(_codex_tail_anchor_from_file "$content_file")
+    instance=$(_pane_instance_name "$pane_target")
+    log_file=$(_pane_log_file "$pane_target")
+    log_size=$(_file_size "$log_file")
+    created_at=$(get_timestamp)
+    created_epoch=$(date +%s)
+    state_file=$(_pane_submit_state_file "$pane_target")
+    tmp_file="${state_file}.tmp"
+
+    if jq -n \
+        --arg pane "$pane_target" \
+        --arg instance "$instance" \
+        --arg cli "$cli_cmd" \
+        --arg anchor_head "$anchor_head" \
+        --arg anchor_tail "$anchor_tail" \
+        --arg log_file "$log_file" \
+        --arg created_at "$created_at" \
+        --argjson created_epoch "$created_epoch" \
+        --argjson log_size "$log_size" \
+        '{
+            pane: $pane,
+            instance: (if $instance == "" then null else $instance end),
+            cli: $cli,
+            anchor_head: (if $anchor_head == "" then null else $anchor_head end),
+            anchor_tail: (if $anchor_tail == "" then null else $anchor_tail end),
+            log_file: (if $log_file == "" then null else $log_file end),
+            log_size_at_record: $log_size,
+            created_at: $created_at,
+            created_epoch: $created_epoch,
+            updated_at: $created_at,
+            updated_epoch: $created_epoch,
+            last_attempt_at: null,
+            last_attempt_epoch: 0,
+            submit_attempts: 0,
+            alerted_at: null,
+            alert_count: 0
+        }' > "$tmp_file" 2>/dev/null; then
+        mv "$tmp_file" "$state_file"
+    else
+        rm -f "$tmp_file"
+    fi
+}
+
+_codex_submit_still_pending() {
+    local pane_target="$1"
+    local anchor_head="$2"
+    local anchor_tail="$3"
+    local baseline_log_size="${4:-0}"
+    local current_log_size
+    current_log_size=$(_pane_log_size "$pane_target")
+
+    if [[ "$current_log_size" -gt "$baseline_log_size" ]]; then
+        return 1
+    fi
+
+    if ! check_prompt "$pane_target"; then
+        return 1
+    fi
+
+    if _pane_tail_matches_pending_submit "$pane_target" "$anchor_head" "$anchor_tail"; then
+        return 0
+    fi
+
+    return 1
+}
+
+_retry_codex_pending_submit() {
+    local pane_target="$1"
+    local anchor_head="$2"
+    local anchor_tail="$3"
+    local baseline_snapshot="$4"
+    local baseline_log_size="${5:-0}"
+
+    if ! _submit_until_pane_changes "$pane_target" "$baseline_snapshot"; then
+        return 1
+    fi
+
+    sleep "${SEND_SUBMIT_CHECK_DELAY:-0.2}"
+    ! _codex_submit_still_pending "$pane_target" "$anchor_head" "$anchor_tail" "$baseline_log_size"
 }
 
 _wait_for_pane_settle() {
@@ -753,6 +1002,9 @@ _pane_locked_paste_enter() {
     local buf_name="pane-$$-$RANDOM"
     local cli_cmd="$cli_hint"
     local settle_snapshot=""
+    local anchor_head=""
+    local anchor_tail=""
+    local submit_log_size=0
 
     # 锁文件按 pane 目标命名（. 替换为 - 避免路径问题）
     local lock_file="${RUNTIME_DIR}/.pane-send-lock-${pane_target//./-}"
@@ -768,6 +1020,11 @@ _pane_locked_paste_enter() {
 
         [[ -n "$cli_cmd" ]] || cli_cmd=$(_pane_cli_command "$pane_target")
         if _settled_send_enabled && _cli_uses_codex "$cli_cmd"; then
+            _record_codex_pending_submit "$pane_target" "$content_file" "$cli_cmd"
+            anchor_head=$(_codex_anchor_from_file "$content_file")
+            anchor_tail=$(_codex_tail_anchor_from_file "$content_file")
+            submit_log_size=$(_pane_log_size "$pane_target")
+
             if ! settle_snapshot=$(_wait_for_pane_settle "$pane_target"); then
                 log_warn "[_pane_locked_paste_enter] pane 输入在超时前未稳定: pane=$pane_target cli=${cli_cmd%% *}"
             fi
@@ -775,6 +1032,10 @@ _pane_locked_paste_enter() {
             if ! _submit_until_pane_changes "$pane_target" "$settle_snapshot"; then
                 log_warn "[_pane_locked_paste_enter] 自动提交未生效: pane=$pane_target cli=${cli_cmd%% *}"
                 return 1
+            fi
+
+            if _codex_submit_still_pending "$pane_target" "$anchor_head" "$anchor_tail" "$submit_log_size"; then
+                log_warn "[_pane_locked_paste_enter] Codex 输入框仍残留未提交内容: pane=$pane_target cli=${cli_cmd%% *}"
             fi
         else
             sleep "${PASTE_DELAY:-0.3}"

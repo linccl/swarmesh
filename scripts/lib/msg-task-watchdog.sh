@@ -174,6 +174,64 @@ _watchdog_idle_warning() {
     log_info "[watchdog] 空闲告警: 任务 $tid, 认领者 $claimer"
 }
 
+_watchdog_touch_pending_submit_retry() {
+    local submit_file="$1"
+    local now_ts="$2"
+    local now_epoch="$3"
+    [[ -f "$submit_file" ]] || return 0
+
+    local tmp="${submit_file}.tmp"
+    if jq \
+        --arg now_ts "$now_ts" \
+        --argjson now_epoch "$now_epoch" \
+        '
+        .submit_attempts = ((.submit_attempts // 0) + 1)
+        | .last_attempt_at = $now_ts
+        | .last_attempt_epoch = $now_epoch
+        | .updated_at = $now_ts
+        | .updated_epoch = $now_epoch
+        ' "$submit_file" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$submit_file"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+_watchdog_mark_pending_submit_alerted() {
+    local submit_file="$1"
+    local now_ts="$2"
+    local now_epoch="$3"
+    [[ -f "$submit_file" ]] || return 0
+
+    local tmp="${submit_file}.tmp"
+    if jq \
+        --arg now_ts "$now_ts" \
+        --argjson now_epoch "$now_epoch" \
+        '
+        .alert_count = ((.alert_count // 0) + 1)
+        | .alerted_at = $now_ts
+        | .updated_at = $now_ts
+        | .updated_epoch = $now_epoch
+        ' "$submit_file" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$submit_file"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+_watchdog_pending_submit_alert() {
+    local pane_target="$1"
+    local instance="$2"
+    local attempts="$3"
+    local display_name="${instance:-$pane_target}"
+    local message="[输入框卡住] Codex 实例 ${display_name} 的输入框在 ${CODEX_PENDING_INPUT_TTL:-300}s 后仍残留未提交内容，自动补提交已尝试 ${attempts} 次仍失败。请检查 tmux pane ${pane_target}。"
+
+    emit_event "pane.submit_stuck" "$display_name" "pane=$pane_target" "attempts=$attempts"
+    _unified_notify "inspector" "$message" "pane.submit_stuck" "high"
+    _unified_notify "human" "$message" "pane.submit_stuck" "high"
+    log_info "[watchdog] Codex 输入框卡住: pane=$pane_target, instance=$display_name, attempts=$attempts"
+}
+
 _watchdog_parse_task_epoch() {
     local ts="$1"
     [[ -n "$ts" && "$ts" != "null" ]] || { echo "0"; return 0; }
@@ -323,6 +381,101 @@ _watchdog_check_one_task() {
     if [[ -n "$pane_target" ]] && check_prompt "$pane_target" 2>/dev/null; then
         _watchdog_idle_warning "$tid" "$claimed_by"
     fi
+}
+
+_watchdog_check_pending_submits() {
+    [[ -d "$PANE_SUBMIT_DIR" ]] || return 0
+
+    shopt -s nullglob
+    for submit_file in "$PANE_SUBMIT_DIR/"*.json; do
+        [[ -f "$submit_file" ]] || continue
+
+        local meta
+        meta=$(jq -r '
+            [
+                (.pane // ""),
+                (.instance // ""),
+                (.cli // ""),
+                (.anchor_head // ""),
+                (.anchor_tail // ""),
+                ((.created_epoch // 0) | tostring),
+                ((.last_attempt_epoch // 0) | tostring),
+                ((.submit_attempts // 0) | tostring),
+                ((.log_size_at_record // 0) | tostring),
+                ((.alert_count // 0) | tostring)
+            ] | join("\u0001")
+        ' "$submit_file" 2>/dev/null) || { rm -f "$submit_file"; continue; }
+
+        local pane_target instance cli_cmd anchor_head anchor_tail created_epoch last_attempt_epoch submit_attempts recorded_log_size alert_count
+        IFS=$'\001' read -r pane_target instance cli_cmd anchor_head anchor_tail created_epoch last_attempt_epoch submit_attempts recorded_log_size alert_count <<< "$meta"
+
+        [[ -n "$pane_target" ]] || { rm -f "$submit_file"; continue; }
+        _cli_uses_codex "$cli_cmd" || { rm -f "$submit_file"; continue; }
+
+        if ! tmux display-message -t "${SESSION_NAME}:${pane_target}" -p '#{pane_id}' &>/dev/null; then
+            rm -f "$submit_file"
+            continue
+        fi
+
+        local current_log_size
+        current_log_size=$(_pane_log_size "$pane_target")
+        if [[ "$current_log_size" -gt "$recorded_log_size" ]]; then
+            rm -f "$submit_file"
+            continue
+        fi
+
+        if ! check_prompt "$pane_target" 2>/dev/null; then
+            rm -f "$submit_file"
+            continue
+        fi
+
+        if ! _pane_tail_matches_pending_submit "$pane_target" "$anchor_head" "$anchor_tail"; then
+            rm -f "$submit_file"
+            continue
+        fi
+
+        local now
+        now=$(date +%s)
+        if [[ "$created_epoch" -gt 0 && $((now - created_epoch)) -lt ${CODEX_PENDING_INPUT_TTL:-300} ]]; then
+            continue
+        fi
+
+        if [[ "$submit_attempts" -ge ${CODEX_PENDING_INPUT_MAX_RETRIES:-2} ]]; then
+            if [[ "$alert_count" -eq 0 ]]; then
+                local now_ts
+                now_ts=$(get_timestamp)
+                _watchdog_pending_submit_alert "$pane_target" "$instance" "$submit_attempts"
+                _watchdog_mark_pending_submit_alerted "$submit_file" "$now_ts" "$now"
+            fi
+            continue
+        fi
+
+        if [[ "$last_attempt_epoch" -gt 0 && $((now - last_attempt_epoch)) -lt ${CODEX_PENDING_INPUT_RETRY_COOLDOWN:-300} ]]; then
+            continue
+        fi
+
+        local now_ts baseline_snapshot next_attempt
+        now_ts=$(get_timestamp)
+        baseline_snapshot=$(_capture_pane_tail "$pane_target")
+        next_attempt=$((submit_attempts + 1))
+
+        _watchdog_touch_pending_submit_retry "$submit_file" "$now_ts" "$now"
+
+        if _retry_codex_pending_submit "$pane_target" "$anchor_head" "$anchor_tail" "$baseline_snapshot" "$current_log_size"; then
+            emit_event "pane.submit_recovered" "${instance:-$pane_target}" "pane=$pane_target" "attempt=$next_attempt"
+            log_info "[watchdog] 已补提交 Codex 输入框草稿: pane=$pane_target, instance=${instance:-$pane_target}, attempt=$next_attempt"
+            rm -f "$submit_file"
+            continue
+        fi
+
+        log_warn "[watchdog] Codex 输入框仍残留未提交内容: pane=$pane_target, instance=${instance:-$pane_target}, attempt=$next_attempt"
+
+        if [[ "$next_attempt" -ge ${CODEX_PENDING_INPUT_MAX_RETRIES:-2} && "$alert_count" -eq 0 ]]; then
+            _watchdog_pending_submit_alert "$pane_target" "$instance" "$next_attempt"
+            _watchdog_mark_pending_submit_alerted "$submit_file" "$now_ts" "$now"
+        fi
+    done
+    shopt -u nullglob
 }
 
 # =============================================================================
@@ -731,6 +884,9 @@ _watchdog_main_loop() {
 
         # pending 任务堆积检测（通知 supervisor 评估）
         _watchdog_check_pending_pileup
+
+        # Codex 输入框残留草稿检测与补提交
+        _watchdog_check_pending_submits
 
         # 日志轮转检查（按 LOG_ROTATE_INTERVAL 频率）
         local now
