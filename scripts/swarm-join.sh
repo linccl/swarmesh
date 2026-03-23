@@ -239,7 +239,9 @@ fi
 log_info "Worktree: $ROLE_WORKTREE (branch: $ROLE_BRANCH)"
 
 # 在角色的 worktree 目录启动 CLI（导出 RUNTIME_DIR 和 SWARM_SESSION 确保 pane 内脚本找到正确路径）
-tmux send-keys -t "$SESSION_NAME:$PANE_TARGET" "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && export RUNTIME_DIR=\"$RUNTIME_DIR\" && export SWARM_SESSION=\"$SESSION_NAME\" && $CLI_CMD" C-m
+_send_keys_enter "$PANE_TARGET" \
+    "cd \"$ROLE_WORKTREE\" && export SWARM_ROLE=\"$ROLE\" && export SWARM_INSTANCE=\"$INSTANCE\" && export RUNTIME_DIR=\"$RUNTIME_DIR\" && export SWARM_SESSION=\"$SESSION_NAME\" && $CLI_CMD" \
+    "$CLI_CMD"
 
 sleep "$CLI_STARTUP_WAIT"
 
@@ -351,10 +353,7 @@ if [[ -n "$INITIAL_TASK" ]]; then
 
     TASK_TMP=$(mktemp "${RUNTIME_DIR}/.task-XXXXXX")
     printf '%s' "$INITIAL_TASK" > "$TASK_TMP"
-    if ! _pane_locked_paste_enter "$PANE_TARGET" "$TASK_TMP" "$CLI_CMD"; then
-        rm -f "$TASK_TMP"
-        die "初始任务发送失败: instance=$INSTANCE pane=$PANE_TARGET"
-    fi
+    _pane_locked_paste_enter "$PANE_TARGET" "$TASK_TMP" "$CLI_CMD"
     rm -f "$TASK_TMP"
 
     log_success "初始任务已派发"

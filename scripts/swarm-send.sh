@@ -218,10 +218,7 @@ log_info "发送任务到 pane: $SESSION_NAME:$TARGET_PANE"
 # flock 防止并发发送同一 pane 时消息交错。
 SEND_TMP=$(mktemp "${RUNTIME_DIR}/.send-XXXXXX")
 printf '%s' "$TASK_CONTENT" > "$SEND_TMP"
-if ! _pane_locked_paste_enter "$TARGET_PANE" "$SEND_TMP"; then
-    rm -f "$SEND_TMP"
-    die "任务发送失败: pane=$TARGET_PANE role=$TARGET_ROLE"
-fi
+_pane_locked_paste_enter "$TARGET_PANE" "$SEND_TMP" "$TARGET_CLI"
 rm -f "$SEND_TMP"
 
 # 等 pipe-pane 将输入文本刷入日志，确保偏移量跳过输入
