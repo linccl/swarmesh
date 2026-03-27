@@ -457,21 +457,29 @@ generate_instance_resume_summary() {
 
         # Git 提交历史（该分支相对于 main/HEAD 的新提交）
         echo "## 最近提交"
-        local main_branch
-        main_branch=$(git -C "$project_dir" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
-            | sed 's|refs/remotes/origin/||')
+        local main_branch=""
+        main_branch=$(
+            git -C "$project_dir" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+                | sed 's|refs/remotes/origin/||' \
+                || true
+        )
         if [[ -z "$main_branch" ]]; then
             for candidate in main master; do
                 if git -C "$project_dir" show-ref --verify --quiet "refs/heads/$candidate" 2>/dev/null; then
                     main_branch="$candidate"; break
                 fi
             done
-            main_branch="${main_branch:-main}"
         fi
         if git -C "$project_dir" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
-            local commits
-            commits=$(git -C "$project_dir" log "$branch" --not "$main_branch" \
-                --oneline --no-decorate -n "${RESUME_SUMMARY_MAX_COMMITS:-20}" 2>/dev/null)
+            local commits=""
+            if [[ -n "$main_branch" ]] \
+                && git -C "$project_dir" show-ref --verify --quiet "refs/heads/$main_branch" 2>/dev/null; then
+                commits=$(git -C "$project_dir" log "$branch" --not "$main_branch" \
+                    --oneline --no-decorate -n "${RESUME_SUMMARY_MAX_COMMITS:-20}" 2>/dev/null || true)
+            else
+                commits=$(git -C "$project_dir" log "$branch" \
+                    --oneline --no-decorate -n "${RESUME_SUMMARY_MAX_COMMITS:-20}" 2>/dev/null || true)
+            fi
             if [[ -n "$commits" ]]; then
                 echo '```'
                 echo "$commits"
@@ -609,10 +617,12 @@ save_all_resume_summaries() {
     while IFS='|' read -r inst branch; do
         [[ -n "$inst" ]] || continue
         # 兜底：state.json 无 branch 字段（旧版本）
-        [[ -n "$branch" && "$branch" != "null" ]] || branch=$(swarm_role_branch_name "$project_dir" "$inst")
-        generate_instance_resume_summary \
+        [[ -n "$branch" && "$branch" != "null" ]] || branch=$(swarm_role_branch_name "$project_dir" "$inst" || true)
+        if ! generate_instance_resume_summary \
             "$inst" "$branch" "$project_dir" \
-            "${RESUME_SUMMARY_DIR:-$RUNTIME_DIR/resume}/${inst}.md"
+            "${RESUME_SUMMARY_DIR:-$RUNTIME_DIR/resume}/${inst}.md"; then
+            log_warn "生成恢复摘要失败: instance=$inst branch=${branch:-unknown}"
+        fi
     done < <(jq -r '.panes[] | "\(.instance // .role)|\(.branch // "")"' "$state_file" 2>/dev/null)
 }
 
@@ -1052,7 +1062,6 @@ _pane_locked_paste_enter() {
     local content_file="$2"
     local cli_type="${3:-}"
     local buf_name="pane-$$-$RANDOM"
-    local cli_cmd="$cli_hint"
     local settle_snapshot=""
     local anchor_head=""
     local anchor_tail=""
@@ -1099,7 +1108,7 @@ _accept_codex_trust_prompt_if_needed() {
 
         if [[ "$pane_text" == *"Do you trust the contents of this directory?"* ]] \
             || [[ "$pane_text" == *"Press enter to continue"* ]]; then
-            tmux send-keys -t "$pane_ref" Enter
+            tmux send-keys -l -t "$pane_ref" $'\r'
             sleep 1
             continue
         fi
@@ -1114,6 +1123,10 @@ send_init_to_pane() {
     local pane_target="$1"
     local init_msg="$2"
     local cli_type="${3:-}"
+
+    if _is_codex_cli "$cli_type"; then
+        _accept_codex_trust_prompt_if_needed "$pane_target"
+    fi
 
     local init_tmp
     init_tmp=$(mktemp "${RUNTIME_DIR}/.init-XXXXXX")

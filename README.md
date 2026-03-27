@@ -43,6 +43,15 @@ Each role runs in an isolated tmux pane with its own role configuration, inbox, 
 
 `swarm-cli.sh` is the universal control entry point, usable from any terminal:
 
+For long-term use, add the `scripts/` directory to your shell `PATH` so you can call `swarm-cli.sh`, `swarm-msg.sh`, `swarm-start.sh`, etc. directly:
+
+```bash
+# ~/.zshrc or ~/.bashrc
+export PATH="/path/to/swarmesh/scripts:$PATH"
+```
+
+Reload your shell after updating the config, then you can run commands like `swarm-cli.sh start ~/my-app` directly.
+
 ```bash
 # Start swarm (interactive profile selection)
 ./scripts/swarm-cli.sh start ~/my-app
@@ -519,6 +528,15 @@ Supports mixing different AI CLIs — frontend uses Gemini, backend uses Claude,
 #### 通用 CLI（推荐）
 
 `swarm-cli.sh` 是通用主控入口，任何终端都能使用：
+
+为了长期使用，建议把 `scripts/` 目录加入 shell 的 `PATH`，这样可以直接调用 `swarm-cli.sh`、`swarm-msg.sh`、`swarm-start.sh` 等命令：
+
+```bash
+# ~/.zshrc 或 ~/.bashrc
+export PATH="/path/to/swarmesh/scripts:$PATH"
+```
+
+修改后重新加载 shell，即可直接执行 `swarm-cli.sh start ~/my-app` 这类命令。
 
 ```bash
 # 启动蜂群（交互式选择 profile）
