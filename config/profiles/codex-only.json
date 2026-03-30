@@ -6,7 +6,7 @@
   "roles": [
     {
       "name": "frontend",
-      "cli": "codex -a never -s danger-full-access chat",
+      "cli": "codex -a never -s danger-full-access",
       "config": "core/frontend.md",
       "alias": "fe,front,frontend,0",
       "title": "🎨 前端专家",
@@ -14,7 +14,7 @@
     },
     {
       "name": "backend",
-      "cli": "codex -a never -s danger-full-access chat",
+      "cli": "codex -a never -s danger-full-access",
       "config": "core/backend.md",
       "alias": "be,back,backend,1",
       "title": "⚙️ 后端专家",
@@ -22,7 +22,7 @@
     },
     {
       "name": "reviewer",
-      "cli": "codex -a never -s danger-full-access chat",
+      "cli": "codex -a never -s danger-full-access",
       "config": "quality/reviewer.md",
       "alias": "review,rv,reviewer,2",
       "title": "🔍 代码审查员",
@@ -30,7 +30,7 @@
     },
     {
       "name": "supervisor",
-      "cli": "codex -a never -s danger-full-access chat",
+      "cli": "codex -a never -s danger-full-access",
       "config": "management/supervisor.md",
       "alias": "sup,supervisor,3",
       "title": "🧭 编排者",
@@ -38,7 +38,7 @@
     },
     {
       "name": "inspector",
-      "cli": "codex -a never -s danger-full-access chat",
+      "cli": "codex -a never -s danger-full-access",
       "config": "management/inspector.md",
       "alias": "insp,inspector,4",
       "title": "✅ 督查员",

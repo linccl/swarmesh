@@ -731,11 +731,7 @@ for ((i=0; i<ROLES_COUNT; i++)); do
         # 使用共享函数构建初始化消息（与 swarm-join.sh 统一）
         INIT_MSG=$(build_init_message "$CONFIG_FILE" "$ROLE_BRANCH" "$TEAM_INFO")
 
-        INIT_TMP=$(mktemp "${RUNTIME_DIR}/.init-XXXXXX")
-        printf '%s' "$INIT_MSG" > "$INIT_TMP"
-        _pane_locked_paste_enter "$PANE_TARGET" "$INIT_TMP" "$CLI"
-        rm -f "$INIT_TMP"
-        sleep 1
+        send_init_to_pane "$PANE_TARGET" "$INIT_MSG" "$CLI"
     fi
 
     # 启用日志记录

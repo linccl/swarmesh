@@ -325,6 +325,25 @@ swarm-msg.sh reject-task <task-id> "Test coverage insufficient"
 
 If a task stays in `pending_review` longer than `PENDING_REVIEW_TTL`, the watchdog notifies the human operator.
 
+#### Workflow Stage Compact
+
+When `WORKFLOW_STAGE_COMPACT_ENABLED=true`, the workflow engine compacts role context after each completed stage:
+
+- Sends `WORKFLOW_STAGE_COMPACT_COMMAND` to each role that participated in the stage
+- Rehydrates that role with explicit identity, branch, role config path, team roster, and stage result summary
+- Treats compact failures as warnings so the workflow can continue
+
+This keeps long-running sessions smaller without assuming the CLI will retain role identity correctly after compaction.
+
+#### Supervisor-Orchestrated Compact
+
+When you start the swarm normally and collaborate with `supervisor` directly, automatic compaction can also happen without the workflow engine:
+
+- `group.completed` triggers compact + rehydrate for roles related to that task group
+- `task.composed` triggers compact + rehydrate for roles related to the composed parent task
+- Each compact attempt is written to `SUPERVISOR_STAGE_LOG_FILE`
+- Additional events are emitted: `context.compacted`, `context.rehydrated`, `context.compact_failed`, `context.compact_skipped`
+
 #### System Maintenance
 
 ```bash
@@ -387,6 +406,18 @@ All parameters are centralized in `config/defaults.conf` with 3-tier priority: e
 | `RESUME_SUMMARY_MAX_TASKS` | 10 | Max completed/pending tasks in resume summary |
 | `RESUME_PANE_LINES` | 50 | Capture last N lines of each pane for resume |
 | `RESUME_SUMMARY_MAX_MESSAGES` | 10 | Max recent messages in resume summary |
+| `WORKFLOW_STAGE_COMPACT_ENABLED` | true | Enable stage-end compact + rehydrate in workflow engine |
+| `WORKFLOW_STAGE_COMPACT_COMMAND` | `/compact` | Command sent to the role CLI before rehydrate |
+| `WORKFLOW_STAGE_RESULT_MAX_LINES` | 12 | Max result lines per task included in the stage summary |
+| `WORKFLOW_STAGE_REHYDRATE_INCLUDE_TEAM` | true | Include current team members in the rehydrate message |
+| `WORKFLOW_STAGE_COMPACT_SETTLE_WAIT` | 2 | Seconds to wait after compact before rehydrate |
+| `SUPERVISOR_STAGE_COMPACT_ENABLED` | true | Enable compact + rehydrate in supervisor-driven orchestration |
+| `SUPERVISOR_STAGE_COMPACT_ON_GROUP_COMPLETED` | true | Trigger on `group.completed` |
+| `SUPERVISOR_STAGE_COMPACT_ON_TASK_COMPOSED` | true | Trigger on `task.composed` |
+| `SUPERVISOR_STAGE_NOTIFY` | true | Notify supervisors after auto compact |
+| `SUPERVISOR_STAGE_LOG_FILE` | `$LOGS_DIR/context-compact.log` | Audit log for compact / rehydrate actions |
+| `CODEX_COMPACT_RETRY_COUNT` | 3 | Retry count when Codex is not in a compactable idle state |
+| `CODEX_COMPACT_RETRY_DELAY` | 5 | Retry delay in seconds for Codex compact |
 | `DEFAULT_SUPERVISOR_COUNT` | 1 | Initial supervisor count on startup (scales dynamically) |
 | `SUPERVISOR_MAX_COUNT` | 5 | Max supervisor count (prevents unbounded scaling) |
 | `SUPERVISOR_SCALE_COOLDOWN` | 300 | Min interval between supervisor expansions (seconds) |
@@ -490,7 +521,7 @@ Supports mixing different AI CLIs — frontend uses Gemini, backend uses Claude,
 
 ## 本仓库变更点（linccl 版本）
 
-- 新增 `codex-only` profile：提供 `config/profiles/codex-only.json`，仅使用 Codex CLI 的 5 角色精简团队配置，适合“本机只装 Codex/统一 CLI 行为”的场景；默认以 `codex -a never -s danger-full-access chat` 启动
+- 新增 `codex-only` profile：提供 `config/profiles/codex-only.json`，仅使用 Codex CLI 的 5 角色精简团队配置，适合“本机只装 Codex/统一 CLI 行为”的场景；默认以 `codex -a never -s danger-full-access` 启动
 - 默认等待时间调整：将 `swarm-cli.sh task` 与 `swarm-msg.sh wait` 的默认等待超时统一为 `6000s`，减少长任务被误判超时的情况
 - macOS 兼容性增强：修正 BSD `mktemp` 模板用法，并在缺少 `flock`/`timeout` 时提供 polyfill（优先使用 `gtimeout`），保证状态文件更新与等待逻辑可用
 - 扫描日志时间戳统一：`swarm-scan.sh` 支持读取 `config/defaults.conf` 的时间戳格式（`LOG_TIMESTAMP_FORMAT`），便于统一日志展示
@@ -810,6 +841,25 @@ swarm-msg.sh reject-task <task-id> "测试覆盖率不足"
 
 如果任务在 `pending_review` 状态超过 `PENDING_REVIEW_TTL`，看门狗会通知人类操作者。
 
+#### Workflow 阶段 Compact
+
+当 `WORKFLOW_STAGE_COMPACT_ENABLED=true` 时，workflow 引擎会在每个阶段完成后对本阶段参与角色执行一次 compact + rehydrate：
+
+- 先发送 `WORKFLOW_STAGE_COMPACT_COMMAND`
+- 再显式回灌角色身份、分支、角色配置路径、团队成员和阶段结果摘要
+- compact 失败只记 warning，不中断 workflow
+
+这样可以收敛长会话上下文，同时避免把“角色身份和协作方式是否还能记住”押注在 CLI 自身的 compact 行为上。
+
+#### Supervisor 编排流 Compact
+
+如果你是正常启动蜂群后直接和 `supervisor` 协作，不走 workflow，引擎现在也会在稳定完成点自动执行 compact + rehydrate：
+
+- `group.completed`：对该任务组相关角色触发
+- `task.composed`：对子任务归一后的父任务相关角色触发
+- 每次 compact 都会写入 `SUPERVISOR_STAGE_LOG_FILE`
+- 同时发射事件：`context.compacted`、`context.rehydrated`、`context.compact_failed`、`context.compact_skipped`
+
 #### 系统维护
 
 ```bash
@@ -872,6 +922,18 @@ swarm-msg.sh set-limit 0      # 取消上限
 | `RESUME_SUMMARY_MAX_TASKS` | 10 | 恢复摘要中最多包含的已完成/未完成任务数 |
 | `RESUME_PANE_LINES` | 50 | 捕获 pane 最后 N 行用于恢复 |
 | `RESUME_SUMMARY_MAX_MESSAGES` | 10 | 恢复摘要中的最近消息数 |
+| `WORKFLOW_STAGE_COMPACT_ENABLED` | true | workflow 每阶段完成后是否执行 compact + rehydrate |
+| `WORKFLOW_STAGE_COMPACT_COMMAND` | `/compact` | 发送给角色 CLI 的 compact 命令 |
+| `WORKFLOW_STAGE_RESULT_MAX_LINES` | 12 | 每个任务结果写入阶段摘要的最大行数 |
+| `WORKFLOW_STAGE_REHYDRATE_INCLUDE_TEAM` | true | rehydrate 时是否重灌团队成员信息 |
+| `WORKFLOW_STAGE_COMPACT_SETTLE_WAIT` | 2 | compact 命令发送后等待秒数 |
+| `SUPERVISOR_STAGE_COMPACT_ENABLED` | true | supervisor 编排流是否自动 compact + rehydrate |
+| `SUPERVISOR_STAGE_COMPACT_ON_GROUP_COMPLETED` | true | `group.completed` 时触发 |
+| `SUPERVISOR_STAGE_COMPACT_ON_TASK_COMPOSED` | true | `task.composed` 时触发 |
+| `SUPERVISOR_STAGE_NOTIFY` | true | 自动 compact 后是否通知 supervisor |
+| `SUPERVISOR_STAGE_LOG_FILE` | `$LOGS_DIR/context-compact.log` | compact / rehydrate 审计日志 |
+| `CODEX_COMPACT_RETRY_COUNT` | 3 | Codex 不在可 compact 空闲态时的重试次数 |
+| `CODEX_COMPACT_RETRY_DELAY` | 5 | Codex compact 重试间隔（秒） |
 | `DEFAULT_SUPERVISOR_COUNT` | 1 | 启动时 supervisor 数量（按需动态扩展） |
 | `SUPERVISOR_MAX_COUNT` | 5 | supervisor 最大数量上限（防无限扩展） |
 | `SUPERVISOR_SCALE_COOLDOWN` | 300 | 两次扩展之间的最小间隔（秒） |

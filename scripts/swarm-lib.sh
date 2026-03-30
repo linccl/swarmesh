@@ -760,6 +760,18 @@ _pane_instance_name() {
     _pane_state_field "$1" "instance"
 }
 
+_pane_role_name() {
+    _pane_state_field "$1" "role"
+}
+
+_pane_branch_name() {
+    _pane_state_field "$1" "branch"
+}
+
+_pane_config_path() {
+    _pane_state_field "$1" "config"
+}
+
 _pane_log_size() {
     local log_file
     log_file=$(_pane_log_file "$1")
@@ -1098,16 +1110,30 @@ _pane_locked_paste_enter() {
 
 # Codex 首次进入新 worktree 时会先询问是否信任目录。
 # 如果此时直接 paste 初始化提示词，会把整段提示词打进确认界面，导致 Codex 退出。
-_accept_codex_trust_prompt_if_needed() {
+_codex_handle_startup_interstitials() {
     local pane_target="$1"
     local pane_ref="${SESSION_NAME}:${pane_target}"
     local attempt pane_text
 
-    for attempt in 1 2 3 4 5; do
+    for attempt in 1 2 3 4 5 6 7 8; do
         pane_text=$(tmux capture-pane -t "$pane_ref" -p -S -80 2>/dev/null || true)
 
+        if [[ "$pane_text" == *"Update available!"* ]] \
+            && [[ "$pane_text" == *"1. Update now"* ]] \
+            && [[ "$pane_text" == *"2. Skip"* ]] \
+            && [[ "$pane_text" == *"Press enter to continue"* ]]; then
+            tmux send-keys -t "$pane_ref" "2"
+            sleep "${CODEX_PASTE_DELAY:-0.5}"
+            tmux send-keys -l -t "$pane_ref" $'\r'
+            sleep 1
+            continue
+        fi
+
         if [[ "$pane_text" == *"Do you trust the contents of this directory?"* ]] \
-            || [[ "$pane_text" == *"Press enter to continue"* ]]; then
+            && [[ "$pane_text" == *"1. Yes, continue"* ]] \
+            && [[ "$pane_text" == *"Press enter to continue"* ]]; then
+            tmux send-keys -t "$pane_ref" "1"
+            sleep "${CODEX_PASTE_DELAY:-0.5}"
             tmux send-keys -l -t "$pane_ref" $'\r'
             sleep 1
             continue
@@ -1115,6 +1141,32 @@ _accept_codex_trust_prompt_if_needed() {
 
         break
     done
+}
+
+_wait_codex_ready_for_input() {
+    local pane_target="$1"
+    local max_attempts="${CODEX_READY_MAX_ATTEMPTS:-24}"
+    local interval="${CODEX_READY_POLL_INTERVAL:-1}"
+    local pane_ref="${SESSION_NAME}:${pane_target}"
+    local attempt pane_text
+
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        _codex_handle_startup_interstitials "$pane_target"
+        pane_text=$(tmux capture-pane -t "$pane_ref" -p -S -120 2>/dev/null || true)
+
+        if [[ "$pane_text" == *"Starting MCP servers"* ]]; then
+            sleep "$interval"
+            continue
+        fi
+
+        if check_prompt "$pane_target"; then
+            return 0
+        fi
+
+        sleep "$interval"
+    done
+
+    return 1
 }
 
 # 通过 tmux paste-buffer 发送初始化消息到 pane
@@ -1125,7 +1177,9 @@ send_init_to_pane() {
     local cli_type="${3:-}"
 
     if _is_codex_cli "$cli_type"; then
-        _accept_codex_trust_prompt_if_needed "$pane_target"
+        if ! _wait_codex_ready_for_input "$pane_target"; then
+            log_warn "Codex pane not ready for init submit: ${SESSION_NAME}:${pane_target}"
+        fi
     fi
 
     local init_tmp
@@ -1134,6 +1188,387 @@ send_init_to_pane() {
     _pane_locked_paste_enter "$pane_target" "$init_tmp" "$cli_type"
     rm -f "$init_tmp"
     sleep 1
+}
+
+_build_team_info_text() {
+    local state_file="${1:-${STATE_FILE:-$RUNTIME_DIR/state.json}}"
+    [[ -f "$state_file" ]] || return 0
+
+    jq -r '
+        .panes[] |
+        "- \(.instance // .role)\(if (.instance // .role) != (.role // "") then " (角色: \(.role))" else "" end)\(if (.branch // "") != "" then " [branch: \(.branch)]" else "" end)"
+    ' "$state_file" 2>/dev/null
+}
+
+_append_context_compact_log() {
+    local trigger="$1"
+    local target="$2"
+    local status="$3"
+    local detail="$4"
+    local log_file="${SUPERVISOR_STAGE_LOG_FILE:-$LOGS_DIR/context-compact.log}"
+
+    mkdir -p "$(dirname "$log_file")"
+    {
+        printf '[%s] trigger=%s target=%s status=%s detail=%s\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$trigger" "$target" "$status" "$detail"
+    } >> "$log_file"
+}
+
+_task_file_by_id() {
+    local task_id="$1"
+    local dir
+    for dir in pending processing completed failed blocked paused pending_review; do
+        if [[ -f "$TASKS_DIR/$dir/$task_id.json" ]]; then
+            echo "$TASKS_DIR/$dir/$task_id.json"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_collect_group_roles() {
+    local group_id="$1"
+    local group_file="$TASKS_DIR/groups/$group_id.json"
+    [[ -f "$group_file" ]] || return 0
+
+    local task_id task_file assigned_to claimed_by role
+    while IFS= read -r task_id; do
+        [[ -n "$task_id" ]] || continue
+        task_file=$(_task_file_by_id "$task_id") || continue
+
+        assigned_to=$(jq -r '.assigned_to // ""' "$task_file" 2>/dev/null)
+        claimed_by=$(jq -r '.claimed_by // ""' "$task_file" 2>/dev/null)
+
+        if [[ -n "$claimed_by" && "$claimed_by" != "null" ]]; then
+            role=$(jq -r --arg inst "$claimed_by" '.panes[] | select(.instance == $inst) | .role // ""' "$STATE_FILE" 2>/dev/null | head -1)
+            [[ -n "$role" ]] && echo "$role"
+        fi
+
+        if [[ -n "$assigned_to" && "$assigned_to" != "null" ]]; then
+            role=$(jq -r --arg q "$assigned_to" '
+                (.panes[] | select(.instance == $q) | .role) //
+                (.panes[] | select(.role == $q) | .role) //
+                empty
+            ' "$STATE_FILE" 2>/dev/null | head -1)
+            [[ -n "$role" ]] && echo "$role"
+        fi
+    done < <(jq -r '.tasks[]' "$group_file" 2>/dev/null)
+}
+
+_collect_parent_related_roles() {
+    local parent_id="$1"
+    local parent_file
+    parent_file=$(_task_file_by_id "$parent_id") || return 0
+
+    local claimed_by assigned_to role sub_id sub_file sub_claimed_by sub_assigned_to
+    claimed_by=$(jq -r '.claimed_by // ""' "$parent_file" 2>/dev/null)
+    assigned_to=$(jq -r '.assigned_to // ""' "$parent_file" 2>/dev/null)
+
+    if [[ -n "$claimed_by" && "$claimed_by" != "null" ]]; then
+        role=$(jq -r --arg inst "$claimed_by" '.panes[] | select(.instance == $inst) | .role // ""' "$STATE_FILE" 2>/dev/null | head -1)
+        [[ -n "$role" ]] && echo "$role"
+    fi
+
+    if [[ -n "$assigned_to" && "$assigned_to" != "null" ]]; then
+        role=$(jq -r --arg q "$assigned_to" '
+            (.panes[] | select(.instance == $q) | .role) //
+            (.panes[] | select(.role == $q) | .role) //
+            empty
+        ' "$STATE_FILE" 2>/dev/null | head -1)
+        [[ -n "$role" ]] && echo "$role"
+    fi
+
+    while IFS= read -r sub_id; do
+        [[ -n "$sub_id" ]] || continue
+        sub_file=$(_task_file_by_id "$sub_id") || continue
+        sub_claimed_by=$(jq -r '.claimed_by // ""' "$sub_file" 2>/dev/null)
+        sub_assigned_to=$(jq -r '.assigned_to // ""' "$sub_file" 2>/dev/null)
+
+        if [[ -n "$sub_claimed_by" && "$sub_claimed_by" != "null" ]]; then
+            role=$(jq -r --arg inst "$sub_claimed_by" '.panes[] | select(.instance == $inst) | .role // ""' "$STATE_FILE" 2>/dev/null | head -1)
+            [[ -n "$role" ]] && echo "$role"
+        fi
+
+        if [[ -n "$sub_assigned_to" && "$sub_assigned_to" != "null" ]]; then
+            role=$(jq -r --arg q "$sub_assigned_to" '
+                (.panes[] | select(.instance == $q) | .role) //
+                (.panes[] | select(.role == $q) | .role) //
+                empty
+            ' "$STATE_FILE" 2>/dev/null | head -1)
+            [[ -n "$role" ]] && echo "$role"
+        fi
+    done < <(jq -r '.subtasks // [] | .[]' "$parent_file" 2>/dev/null)
+}
+
+build_stage_rehydrate_message() {
+    local pane_target="$1"
+    local stage_num="$2"
+    local stage_name="$3"
+    local requirement="$4"
+    local stage_summary="$5"
+
+    local role instance branch config_path cli_cmd team_info
+    role=$(_pane_role_name "$pane_target")
+    instance=$(_pane_instance_name "$pane_target")
+    branch=$(_pane_branch_name "$pane_target")
+    config_path=$(_pane_config_path "$pane_target")
+    cli_cmd=$(_pane_cli_command "$pane_target")
+
+    if [[ -z "$instance" ]]; then
+        instance="$role"
+    fi
+
+    if [[ -z "$config_path" || "$config_path" == "null" ]]; then
+        config_path="unknown"
+    fi
+
+    if [[ "${WORKFLOW_STAGE_REHYDRATE_INCLUDE_TEAM:-true}" == "true" ]]; then
+        team_info=$(_build_team_info_text)
+    fi
+
+    cat <<EOF
+[Swarm 阶段恢复]
+你刚完成 workflow 阶段压缩。以下信息用于恢复你的稳定认知和当前阶段记忆。
+
+## 你的身份
+- 实例: ${instance}
+- 角色: ${role}
+- CLI: ${cli_cmd}
+- 分支: ${branch}
+- 角色配置: ${config_path}
+
+请重新读取你的角色配置文件并严格按该角色工作:
+${CONFIG_DIR}/roles/${config_path}
+
+## 当前工作流
+- 阶段: ${stage_num} / ${stage_name}
+- 需求: ${requirement}
+
+## 协作提醒
+- 只与当前团队成员协作
+- 需要其他角色配合时，使用 swarm-msg.sh send <角色> "消息"
+- 完成后继续用 swarm-msg.sh complete-task / publish / reply 等标准命令
+
+$(if [[ -n "$team_info" ]]; then
+cat <<TEAM_EOF
+## 当前团队成员
+${team_info}
+TEAM_EOF
+fi)
+
+## 上阶段摘要
+${stage_summary}
+
+## 恢复动作
+1. 先确认你的角色职责和分支状态
+2. 以上阶段摘要为准继续后续工作
+3. 如需跨角色协作，显式重发关键约定，不依赖旧上下文隐式记忆
+EOF
+}
+
+compact_and_rehydrate_pane() {
+    local pane_target="$1"
+    local stage_num="$2"
+    local stage_name="$3"
+    local requirement="$4"
+    local stage_summary="$5"
+
+    local cli_cmd compact_cmd rehydrate_msg compact_tmp
+    cli_cmd=$(_pane_cli_command "$pane_target")
+    compact_cmd="${WORKFLOW_STAGE_COMPACT_COMMAND:-/compact}"
+
+    if [[ -z "$pane_target" || -z "$cli_cmd" ]]; then
+        log_warn "[compact_and_rehydrate_pane] 缺少 pane 或 cli 信息: pane=$pane_target cli=$cli_cmd"
+        return 1
+    fi
+
+    rehydrate_msg=$(build_stage_rehydrate_message "$pane_target" "$stage_num" "$stage_name" "$requirement" "$stage_summary")
+
+    if [[ -n "$compact_cmd" ]]; then
+        if _is_codex_cli "$cli_cmd"; then
+            if ! _wait_codex_compact_ready "$pane_target"; then
+                log_warn "[compact_and_rehydrate_pane] Codex 未进入可 compact 空闲态: pane=$pane_target"
+                return 2
+            fi
+        fi
+
+        compact_tmp=$(mktemp "${RUNTIME_DIR}/.compact-XXXXXX")
+        printf '%s' "$compact_cmd" > "$compact_tmp"
+        _pane_locked_paste_enter "$pane_target" "$compact_tmp" "$cli_cmd" || {
+            rm -f "$compact_tmp"
+            return 1
+        }
+        rm -f "$compact_tmp"
+        sleep "${WORKFLOW_STAGE_COMPACT_SETTLE_WAIT:-2}"
+    fi
+
+    send_init_to_pane "$pane_target" "$rehydrate_msg" "$cli_cmd"
+}
+
+_pane_tail_snapshot() {
+    local pane_target="$1"
+    local capture_lines="${2:-80}"
+    tmux capture-pane -t "${SESSION_NAME}:${pane_target}" -p -S "-${capture_lines}" 2>/dev/null || true
+}
+
+_codex_compact_ready() {
+    local pane_target="$1"
+    local snapshot
+    snapshot=$(_pane_tail_snapshot "$pane_target" 80)
+
+    check_prompt "$pane_target" || return 1
+    [[ "$snapshot" == *"Working ("* ]] && return 1
+    [[ "$snapshot" == *"Starting MCP servers"* ]] && return 1
+    [[ "$snapshot" == *"task is in progress"* ]] && return 1
+    [[ "$snapshot" == *"disabled while a task is in progress"* ]] && return 1
+
+    return 0
+}
+
+_wait_codex_compact_ready() {
+    local pane_target="$1"
+    local retries="${CODEX_COMPACT_RETRY_COUNT:-3}"
+    local delay="${CODEX_COMPACT_RETRY_DELAY:-5}"
+    local attempt
+
+    for ((attempt=0; attempt<=retries; attempt++)); do
+        if _codex_compact_ready "$pane_target"; then
+            return 0
+        fi
+        [[ $attempt -lt $retries ]] || break
+        sleep "$delay"
+    done
+
+    return 1
+}
+
+_build_group_stage_summary() {
+    local group_id="$1"
+    local group_file="$TASKS_DIR/groups/$group_id.json"
+    [[ -f "$group_file" ]] || return 0
+
+    local group_title
+    group_title=$(jq -r '.title // ""' "$group_file" 2>/dev/null)
+
+    local summary="任务组完成:\n- group_id: ${group_id}\n- 标题: ${group_title}\n"
+    local task_id task_file title result trimmed
+    while IFS= read -r task_id; do
+        [[ -n "$task_id" ]] || continue
+        task_file=$(_task_file_by_id "$task_id") || continue
+        title=$(jq -r '.title // ""' "$task_file" 2>/dev/null)
+        result=$(jq -r '.result // ""' "$task_file" 2>/dev/null | sed '/^[[:space:]]*$/d' | head -n "${WORKFLOW_STAGE_RESULT_MAX_LINES:-12}")
+        summary+=$'\n'"- 任务: ${task_id} ${title}"
+        if [[ -n "$result" ]]; then
+            summary+=$'\n'"  结果摘要:"
+            while IFS= read -r trimmed; do
+                [[ -n "$trimmed" ]] && summary+=$'\n'"    ${trimmed}"
+            done <<< "$result"
+        fi
+    done < <(jq -r '.tasks[]' "$group_file" 2>/dev/null)
+
+    printf '%b' "$summary"
+}
+
+_build_parent_compose_summary() {
+    local parent_id="$1"
+    local parent_file
+    parent_file=$(_task_file_by_id "$parent_id") || return 0
+
+    local title result line
+    title=$(jq -r '.title // ""' "$parent_file" 2>/dev/null)
+    result=$(jq -r '.result // ""' "$parent_file" 2>/dev/null | sed '/^[[:space:]]*$/d' | head -n "${WORKFLOW_STAGE_RESULT_MAX_LINES:-12}")
+
+    local summary="父任务归一完成:\n- parent_id: ${parent_id}\n- 标题: ${title}\n"
+    if [[ -n "$result" ]]; then
+        summary+=$'\n'"- 汇总结果:"
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && summary+=$'\n'"  ${line}"
+        done <<< "$result"
+    fi
+
+    printf '%b' "$summary"
+}
+
+compact_group_roles() {
+    local group_id="$1"
+    local requirement="$2"
+    [[ "${SUPERVISOR_STAGE_COMPACT_ENABLED:-true}" == "true" ]] || return 0
+    [[ "${SUPERVISOR_STAGE_COMPACT_ON_GROUP_COMPLETED:-true}" == "true" ]] || return 0
+
+    local summary role pane_target instance
+    summary=$(_build_group_stage_summary "$group_id")
+
+    local touched=""
+    while IFS= read -r role; do
+        [[ -n "$role" ]] || continue
+        if ! IFS='|' read -r pane_target instance <<< "$(resolve_role_to_pane "$role" 2>/dev/null)"; then
+            _append_context_compact_log "group.completed:$group_id" "$role" "skipped" "no-online-instance"
+            emit_event "context.compact_skipped" "$role" "trigger=group.completed" "group_id=$group_id" "reason=no-online-instance"
+            continue
+        fi
+
+        local compact_rc=0
+        if compact_and_rehydrate_pane "$pane_target" "supervisor" "group.completed:${group_id}" "$requirement" "$summary"; then
+            _append_context_compact_log "group.completed:$group_id" "${instance:-$role}" "ok" "compact+rehydrate"
+            emit_event "context.compacted" "$role" "trigger=group.completed" "group_id=$group_id" "instance=${instance:-$role}"
+            emit_event "context.rehydrated" "$role" "trigger=group.completed" "group_id=$group_id" "instance=${instance:-$role}"
+            touched+="${touched:+,}${instance:-$role}"
+        else
+            compact_rc=$?
+            if [[ $compact_rc -eq 2 ]]; then
+                _append_context_compact_log "group.completed:$group_id" "${instance:-$role}" "skipped" "codex-not-idle"
+                emit_event "context.compact_skipped" "$role" "trigger=group.completed" "group_id=$group_id" "instance=${instance:-$role}" "reason=codex-not-idle"
+            else
+                _append_context_compact_log "group.completed:$group_id" "${instance:-$role}" "failed" "compact-or-rehydrate-error"
+                emit_event "context.compact_failed" "$role" "trigger=group.completed" "group_id=$group_id" "instance=${instance:-$role}"
+            fi
+        fi
+    done < <(_collect_group_roles "$group_id" | awk '!seen[$0]++')
+
+    if [[ "${SUPERVISOR_STAGE_NOTIFY:-true}" == "true" && -n "$touched" ]]; then
+        _notify_all_supervisors "[上下文收敛] 任务组 $group_id 已触发 compact + rehydrate。角色: $touched" "context.compacted" "normal"
+    fi
+}
+
+compact_parent_roles() {
+    local parent_id="$1"
+    local requirement="$2"
+    [[ "${SUPERVISOR_STAGE_COMPACT_ENABLED:-true}" == "true" ]] || return 0
+    [[ "${SUPERVISOR_STAGE_COMPACT_ON_TASK_COMPOSED:-true}" == "true" ]] || return 0
+
+    local summary role pane_target instance
+    summary=$(_build_parent_compose_summary "$parent_id")
+
+    local touched=""
+    while IFS= read -r role; do
+        [[ -n "$role" ]] || continue
+        if ! IFS='|' read -r pane_target instance <<< "$(resolve_role_to_pane "$role" 2>/dev/null)"; then
+            _append_context_compact_log "task.composed:$parent_id" "$role" "skipped" "no-online-instance"
+            emit_event "context.compact_skipped" "$role" "trigger=task.composed" "parent_id=$parent_id" "reason=no-online-instance"
+            continue
+        fi
+
+        local compact_rc=0
+        if compact_and_rehydrate_pane "$pane_target" "supervisor" "task.composed:${parent_id}" "$requirement" "$summary"; then
+            _append_context_compact_log "task.composed:$parent_id" "${instance:-$role}" "ok" "compact+rehydrate"
+            emit_event "context.compacted" "$role" "trigger=task.composed" "parent_id=$parent_id" "instance=${instance:-$role}"
+            emit_event "context.rehydrated" "$role" "trigger=task.composed" "parent_id=$parent_id" "instance=${instance:-$role}"
+            touched+="${touched:+,}${instance:-$role}"
+        else
+            compact_rc=$?
+            if [[ $compact_rc -eq 2 ]]; then
+                _append_context_compact_log "task.composed:$parent_id" "${instance:-$role}" "skipped" "codex-not-idle"
+                emit_event "context.compact_skipped" "$role" "trigger=task.composed" "parent_id=$parent_id" "instance=${instance:-$role}" "reason=codex-not-idle"
+            else
+                _append_context_compact_log "task.composed:$parent_id" "${instance:-$role}" "failed" "compact-or-rehydrate-error"
+                emit_event "context.compact_failed" "$role" "trigger=task.composed" "parent_id=$parent_id" "instance=${instance:-$role}"
+            fi
+        fi
+    done < <(_collect_parent_related_roles "$parent_id" | awk '!seen[$0]++')
+
+    if [[ "${SUPERVISOR_STAGE_NOTIFY:-true}" == "true" && -n "$touched" ]]; then
+        _notify_all_supervisors "[上下文收敛] 父任务 $parent_id 已触发 compact + rehydrate。角色: $touched" "context.compacted" "normal"
+    fi
 }
 
 # =============================================================================
@@ -1197,7 +1632,7 @@ _get_delivery_rule() {
         rule=$(jq -r --arg cat "$category" '.delivery_rules[$cat] // .delivery_rules["default"] // "dual"' "$policy_file" 2>/dev/null)
         case "${rule:-dual}" in
             dual|inbox_only) echo "$rule" ;;
-            *) log_warn "[_get_delivery_rule] 未知规则: $rule (类别: $category)，回退到 dual"; echo "dual" ;;
+            *) log_warn "[_get_delivery_rule] 未知规则: ${rule} (类别: ${category})，回退到 dual"; echo "dual" ;;
         esac
     else
         echo "dual"
@@ -1215,7 +1650,7 @@ _unified_notify() {
 
     # 守卫：过滤无效目标
     if [[ -z "$to" || "$to" == "null" ]]; then
-        log_warn "[_unified_notify] 无效目标: to='$to' category=$category，跳过"
+        log_warn "[_unified_notify] 无效目标: to='${to}' category=${category}，跳过"
         return 0
     fi
 

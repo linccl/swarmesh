@@ -461,6 +461,8 @@ _check_group_completion() {
                 "[任务组完成] $group_title (ID: $group_id) 全部 $total 个任务已完成。执行 swarm-msg.sh group-status $group_id 查看详情。" \
                 "task.group_completed" "high"
 
+            compact_group_roles "$group_id" "任务组完成: $group_title"
+
             info "任务组全部完成: $group_id ($group_title)"
         fi
     ) 200>"${group_file}.lock"
@@ -523,9 +525,11 @@ _generate_subtask_ids() {
 
         # 碰撞检查
         local collision=false
-        for eid in "${existing_ids[@]}"; do
-            [[ "$eid" == "$sub_id" ]] && collision=true && break
-        done
+        if [[ ${#existing_ids[@]} -gt 0 ]]; then
+            for eid in "${existing_ids[@]}"; do
+                [[ "$eid" == "$sub_id" ]] && collision=true && break
+            done
+        fi
         [[ -f "$TASKS_DIR/failed/$sub_id.json" ]] && collision=true
         [[ "$collision" == true ]] && continue
 
@@ -687,6 +691,8 @@ _compose_parent() {
         _unified_notify "$from_id" \
             "[任务归一] $parent_title (ID: $parent_id) 所有子任务已完成，结果已汇总。"$'\n'"$composed_result" \
             "task.composed" "high"
+
+        compact_parent_roles "$parent_id" "父任务归一完成: $parent_title"
 
         # 更新 Story
         _story_update_task "$parent_id" "completed" "子任务全部完成，已归一"
@@ -893,7 +899,7 @@ cmd_publish() {
             notify_msg+=$'\n'"$description"
         fi
         notify_msg+=$'\n'$'\n'"👉 认领: swarm-msg.sh claim $task_id"
-        notify_msg+=$'\n'"👉 认领后先同步计划给 $my_instance，再直接开工，不要等待确认"
+        notify_msg+=$'\n'"👉 认领后先同步计划给 ${my_instance}，再直接开工，不要等待确认"
         notify_msg+=$'\n'"👉 完成后: swarm-msg.sh complete-task $task_id --result \"完成说明\""
         notify_msg+=$'\n'"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -1915,7 +1921,11 @@ cmd_split_task() {
     done < <(jq -r '.subtasks // [] | .[]' "$parent_file" 2>/dev/null)
 
     local ids_str
-    ids_str=$(_generate_subtask_ids "$parent_id" "$next_depth" "$subtask_count" "${existing_ids[@]}")
+    if [[ ${#existing_ids[@]} -gt 0 ]]; then
+        ids_str=$(_generate_subtask_ids "$parent_id" "$next_depth" "$subtask_count" "${existing_ids[@]}")
+    else
+        ids_str=$(_generate_subtask_ids "$parent_id" "$next_depth" "$subtask_count")
+    fi
     [[ -n "$ids_str" ]] || die "split-task: 无法生成子任务 ID（后缀耗尽）"
     read -ra subtask_ids <<< "$ids_str"
 
@@ -2029,7 +2039,11 @@ cmd_split_task() {
     done
 
     # 更新父任务: subtasks = 保留的旧子任务 + 新子任务, split_status="split"（加文件锁）
-    local all_subtask_ids=("${existing_ids[@]}" "${subtask_ids[@]}")
+    local -a all_subtask_ids=()
+    if [[ ${#existing_ids[@]} -gt 0 ]]; then
+        all_subtask_ids=("${existing_ids[@]}")
+    fi
+    all_subtask_ids+=("${subtask_ids[@]}")
     local subtasks_json
     subtasks_json=$(printf '%s\n' "${all_subtask_ids[@]}" | jq -R '.' | jq -s '.')
     local split_ts
@@ -2281,7 +2295,11 @@ cmd_expand_subtask() {
 
     # 同层替换，新子任务和被替换的子任务深度相同
     local ids_str
-    ids_str=$(_generate_subtask_ids "$parent_id" "$current_depth" "$subtask_count" "${existing_ids[@]}")
+    if [[ ${#existing_ids[@]} -gt 0 ]]; then
+        ids_str=$(_generate_subtask_ids "$parent_id" "$current_depth" "$subtask_count" "${existing_ids[@]}")
+    else
+        ids_str=$(_generate_subtask_ids "$parent_id" "$current_depth" "$subtask_count")
+    fi
     [[ -n "$ids_str" ]] || die "expand-subtask: 无法生成子任务 ID（后缀耗尽）"
     read -ra subtask_ids <<< "$ids_str"
 

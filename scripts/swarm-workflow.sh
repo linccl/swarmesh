@@ -44,6 +44,90 @@ success() { echo -e "\033[0;32m[workflow]\033[0m $*" >&2; }
 warn()    { echo -e "\033[1;33m[workflow]\033[0m $*" >&2; }
 stage()   { echo -e "\n\033[1;35m━━━ $* ━━━\033[0m" >&2; }
 
+_trim_stage_result() {
+    local content="$1"
+    local max_lines="${WORKFLOW_STAGE_RESULT_MAX_LINES:-12}"
+
+    printf '%s\n' "$content" \
+        | sed '/^[[:space:]]*$/d' \
+        | sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+        | head -n "$max_lines"
+}
+
+_build_role_stage_summary() {
+    local wf_id="$1"
+    local role="$2"
+    local stage_json="$3"
+
+    local summary=""
+    local task_ids=()
+    local task_id task_title task_status task_result trimmed_result
+
+    while IFS= read -r task_id; do
+        [[ -n "$task_id" ]] && task_ids+=("$task_id")
+    done < <(echo "$stage_json" | jq -r --arg role "$role" '.tasks[] | select(.role == $role) | .id')
+
+    summary+="角色 ${role} 在本阶段完成的任务:\n"
+
+    for task_id in "${task_ids[@]}"; do
+        task_title=$(echo "$stage_json" | jq -r --arg tid "$task_id" '.tasks[] | select(.id == $tid) | .template // .id')
+        task_status=$(jq -r --arg tid "$task_id" '.tasks[$tid] // "unknown"' "${WF_STATE_DIR}/${wf_id}.json")
+        task_result=$(jq -r --arg tid "$task_id" '.results[$tid] // ""' "${WF_STATE_DIR}/${wf_id}.json")
+        trimmed_result=$(_trim_stage_result "$task_result")
+
+        summary+=$'\n'"- 任务: ${task_id}"
+        summary+=$'\n'"  状态: ${task_status}"
+        if [[ -n "$task_title" && "$task_title" != "null" ]]; then
+            summary+=$'\n'"  指令: ${task_title}"
+        fi
+        if [[ -n "$trimmed_result" ]]; then
+            summary+=$'\n'"  结果摘要:"
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && summary+=$'\n'"    ${line}"
+            done <<< "$trimmed_result"
+        fi
+    done
+
+    printf '%b' "$summary"
+}
+
+_compact_roles_after_stage() {
+    local wf_id="$1"
+    local stage_json="$2"
+    local requirement="$3"
+
+    [[ "${WORKFLOW_STAGE_COMPACT_ENABLED:-true}" == "true" ]] || return 0
+    [[ "$DRY_RUN" != "true" ]] || return 0
+
+    local stage_num stage_name
+    stage_num=$(echo "$stage_json" | jq -r '.stage')
+    stage_name=$(echo "$stage_json" | jq -r '.name')
+
+    local roles=()
+    local role
+    while IFS= read -r role; do
+        [[ -n "$role" ]] && roles+=("$role")
+    done < <(echo "$stage_json" | jq -r '.tasks[].role' | awk '!seen[$0]++')
+
+    local pane_target instance summary
+    for role in "${roles[@]}"; do
+        pane_target=""
+        instance=""
+        if ! IFS='|' read -r pane_target instance <<< "$(resolve_role_to_pane "$role" 2>/dev/null)"; then
+            warn "阶段 ${stage_num} compact 跳过角色 ${role}: 无在线实例"
+            continue
+        fi
+
+        summary=$(_build_role_stage_summary "$wf_id" "$role" "$stage_json")
+        if ! compact_and_rehydrate_pane "$pane_target" "$stage_num" "$stage_name" "$requirement" "$summary"; then
+            warn "阶段 ${stage_num} compact 失败: role=${role} instance=${instance}"
+            continue
+        fi
+
+        info "阶段 ${stage_num} 已 compact + rehydrate: ${instance:-$role}"
+    done
+}
+
 # ============================================================================
 # 工作流清理
 # ============================================================================
@@ -374,6 +458,8 @@ execute_stage() {
 
     # 发射阶段完成事件
     emit_event "workflow.stage_completed" "" "workflow_id=$wf_id" "stage=$stage_num" "name=$stage_name"
+
+    _compact_roles_after_stage "$wf_id" "$stage_json" "$requirement"
 
     return 0
 }
