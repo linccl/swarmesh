@@ -13,6 +13,7 @@
 #   stop    [--clean]                 停止蜂群
 #   status                            查看蜂群状态
 #   task    [内容]                    派发任务 / 查看收件箱
+#   restart-codex                     顺序重启在线 Codex 实例
 #   join    [role] [选项]             动态添加角色
 #   leave   [role] [选项]             移除角色
 #   msg     <子命令> ...              透传消息系统命令
@@ -398,6 +399,58 @@ cmd_task() {
 }
 
 # =============================================================================
+# 子命令: restart-codex
+# =============================================================================
+
+cmd_restart_codex() {
+    local continue_msg="继续当前任务（如果未完成）。如果当前任务已经完成，请检查是否还有未处理的 swarm 消息或待认领任务，再继续协作。"
+
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "用法: swarm-cli.sh restart-codex [选项]"
+        echo ""
+        echo "顺序重启当前蜂群里所有在线 Codex 实例。默认允许中断忙碌实例。"
+        echo "重启后会用 codex resume 恢复会话，并发送继续任务提示。"
+        echo ""
+        echo "选项:"
+        echo "  --continue-msg <text>   自定义恢复后发送给每个实例的提示语"
+        return 0
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --continue-msg)
+                shift; continue_msg="${1:-$continue_msg}"; shift
+                ;;
+            *)
+                die "restart-codex: 未知参数 $1"
+                ;;
+        esac
+    done
+
+    [[ -f "$STATE_FILE" ]] || die "state.json 不存在，蜂群未启动？"
+    tmux has-session -t "$SESSION_NAME" 2>/dev/null || die "Session '$SESSION_NAME' 不存在"
+
+    local instances=()
+    while IFS= read -r inst; do
+        [[ -n "$inst" ]] && instances+=("$inst")
+    done < <(jq -r '.panes[] | select((.cli // "") | test("codex")) | .instance' "$STATE_FILE" 2>/dev/null)
+
+    if [[ ${#instances[@]} -eq 0 ]]; then
+        log_warn "当前没有在线 Codex 实例"
+        return 0
+    fi
+
+    log_info "准备顺序重启 ${#instances[@]} 个 Codex 实例"
+    local inst
+    for inst in "${instances[@]}"; do
+        restart_codex_instance "$inst" "$continue_msg"
+    done
+
+    echo ""
+    log_ok "所有在线 Codex 实例已顺序重启完成"
+}
+
+# =============================================================================
 # 子命令: join
 # =============================================================================
 
@@ -720,6 +773,7 @@ HEADER
     echo -e "  ${C_GREEN}stop${C_RESET}    [--clean]                 停止蜂群"
     echo -e "  ${C_GREEN}status${C_RESET}                            查看蜂群状态"
     echo -e "  ${C_GREEN}task${C_RESET}    [任务描述]                 派发任务 / 查看收件箱"
+    echo -e "  ${C_GREEN}restart-codex${C_RESET}                     顺序重启在线 Codex 实例"
     echo -e "  ${C_GREEN}join${C_RESET}    [role] [选项]              动态添加角色"
     echo -e "  ${C_GREEN}leave${C_RESET}   [role] [选项]              移除角色"
     echo -e "  ${C_GREEN}msg${C_RESET}     <子命令> ...               透传消息系统命令"
@@ -731,6 +785,7 @@ HEADER
     echo "  swarm-cli.sh task 实现用户注册功能"
     echo "  swarm-cli.sh task backend 实现登录 API"
     echo "  swarm-cli.sh status"
+    echo "  swarm-cli.sh restart-codex"
     echo "  swarm-cli.sh join database --cli \"gemini\""
     echo "  swarm-cli.sh leave database --reason \"设计完成\""
     echo "  swarm-cli.sh msg send reviewer \"请 review PR #42\""
@@ -757,6 +812,9 @@ case "${1:-}" in
         ;;
     task)
         shift; cmd_task "$@"
+        ;;
+    restart-codex)
+        shift; cmd_restart_codex "$@"
         ;;
     join)
         shift; cmd_join "$@"

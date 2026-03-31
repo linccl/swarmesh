@@ -75,6 +75,13 @@ Reload your shell after updating the config, then you can run commands like `swa
 ./scripts/swarm-cli.sh join
 ./scripts/swarm-cli.sh leave
 
+# After manually switching the global Codex API account, sequentially restart all online Codex roles
+./scripts/swarm-cli.sh restart-codex
+./scripts/swarm-restart-codex.sh
+
+# Optional: custom post-resume prompt
+./scripts/swarm-cli.sh restart-codex --continue-msg "继续当前任务（如果未完成）。"
+
 # Pass-through messaging commands
 ./scripts/swarm-cli.sh msg send reviewer "Please review PR #42"
 ./scripts/swarm-cli.sh msg broadcast "v1 API finalized"
@@ -85,6 +92,19 @@ Reload your shell after updating the config, then you can run commands like `swa
 ```
 
 Each subcommand supports `--help` for detailed usage: `./scripts/swarm-cli.sh start --help`
+
+For `restart-codex`, the expected flow is:
+
+1. Manually switch the global Codex API account or credentials first.
+2. Run `./scripts/swarm-restart-codex.sh`.
+3. The script will sequentially restart online Codex roles one by one, never in parallel.
+4. Each role is resumed with `codex resume <session-id>` and then receives a follow-up prompt to continue current work if needed.
+
+Notes:
+
+- The restart flow is designed for panes wrapped by `script` and will only resume after the previous Codex process on that pane TTY has actually exited.
+- The flow automatically handles common Codex startup interstitials observed in practice, including update prompts, trust-directory prompts, rate-limit model prompts, and reasoning-level prompts.
+- If a historical session was previously switched to another model, Codex may still show a non-blocking warning during resume about the recorded model differing from the current one.
 
 #### Claude Code Users
 

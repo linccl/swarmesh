@@ -778,6 +778,27 @@ _pane_log_size() {
     _file_size "$log_file"
 }
 
+_pane_current_command() {
+    local pane_target="$1"
+    tmux display-message -p -t "${SESSION_NAME}:${pane_target}" '#{pane_current_command}' 2>/dev/null || true
+}
+
+_pane_tty() {
+    local pane_target="$1"
+    tmux display-message -p -t "${SESSION_NAME}:${pane_target}" '#{pane_tty}' 2>/dev/null || true
+}
+
+_instance_state_field() {
+    local instance="$1"
+    local field="$2"
+    local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
+    [[ -f "$state_file" ]] || return 0
+
+    jq -r --arg instance "$instance" --arg field "$field" '
+        .panes[] | select(.instance == $instance) | .[$field] // ""
+    ' "$state_file" 2>/dev/null | head -1
+}
+
 _capture_pane_tail() {
     local pane_target="$1"
     local capture_lines="${SEND_SETTLE_CAPTURE_LINES:-80}"
@@ -1139,6 +1160,25 @@ _codex_handle_startup_interstitials() {
             continue
         fi
 
+        if [[ "$pane_text" == *"Approaching rate limits"* ]] \
+            && [[ "$pane_text" == *"1. Switch to gpt-5.1-codex-mini"* ]] \
+            && [[ "$pane_text" == *"2. Keep current model"* ]]; then
+            tmux send-keys -t "$pane_ref" "3"
+            sleep "${CODEX_PASTE_DELAY:-0.5}"
+            tmux send-keys -l -t "$pane_ref" $'\r'
+            sleep 1
+            continue
+        fi
+
+        if [[ "$pane_text" == *"Select Reasoning Level for"* ]] \
+            && [[ "$pane_text" == *"1. Low"* ]] \
+            && [[ "$pane_text" == *"2. Medium (default)"* ]]; then
+            sleep "${CODEX_PASTE_DELAY:-0.5}"
+            tmux send-keys -l -t "$pane_ref" $'\r'
+            sleep 1
+            continue
+        fi
+
         break
     done
 }
@@ -1167,6 +1207,221 @@ _wait_codex_ready_for_input() {
     done
 
     return 1
+}
+
+_extract_codex_resume_command_from_text() {
+    local content="${1:-}"
+    [[ -n "$content" ]] || return 1
+
+    printf '%s\n' "$content" \
+        | grep -Eo 'codex resume[^[:cntrl:]]*' \
+        | tail -1 \
+        | sed -E 's/[[:space:]]+$//'
+}
+
+_extract_codex_resume_command_from_pane() {
+    local pane_target="$1"
+    local capture_lines="${2:-160}"
+    local snapshot
+    snapshot=$(tmux capture-pane -t "${SESSION_NAME}:${pane_target}" -p -S "-${capture_lines}" 2>/dev/null || true)
+    _extract_codex_resume_command_from_text "$snapshot"
+}
+
+_extract_codex_session_id_from_resume_command() {
+    local resume_cmd="${1:-}"
+    [[ -n "$resume_cmd" ]] || return 1
+
+    printf '%s\n' "$resume_cmd" \
+        | sed -nE 's/.*codex resume[[:space:]]+([^[:space:]]+).*/\1/p' \
+        | head -1
+}
+
+_is_valid_codex_session_id() {
+    [[ "${1:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+}
+
+_find_recent_codex_session_id_for_cwd() {
+    local cwd="$1"
+    local sessions_root="${HOME}/.codex/sessions"
+    [[ -n "$cwd" && -d "$sessions_root" ]] || return 1
+
+    local latest_file
+    latest_file=$(
+        rg -l -F "\"cwd\":\"${cwd}\"" "$sessions_root" 2>/dev/null \
+            | sort \
+            | tail -1
+    )
+
+    [[ -n "$latest_file" && -f "$latest_file" ]] || return 1
+
+    sed -nE 's/.*"id":"([^"]+)".*/\1/p' "$latest_file" | head -1
+}
+
+_build_codex_resume_command() {
+    local cli_cmd="$1"
+    local session_id="$2"
+    [[ -n "$session_id" ]] || return 1
+
+    local -a tokens resume_tokens
+    local token next_token i
+    read -r -a tokens <<< "$cli_cmd"
+    resume_tokens=("codex" "resume" "$session_id")
+
+    i=0
+    while [[ $i -lt ${#tokens[@]} ]]; do
+        token="${tokens[$i]}"
+        case "$token" in
+            codex|chat|resume)
+                ((i++))
+                ;;
+            -c|--config|--enable|--disable|-i|--image|-m|--model|-p|--profile|-s|--sandbox|-a|--ask-for-approval|-C|--cd|--add-dir|--local-provider)
+                if [[ $((i + 1)) -lt ${#tokens[@]} ]]; then
+                    next_token="${tokens[$((i + 1))]}"
+                    resume_tokens+=("$token" "$next_token")
+                    i=$((i + 2))
+                else
+                    i=$((i + 1))
+                fi
+                ;;
+            --oss|--full-auto|--dangerously-bypass-approvals-and-sandbox|--search|--no-alt-screen)
+                resume_tokens+=("$token")
+                ((i++))
+                ;;
+            *)
+                ((i++))
+                ;;
+        esac
+    done
+
+    printf '%q ' "${resume_tokens[@]}"
+}
+
+_store_codex_resume_metadata() {
+    local instance="$1"
+    local session_id="$2"
+    local resume_cmd="$3"
+    local updated_at
+    updated_at=$(get_timestamp)
+
+    state_json_update '
+        .panes |= map(
+            if .instance == $inst then
+                . + {
+                    codex_session_id: $sid,
+                    codex_resume_cmd: $cmd,
+                    codex_resume_updated_at: $updated_at
+                }
+            else
+                .
+            end
+        )
+    ' \
+        --arg inst "$instance" \
+        --arg sid "$session_id" \
+        --arg cmd "$resume_cmd" \
+        --arg updated_at "$updated_at"
+}
+
+_request_codex_exit() {
+    local pane_target="$1"
+    local cli_cmd="${2:-codex}"
+    local pane_ref="${SESSION_NAME}:${pane_target}"
+    local attempt tmp_file
+
+    for attempt in 1 2 3 4; do
+        _pane_has_codex_process "$pane_target" || return 0
+
+        tmux send-keys -t "$pane_ref" C-c
+        sleep 1
+        _pane_has_codex_process "$pane_target" || return 0
+
+        if check_prompt "$pane_target"; then
+            tmp_file=$(mktemp "${RUNTIME_DIR}/.codex-exit-XXXXXX")
+            printf '/quit' > "$tmp_file"
+            _pane_locked_paste_enter "$pane_target" "$tmp_file" "$cli_cmd" || true
+            rm -f "$tmp_file"
+            sleep 2
+            _pane_has_codex_process "$pane_target" || return 0
+        fi
+    done
+
+    return 1
+}
+
+_pane_has_codex_process() {
+    local pane_target="$1"
+    local pane_tty tty_name
+    pane_tty=$(_pane_tty "$pane_target")
+    [[ -n "$pane_tty" ]] || return 1
+    tty_name="${pane_tty#/dev/}"
+
+    ps -t "$tty_name" -o command= 2>/dev/null | grep -qE '(^|[[:space:]])codex([[:space:]]|$)'
+}
+
+restart_codex_instance() {
+    local instance="$1"
+    local continue_msg="${2:-继续当前任务（如果未完成）。如果当前任务已经完成，请检查是否还有未处理的 swarm 消息或待认领任务，再继续协作。}"
+    local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
+    local pane_target cli_cmd worktree role session_id resume_cmd captured_resume launch_cmd cached_session_id
+
+    [[ -f "$state_file" ]] || die "state.json 不存在，蜂群未启动？"
+
+    pane_target=$(_instance_state_field "$instance" "pane")
+    cli_cmd=$(_instance_state_field "$instance" "cli")
+    worktree=$(_instance_state_field "$instance" "worktree")
+    role=$(_instance_state_field "$instance" "role")
+    cached_session_id=$(_instance_state_field "$instance" "codex_session_id")
+
+    [[ -n "$pane_target" ]] || die "实例不存在: $instance"
+    _cli_uses_codex "$cli_cmd" || die "实例 $instance 不是 codex CLI: $cli_cmd"
+    [[ -n "$worktree" && -d "$worktree" ]] || die "实例 $instance 的 worktree 无效: $worktree"
+
+    emit_event "codex.restart.started" "$instance" "pane=$pane_target" "role=${role:-unknown}"
+    log_info "重启 codex 实例: $instance (pane=$pane_target role=${role:-unknown})"
+
+    if _pane_has_codex_process "$pane_target"; then
+        _request_codex_exit "$pane_target" "$cli_cmd" \
+            || die "无法让实例 $instance 正常退出 codex"
+    fi
+
+    captured_resume=$(_extract_codex_resume_command_from_pane "$pane_target" 200 || true)
+    if [[ -n "$captured_resume" ]]; then
+        session_id=$(_extract_codex_session_id_from_resume_command "$captured_resume" || true)
+    fi
+
+    if ! _is_valid_codex_session_id "$session_id"; then
+        session_id="$cached_session_id"
+        captured_resume=$(_instance_state_field "$instance" "codex_resume_cmd")
+    fi
+
+    if ! _is_valid_codex_session_id "$session_id"; then
+        session_id=$(_find_recent_codex_session_id_for_cwd "$worktree" || true)
+    fi
+
+    _is_valid_codex_session_id "$session_id" \
+        || die "实例 $instance 未找到可用的完整 codex session_id，请先手动退出一次让 pane 输出完整 resume 命令"
+
+    resume_cmd=$(_build_codex_resume_command "$cli_cmd" "$session_id") \
+        || die "实例 $instance 无法构建 resume 命令"
+
+    _store_codex_resume_metadata "$instance" "$session_id" "${captured_resume:-$resume_cmd}"
+
+    launch_cmd="cd \"$worktree\" && export SWARM_ROLE=\"$role\" && export SWARM_INSTANCE=\"$instance\" && export RUNTIME_DIR=\"$RUNTIME_DIR\" && export SWARM_SESSION=\"$SESSION_NAME\" && $resume_cmd"
+    _send_keys_enter "$pane_target" "$launch_cmd" "$cli_cmd"
+
+    if ! _wait_codex_ready_for_input "$pane_target"; then
+        emit_event "codex.restart.failed" "$instance" "pane=$pane_target" "reason=resume-timeout"
+        die "实例 $instance 恢复后未能进入可输入状态"
+    fi
+
+    local continue_tmp
+    continue_tmp=$(mktemp "${RUNTIME_DIR}/.codex-continue-XXXXXX")
+    printf '%s' "$continue_msg" > "$continue_tmp"
+    _pane_locked_paste_enter "$pane_target" "$continue_tmp" "$cli_cmd"
+    rm -f "$continue_tmp"
+
+    emit_event "codex.restart.completed" "$instance" "pane=$pane_target" "session_id=$session_id"
+    log_success "codex 实例已恢复: $instance"
 }
 
 # 通过 tmux paste-buffer 发送初始化消息到 pane
