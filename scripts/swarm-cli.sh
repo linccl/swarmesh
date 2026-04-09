@@ -14,6 +14,7 @@
 #   status                            查看蜂群状态
 #   task    [内容]                    派发任务 / 查看收件箱
 #   restart-codex                     顺序重启在线 Codex 实例
+#   restart-watchdog                  仅重启任务看门狗
 #   join    [role] [选项]             动态添加角色
 #   leave   [role] [选项]             移除角色
 #   msg     <子命令> ...              透传消息系统命令
@@ -454,6 +455,61 @@ cmd_restart_codex() {
 }
 
 # =============================================================================
+# 子命令: restart-watchdog
+# =============================================================================
+
+cmd_restart_watchdog() {
+    local state_session="" old_pid="" new_pid="" wait_deadline="" old_cmd=""
+
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "用法: swarm-cli.sh restart-watchdog"
+        echo ""
+        echo "仅重启任务看门狗，不触碰 tmux pane、角色实例或 Codex 会话。"
+        return 0
+    fi
+
+    [[ $# -eq 0 ]] || die "restart-watchdog: 不接受额外参数"
+    [[ -f "$STATE_FILE" ]] || die "state.json 不存在，蜂群未启动？"
+
+    state_session=$(jq -r '.session // empty' "$STATE_FILE" 2>/dev/null || true)
+    [[ -n "$state_session" ]] && SESSION_NAME="$state_session"
+    tmux has-session -t "$SESSION_NAME" 2>/dev/null || die "Session '$SESSION_NAME' 不存在"
+
+    old_pid=$(jq -r '.watchdog_pid // empty' "$STATE_FILE" 2>/dev/null || true)
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+        old_cmd=$(ps -p "$old_pid" -o args= 2>/dev/null || true)
+        log_info "停止旧 watchdog: pid=$old_pid ${old_cmd:+cmd=$old_cmd}"
+        kill "$old_pid" 2>/dev/null || true
+
+        wait_deadline=$((SECONDS + 5))
+        while kill -0 "$old_pid" 2>/dev/null; do
+            if (( SECONDS >= wait_deadline )); then
+                log_warn "旧 watchdog 在 5 秒内未退出，发送 SIGKILL: pid=$old_pid"
+                kill -9 "$old_pid" 2>/dev/null || true
+                break
+            fi
+            sleep 0.2
+        done
+    elif [[ -n "$old_pid" ]]; then
+        log_info "旧 watchdog PID 不存在，直接重启: pid=$old_pid"
+    else
+        log_info "state.json 未记录 watchdog_pid，直接启动新的 watchdog"
+    fi
+
+    source "${SCRIPTS_DIR}/lib/msg-task-watchdog.sh"
+    start_task_watchdog_detached
+    new_pid="${WATCHDOG_PID_LAST:-}"
+    [[ -n "$new_pid" ]] || die "启动 watchdog 失败：未返回 PID"
+    sleep 0.2
+    kill -0 "$new_pid" 2>/dev/null || die "启动 watchdog 失败：PID $new_pid 不存在"
+
+    state_json_update '.watchdog_pid = $pid' --argjson pid "$new_pid"
+    emit_event "watchdog.restarted" "" "session=$SESSION_NAME" "old_pid=${old_pid:-none}" "new_pid=$new_pid"
+
+    log_ok "watchdog 已重启: ${old_pid:-none} -> $new_pid"
+}
+
+# =============================================================================
 # 子命令: join
 # =============================================================================
 
@@ -777,6 +833,7 @@ HEADER
     echo -e "  ${C_GREEN}status${C_RESET}                            查看蜂群状态"
     echo -e "  ${C_GREEN}task${C_RESET}    [任务描述]                 派发任务 / 查看收件箱"
     echo -e "  ${C_GREEN}restart-codex${C_RESET}                     顺序重启在线 Codex 实例"
+    echo -e "  ${C_GREEN}restart-watchdog${C_RESET}                  仅重启任务看门狗"
     echo -e "  ${C_GREEN}join${C_RESET}    [role] [选项]              动态添加角色"
     echo -e "  ${C_GREEN}leave${C_RESET}   [role] [选项]              移除角色"
     echo -e "  ${C_GREEN}msg${C_RESET}     <子命令> ...               透传消息系统命令"
@@ -789,6 +846,7 @@ HEADER
     echo "  swarm-cli.sh task backend 实现登录 API"
     echo "  swarm-cli.sh status"
     echo "  swarm-cli.sh restart-codex"
+    echo "  swarm-cli.sh restart-watchdog"
     echo "  swarm-cli.sh join database --cli \"gemini\""
     echo "  swarm-cli.sh leave database --reason \"设计完成\""
     echo "  swarm-cli.sh msg send reviewer \"请 review PR #42\""
@@ -818,6 +876,9 @@ case "${1:-}" in
         ;;
     restart-codex)
         shift; cmd_restart_codex "$@"
+        ;;
+    restart-watchdog)
+        shift; cmd_restart_watchdog "$@"
         ;;
     join)
         shift; cmd_join "$@"

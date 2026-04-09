@@ -82,6 +82,9 @@ Reload your shell after updating the config, then you can run commands like `swa
 # Optional: custom post-resume prompt
 ./scripts/swarm-cli.sh restart-codex --continue-msg "继续当前任务（如果未完成）。"
 
+# Restart only the task watchdog (reload watchdog/send fixes without touching panes or Codex sessions)
+./scripts/swarm-cli.sh restart-watchdog
+
 # Pass-through messaging commands
 ./scripts/swarm-cli.sh msg send reviewer "Please review PR #42"
 ./scripts/swarm-cli.sh msg broadcast "v1 API finalized"
@@ -105,6 +108,7 @@ Notes:
 - The restart flow is designed for panes wrapped by `script` and will only resume after the previous Codex process on that pane TTY has actually exited.
 - The flow automatically handles common Codex startup interstitials observed in practice, including update prompts, trust-directory prompts, rate-limit model prompts, and reasoning-level prompts.
 - If a historical session was previously switched to another model, Codex may still show a non-blocking warning during resume about the recorded model differing from the current one.
+- `restart-watchdog` only reloads the task watchdog process and does not touch tmux panes, role shells, or live Codex sessions. Use it after changing watchdog / pending-submit / send-path logic, especially on WSL2 setups where you want fixes to take effect without restarting the swarm.
 
 #### Claude Code Users
 
@@ -133,6 +137,9 @@ You can also call the underlying scripts directly:
 
 # Stop
 ./scripts/swarm-stop.sh --force
+
+# Restart only the task watchdog for the current swarm
+./scripts/swarm-cli.sh restart-watchdog
 ```
 
 ### Messaging System
@@ -616,12 +623,20 @@ export PATH="/path/to/swarmesh/scripts:$PATH"
 ./scripts/swarm-cli.sh msg send reviewer "请 review PR #42"
 ./scripts/swarm-cli.sh msg broadcast "v1 接口已定稿"
 
+# 仅重启任务看门狗（不触碰 pane / Codex 会话）
+./scripts/swarm-cli.sh restart-watchdog
+
 # 停止蜂群（可选清理数据）
 ./scripts/swarm-cli.sh stop
 ./scripts/swarm-cli.sh stop --clean
 ```
 
 每个子命令支持 `--help` 查看详细用法：`./scripts/swarm-cli.sh start --help`
+
+补充说明：
+
+- `restart-watchdog` 只会重载任务看门狗进程，不会重启 tmux pane、角色 shell 或正在运行的 Codex 会话。
+- 当你修改了 watchdog、pending-submit 补提交、消息发送链路等脚本，希望在 **Win11 + WSL2** 这类本机环境里立即生效，又不想重启整个蜂群时，可直接执行 `./scripts/swarm-cli.sh restart-watchdog`。
 
 #### Claude Code 用户
 
@@ -650,6 +665,9 @@ export PATH="/path/to/swarmesh/scripts:$PATH"
 
 # 停止
 ./scripts/swarm-stop.sh --force
+
+# 仅重启当前蜂群的 watchdog
+./scripts/swarm-cli.sh restart-watchdog
 ```
 
 ### 消息系统

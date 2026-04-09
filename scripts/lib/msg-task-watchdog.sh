@@ -909,3 +909,20 @@ start_task_watchdog() {
     ) >>"$watchdog_log" 2>&1 &
     echo $!
 }
+
+start_task_watchdog_detached() {
+    local watchdog_log="$LOGS_DIR/watchdog.log"
+    mkdir -p "$LOGS_DIR"
+
+    nohup env \
+        PROJECT_DIR="${PROJECT_DIR:-}" \
+        RUNTIME_DIR="${RUNTIME_DIR:-}" \
+        SWARM_SESSION="${SESSION_NAME:-${SWARM_SESSION:-}}" \
+        SWARM_ROOT="${SWARM_ROOT:-}" \
+        bash -lc '
+            source "$SWARM_ROOT/scripts/swarm-lib.sh"
+            source "$SWARM_ROOT/scripts/lib/msg-task-watchdog.sh"
+            _watchdog_main_loop
+        ' >>"$watchdog_log" 2>&1 < /dev/null &
+    WATCHDOG_PID_LAST=$!
+}

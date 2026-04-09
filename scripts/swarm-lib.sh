@@ -1025,7 +1025,7 @@ _retry_codex_pending_submit() {
     local baseline_snapshot="$4"
     local baseline_log_size="${5:-0}"
 
-    if ! _submit_until_pane_changes "$pane_target" "$baseline_snapshot"; then
+    if ! _submit_until_pane_changes "$pane_target" "$baseline_snapshot" "codex"; then
         return 1
     fi
 
@@ -1064,12 +1064,17 @@ _wait_for_pane_settle() {
 _submit_until_pane_changes() {
     local pane_target="$1"
     local baseline_snapshot="$2"
+    local cli_type="${3:-}"
     local retries="${SEND_SUBMIT_RETRIES:-2}"
     local delay="${SEND_SUBMIT_CHECK_DELAY:-0.2}"
     local attempt=0 current_snapshot=""
 
     for ((attempt=0; attempt<=retries; attempt++)); do
-        tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
+        if _is_codex_cli "$cli_type"; then
+            tmux send-keys -l -t "${SESSION_NAME}:${pane_target}" $'\r'
+        else
+            tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
+        fi
         sleep "$delay"
 
         current_snapshot=$(_capture_pane_tail "$pane_target")
@@ -1118,6 +1123,25 @@ _pane_locked_paste_enter() {
         tmux paste-buffer -b "$buf_name" -t "${SESSION_NAME}:${pane_target}" -d
 
         if _is_codex_cli "$cli_type"; then
+            if _settled_send_enabled; then
+                anchor_head=$(_codex_anchor_from_file "$content_file")
+                anchor_tail=$(_codex_tail_anchor_from_file "$content_file")
+                sleep "${CODEX_PASTE_DELAY:-0.5}"
+                submit_log_size=$(_pane_log_size "$pane_target")
+                settle_snapshot=$(_capture_pane_tail "$pane_target")
+
+                if _submit_until_pane_changes "$pane_target" "$settle_snapshot" "$cli_type"; then
+                    if _codex_submit_still_pending "$pane_target" "$anchor_head" "$anchor_tail" "$submit_log_size"; then
+                        _record_codex_pending_submit "$pane_target" "$content_file" "$cli_type"
+                    else
+                        _clear_codex_pending_submit "$pane_target"
+                    fi
+                else
+                    _record_codex_pending_submit "$pane_target" "$content_file" "$cli_type"
+                fi
+                return 0
+            fi
+
             # Codex CLI: Kitty keyboard protocol 导致 Enter 关键字失效，
             # 必须用 -l 发送原始 CR 字节 (0x0D)
             sleep "${CODEX_PASTE_DELAY:-0.5}"
