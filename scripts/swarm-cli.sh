@@ -404,6 +404,7 @@ cmd_task() {
 
 cmd_restart_codex() {
     local continue_msg="继续当前任务（如果未完成）。如果当前任务已经完成，请检查是否还有未处理的 swarm 消息或待认领任务，再继续协作。"
+    local state_session=""
 
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         echo "用法: swarm-cli.sh restart-codex [选项]"
@@ -428,6 +429,8 @@ cmd_restart_codex() {
     done
 
     [[ -f "$STATE_FILE" ]] || die "state.json 不存在，蜂群未启动？"
+    state_session=$(jq -r '.session // empty' "$STATE_FILE" 2>/dev/null || true)
+    [[ -n "$state_session" ]] && SESSION_NAME="$state_session"
     tmux has-session -t "$SESSION_NAME" 2>/dev/null || die "Session '$SESSION_NAME' 不存在"
 
     local instances=()

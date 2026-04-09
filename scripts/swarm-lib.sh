@@ -1129,6 +1129,24 @@ _pane_locked_paste_enter() {
     )
 }
 
+# tmux capture-pane 会带上历史滚动区和 ANSI 控制序列。
+# WSL2 + Windows Terminal 下 Codex 的 interstitial 提示更容易残留在 scrollback 中，
+# 如果直接全文匹配，自动恢复逻辑会把旧的“2/3”继续打进新的会话输入框。
+_capture_pane_clean_tail() {
+    local pane_ref="$1"
+    local tail_lines="${2:-20}"
+
+    tmux capture-pane -t "$pane_ref" -p 2>/dev/null \
+        | perl -pe '
+            s/\e\[[0-9;?]*[ -\/]*[@-~]//g;
+            s/\e\][^\a]*(?:\a|\e\\)//g;
+            s/\r//g;
+            s/[\x00-\x08\x0b\x0c\x0e-\x1f]//g;
+        ' \
+        | sed '/^[[:space:]]*$/d' \
+        | tail -n "$tail_lines"
+}
+
 # Codex 首次进入新 worktree 时会先询问是否信任目录。
 # 如果此时直接 paste 初始化提示词，会把整段提示词打进确认界面，导致 Codex 退出。
 _codex_handle_startup_interstitials() {
@@ -1137,17 +1155,20 @@ _codex_handle_startup_interstitials() {
     local attempt pane_text
 
     for attempt in 1 2 3 4 5 6 7 8; do
-        pane_text=$(tmux capture-pane -t "$pane_ref" -p -S -80 2>/dev/null || true)
+        pane_text=$(_capture_pane_clean_tail "$pane_ref" 18)
 
         if [[ "$pane_text" == *"Update available!"* ]] \
             && [[ "$pane_text" == *"1. Update now"* ]] \
-            && [[ "$pane_text" == *"2. Skip"* ]] \
             && [[ "$pane_text" == *"Press enter to continue"* ]]; then
-            tmux send-keys -t "$pane_ref" "2"
+            if [[ "$pane_text" == *"3. Skip until next version"* ]]; then
+                tmux send-keys -t "$pane_ref" "3"
+            else
+                tmux send-keys -t "$pane_ref" "2"
+            fi
             sleep "${CODEX_PASTE_DELAY:-0.5}"
             tmux send-keys -l -t "$pane_ref" $'\r'
             sleep 1
-            continue
+            return 0
         fi
 
         if [[ "$pane_text" == *"Do you trust the contents of this directory?"* ]] \
@@ -1157,17 +1178,17 @@ _codex_handle_startup_interstitials() {
             sleep "${CODEX_PASTE_DELAY:-0.5}"
             tmux send-keys -l -t "$pane_ref" $'\r'
             sleep 1
-            continue
+            return 0
         fi
 
         if [[ "$pane_text" == *"Approaching rate limits"* ]] \
             && [[ "$pane_text" == *"1. Switch to gpt-5.1-codex-mini"* ]] \
             && [[ "$pane_text" == *"2. Keep current model"* ]]; then
-            tmux send-keys -t "$pane_ref" "3"
+            tmux send-keys -t "$pane_ref" "2"
             sleep "${CODEX_PASTE_DELAY:-0.5}"
             tmux send-keys -l -t "$pane_ref" $'\r'
             sleep 1
-            continue
+            return 0
         fi
 
         if [[ "$pane_text" == *"Select Reasoning Level for"* ]] \
@@ -1176,11 +1197,13 @@ _codex_handle_startup_interstitials() {
             sleep "${CODEX_PASTE_DELAY:-0.5}"
             tmux send-keys -l -t "$pane_ref" $'\r'
             sleep 1
-            continue
+            return 0
         fi
 
         break
     done
+
+    return 0
 }
 
 _wait_codex_ready_for_input() {
@@ -1192,7 +1215,7 @@ _wait_codex_ready_for_input() {
 
     for ((attempt=1; attempt<=max_attempts; attempt++)); do
         _codex_handle_startup_interstitials "$pane_target"
-        pane_text=$(tmux capture-pane -t "$pane_ref" -p -S -120 2>/dev/null || true)
+        pane_text=$(_capture_pane_clean_tail "$pane_ref" 24)
 
         if [[ "$pane_text" == *"Starting MCP servers"* ]]; then
             sleep "$interval"
@@ -1355,14 +1378,14 @@ _pane_has_codex_process() {
     [[ -n "$pane_tty" ]] || return 1
     tty_name="${pane_tty#/dev/}"
 
-    ps -t "$tty_name" -o command= 2>/dev/null | grep -qE '(^|[[:space:]])codex([[:space:]]|$)'
+    ps -t "$tty_name" -o args= 2>/dev/null | grep -qE '(^|[[:space:]/])codex([[:space:]]|$)'
 }
 
 restart_codex_instance() {
     local instance="$1"
     local continue_msg="${2:-继续当前任务（如果未完成）。如果当前任务已经完成，请检查是否还有未处理的 swarm 消息或待认领任务，再继续协作。}"
     local state_file="${STATE_FILE:-$RUNTIME_DIR/state.json}"
-    local pane_target cli_cmd worktree role session_id resume_cmd captured_resume launch_cmd cached_session_id
+    local pane_target="" cli_cmd="" worktree="" role="" session_id="" resume_cmd="" captured_resume="" launch_cmd="" cached_session_id=""
 
     [[ -f "$state_file" ]] || die "state.json 不存在，蜂群未启动？"
 
