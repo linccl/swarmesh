@@ -417,12 +417,23 @@ _watchdog_check_pending_submits() {
             continue
         fi
 
-        if ! check_prompt "$pane_target" 2>/dev/null; then
+        local prompt_ready=0 banner_pending=0 anchor_pending=0
+        if check_prompt "$pane_target" 2>/dev/null; then
+            prompt_ready=1
+        fi
+        if _codex_has_pending_submit_banner "$pane_target"; then
+            banner_pending=1
+        fi
+        if _pane_tail_matches_pending_submit "$pane_target" "$anchor_head" "$anchor_tail"; then
+            anchor_pending=1
+        fi
+
+        if [[ "$prompt_ready" -eq 0 && "$banner_pending" -eq 0 ]]; then
             rm -f "$submit_file"
             continue
         fi
 
-        if ! _pane_tail_matches_pending_submit "$pane_target" "$anchor_head" "$anchor_tail"; then
+        if [[ "$anchor_pending" -eq 0 && "$banner_pending" -eq 0 ]]; then
             rm -f "$submit_file"
             continue
         fi

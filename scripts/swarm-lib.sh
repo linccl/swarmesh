@@ -926,6 +926,13 @@ _pane_tail_matches_pending_submit() {
     return 1
 }
 
+_codex_has_pending_submit_banner() {
+    local pane_target="$1"
+
+    _pane_tail_contains_text "$pane_target" "Messages to be submitted after next tool call" \
+        || _pane_tail_contains_text "$pane_target" "press esc to interrupt and send immediately"
+}
+
 _pane_submit_state_file() {
     local pane_safe="${1//./-}"
     printf '%s/%s.json' "$PANE_SUBMIT_DIR" "$pane_safe"
@@ -1000,12 +1007,12 @@ _codex_submit_still_pending() {
     local anchor_head="$2"
     local anchor_tail="$3"
 
-    if _pane_tail_matches_pending_submit "$pane_target" "$anchor_head" "$anchor_tail"; then
+    if _codex_has_pending_submit_banner "$pane_target"; then
         return 0
     fi
 
-    if ! check_prompt "$pane_target"; then
-        return 1
+    if _pane_tail_matches_pending_submit "$pane_target" "$anchor_head" "$anchor_tail"; then
+        return 0
     fi
 
     return 1
@@ -1064,6 +1071,18 @@ _submit_until_pane_changes() {
 
     for ((attempt=0; attempt<=retries; attempt++)); do
         if _is_codex_cli "$cli_type"; then
+            # Codex 正在执行工具时，消息会进入 “after next tool call” 队列。
+            # 这时单发 CR 往往无效，需先发送原始 ESC 触发 “interrupt and send immediately”。
+            if _codex_has_pending_submit_banner "$pane_target"; then
+                tmux send-keys -l -t "${SESSION_NAME}:${pane_target}" $'\e'
+                sleep "$delay"
+
+                current_snapshot=$(_capture_pane_tail "$pane_target")
+                if ! _codex_has_pending_submit_banner "$pane_target"; then
+                    return 0
+                fi
+            fi
+
             tmux send-keys -l -t "${SESSION_NAME}:${pane_target}" $'\r'
         else
             tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
