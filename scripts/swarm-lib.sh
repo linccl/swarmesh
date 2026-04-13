@@ -999,20 +999,13 @@ _codex_submit_still_pending() {
     local pane_target="$1"
     local anchor_head="$2"
     local anchor_tail="$3"
-    local baseline_log_size="${4:-0}"
-    local current_log_size
-    current_log_size=$(_pane_log_size "$pane_target")
 
-    if [[ "$current_log_size" -gt "$baseline_log_size" ]]; then
-        return 1
+    if _pane_tail_matches_pending_submit "$pane_target" "$anchor_head" "$anchor_tail"; then
+        return 0
     fi
 
     if ! check_prompt "$pane_target"; then
         return 1
-    fi
-
-    if _pane_tail_matches_pending_submit "$pane_target" "$anchor_head" "$anchor_tail"; then
-        return 0
     fi
 
     return 1

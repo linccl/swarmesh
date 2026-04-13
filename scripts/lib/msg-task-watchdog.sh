@@ -417,13 +417,6 @@ _watchdog_check_pending_submits() {
             continue
         fi
 
-        local current_log_size
-        current_log_size=$(_pane_log_size "$pane_target")
-        if [[ "$current_log_size" -gt "$recorded_log_size" ]]; then
-            rm -f "$submit_file"
-            continue
-        fi
-
         if ! check_prompt "$pane_target" 2>/dev/null; then
             rm -f "$submit_file"
             continue
@@ -461,7 +454,7 @@ _watchdog_check_pending_submits() {
 
         _watchdog_touch_pending_submit_retry "$submit_file" "$now_ts" "$now"
 
-        if _retry_codex_pending_submit "$pane_target" "$anchor_head" "$anchor_tail" "$baseline_snapshot" "$current_log_size"; then
+        if _retry_codex_pending_submit "$pane_target" "$anchor_head" "$anchor_tail" "$baseline_snapshot" "$recorded_log_size"; then
             emit_event "pane.submit_recovered" "${instance:-$pane_target}" "pane=$pane_target" "attempt=$next_attempt"
             log_info "[watchdog] 已补提交 Codex 输入框草稿: pane=$pane_target, instance=${instance:-$pane_target}, attempt=$next_attempt"
             rm -f "$submit_file"
