@@ -933,6 +933,18 @@ _codex_has_pending_submit_banner() {
         || _pane_tail_contains_text "$pane_target" "press esc to interrupt and send immediately"
 }
 
+_codex_has_retryable_rate_limit_error() {
+    local pane_target="$1"
+    local pane_ref="${SESSION_NAME}:${pane_target}"
+    local pane_text pane_text_lc
+
+    pane_text=$(_capture_pane_clean_tail "$pane_ref" 32)
+    pane_text_lc=$(printf '%s' "$pane_text" | tr '[:upper:]' '[:lower:]')
+
+    [[ "$pane_text_lc" == *"exceeded retry limit"* ]] \
+        && [[ "$pane_text_lc" == *"429 too many requests"* ]]
+}
+
 _pane_submit_state_file() {
     local pane_safe="${1//./-}"
     printf '%s/%s.json' "$PANE_SUBMIT_DIR" "$pane_safe"

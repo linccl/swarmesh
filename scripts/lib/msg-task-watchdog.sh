@@ -232,6 +232,90 @@ _watchdog_pending_submit_alert() {
     log_info "[watchdog] Codex 输入框卡住: pane=$pane_target, instance=$display_name, attempts=$attempts"
 }
 
+_watchdog_rate_limit_state_file() {
+    local pane_safe="${1//./-}"
+    printf '%s/.watchdog-rate-limit-%s.state' "$RUNTIME_DIR" "$pane_safe"
+}
+
+_watchdog_clear_rate_limit_state() {
+    local pane_target="$1"
+    rm -f "$(_watchdog_rate_limit_state_file "$pane_target")" 2>/dev/null || true
+}
+
+_watchdog_rate_limit_fingerprint() {
+    local pane_target="$1"
+    local snapshot
+    snapshot=$(_capture_pane_clean_tail "${SESSION_NAME}:${pane_target}" 40)
+    printf '%s' "$snapshot" | cksum | awk '{print $1 ":" $2}'
+}
+
+_watchdog_rate_limit_in_cooldown() {
+    local pane_target="$1"
+    local fingerprint="$2"
+    local now_epoch="$3"
+    local state_file last_fingerprint last_epoch
+
+    state_file=$(_watchdog_rate_limit_state_file "$pane_target")
+    [[ -f "$state_file" ]] || return 1
+
+    IFS=$'\t' read -r last_fingerprint last_epoch < "$state_file" || return 1
+    [[ "$last_fingerprint" == "$fingerprint" ]] || return 1
+    [[ "$last_epoch" =~ ^[0-9]+$ ]] || return 1
+
+    (( now_epoch - last_epoch < ${CODEX_RATE_LIMIT_CONTINUE_COOLDOWN:-180} ))
+}
+
+_watchdog_mark_rate_limit_continue_sent() {
+    local pane_target="$1"
+    local fingerprint="$2"
+    local now_epoch="$3"
+    local state_file
+
+    state_file=$(_watchdog_rate_limit_state_file "$pane_target")
+    printf '%s\t%s\n' "$fingerprint" "$now_epoch" > "$state_file"
+}
+
+_watchdog_maybe_continue_rate_limited_task() {
+    local pane_target="$1"
+    local instance="$2"
+    local task_id="$3"
+    local display_name="${instance:-$pane_target}"
+
+    if ! check_prompt "$pane_target" 2>/dev/null; then
+        _watchdog_clear_rate_limit_state "$pane_target"
+        return 1
+    fi
+
+    if ! _codex_has_retryable_rate_limit_error "$pane_target"; then
+        _watchdog_clear_rate_limit_state "$pane_target"
+        return 1
+    fi
+
+    local now_epoch fingerprint
+    now_epoch=$(date +%s)
+    fingerprint=$(_watchdog_rate_limit_fingerprint "$pane_target")
+
+    if _watchdog_rate_limit_in_cooldown "$pane_target" "$fingerprint" "$now_epoch"; then
+        return 0
+    fi
+
+    local continue_tmp cli_cmd
+    continue_tmp=$(mktemp "${RUNTIME_DIR}/.rate-limit-continue-XXXXXX")
+    printf '%s' "继续" > "$continue_tmp"
+    cli_cmd=$(_pane_cli_command "$pane_target")
+
+    if _pane_locked_paste_enter "$pane_target" "$continue_tmp" "$cli_cmd" 2>/dev/null; then
+        _watchdog_mark_rate_limit_continue_sent "$pane_target" "$fingerprint" "$now_epoch"
+        emit_event "pane.rate_limit_continue" "$display_name" "pane=$pane_target" "task_id=$task_id"
+        log_info "[watchdog] 检测到 Codex 429 限流，已发送继续: pane=$pane_target, instance=$display_name, task_id=$task_id"
+    else
+        log_warn "[watchdog] 检测到 Codex 429 限流，但发送继续失败: pane=$pane_target, instance=$display_name, task_id=$task_id"
+    fi
+
+    rm -f "$continue_tmp"
+    return 0
+}
+
 _watchdog_parse_task_epoch() {
     local ts="$1"
     [[ -n "$ts" && "$ts" != "null" ]] || { echo "0"; return 0; }
@@ -377,7 +461,12 @@ _watchdog_check_one_task() {
         fi
     fi
 
-    # --- 检测 4: 空闲检测（pane 存活但 idle） ---
+    # --- 检测 4: Codex 429 限流后自动发送“继续” ---
+    if [[ -n "$pane_target" ]] && _watchdog_maybe_continue_rate_limited_task "$pane_target" "$claimed_by" "$tid"; then
+        return 0
+    fi
+
+    # --- 检测 5: 空闲检测（pane 存活但 idle） ---
     if [[ -n "$pane_target" ]] && check_prompt "$pane_target" 2>/dev/null; then
         _watchdog_idle_warning "$tid" "$claimed_by"
     fi
