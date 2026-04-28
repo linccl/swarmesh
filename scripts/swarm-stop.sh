@@ -372,6 +372,31 @@ cleanup_watchers() {
     fi
 }
 
+remove_dir_with_retry() {
+    local target_dir="$1"
+    local max_attempts="${2:-5}"
+    local delay_seconds="${3:-2}"
+    local attempt output=""
+
+    [[ -n "$target_dir" ]] || return 1
+
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        [[ ! -e "$target_dir" ]] && return 0
+
+        if output=$(rm -rf "$target_dir" 2>&1); then
+            [[ ! -e "$target_dir" ]] && return 0
+        fi
+
+        if [[ $attempt -lt $max_attempts ]]; then
+            log_warn "清理目录失败，${delay_seconds}s 后重试 (${attempt}/${max_attempts}): $target_dir"
+            sleep "$delay_seconds"
+        fi
+    done
+
+    [[ -n "$output" ]] && printf '%s\n' "$output" >&2
+    return 1
+}
+
 # 移除所有 git worktree 并列出分支供人类审查
 cleanup_worktrees() {
     if [[ ! -f "$STATE_FILE" ]]; then
@@ -383,6 +408,7 @@ cleanup_worktrees() {
     worktree_dir=$(jq -r '.worktree_dir // ""' "$STATE_FILE" 2>/dev/null)
 
     [[ -n "$project_dir" && -d "$project_dir" ]] || return 0
+    [[ -n "$worktree_dir" && -d "$worktree_dir" ]] || return 0
 
     # 列出蜂群创建的分支
     local branches=()
@@ -392,11 +418,22 @@ cleanup_worktrees() {
 
     if [[ ${#branches[@]} -gt 0 ]]; then
         log_info "移除 git worktrees..."
+        shopt -s nullglob
+        local wt
         for wt in "$worktree_dir"/*/; do
-            [[ -d "$wt" ]] && git -C "$project_dir" worktree remove --force "$wt" 2>/dev/null || true
+            [[ -d "$wt" ]] || continue
+            git -C "$project_dir" worktree remove --force "$wt" 2>/dev/null || true
         done
-        rm -rf "$worktree_dir"
-        log_success "Worktrees 已清理"
+        shopt -u nullglob
+
+        git -C "$project_dir" worktree prune --expire now 2>/dev/null || true
+
+        if remove_dir_with_retry "$worktree_dir"; then
+            log_success "Worktrees 已清理"
+        else
+            log_warn "Worktree 目录清理失败，通常是仍有进程占用或 Windows 正在锁定文件: $worktree_dir"
+            git -C "$project_dir" worktree prune --expire now 2>/dev/null || true
+        fi
 
         echo ""
         echo "以下 swarm 分支已保留，供人类审查和合并:"
@@ -580,14 +617,15 @@ main() {
     # 清理项目目录中注入的蜂群上下文
     cleanup_swarm_context "$STATE_FILE"
 
-    # 移除所有 git worktree 并列出分支供人类审查
-    cleanup_worktrees
-
     # 发射停止事件（在 kill session 之前，确保事件写入）
     emit_event "system.stopped" "" "session=$SESSION_NAME"
 
     # 关闭 tmux session
     kill_session
+    sleep 1
+
+    # 移除所有 git worktree 并列出分支供人类审查
+    cleanup_worktrees
 
     # 清理运行时数据（可选）
     if [[ "$CLEAN_ALL" == "true" ]]; then

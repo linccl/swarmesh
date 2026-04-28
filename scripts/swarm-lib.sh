@@ -693,6 +693,52 @@ _is_codex_cli() {
     [[ "${1:-}" == *codex* ]]
 }
 
+_tmux_send_hex_key() {
+    local target_ref="$1"
+    local hex_key="$2"
+
+    if tmux send-keys -H -t "$target_ref" "$hex_key" 2>/dev/null; then
+        return 0
+    fi
+
+    case "$hex_key" in
+        0d) tmux send-keys -l -t "$target_ref" $'\r' ;;
+        1b) tmux send-keys -l -t "$target_ref" $'\e' ;;
+        *) return 1 ;;
+    esac
+}
+
+_codex_send_submit_key() {
+    local pane_target="$1"
+    _tmux_send_hex_key "${SESSION_NAME}:${pane_target}" 0d
+}
+
+_codex_send_interrupt_key() {
+    local pane_target="$1"
+    _tmux_send_hex_key "${SESSION_NAME}:${pane_target}" 1b
+}
+
+_wait_for_codex_paste_visible() {
+    local pane_target="$1"
+    local anchor_head="$2"
+    local anchor_tail="$3"
+    local max_polls="${CODEX_PASTE_VISIBLE_MAX_POLLS:-30}"
+    local interval="${CODEX_PASTE_VISIBLE_POLL_INTERVAL:-0.1}"
+    local poll
+
+    [[ -n "${anchor_head}${anchor_tail}" ]] || return 0
+
+    for ((poll=0; poll<max_polls; poll++)); do
+        if _codex_has_pending_submit_banner "$pane_target" \
+            || _pane_tail_matches_pending_submit "$pane_target" "$anchor_head" "$anchor_tail"; then
+            return 0
+        fi
+        sleep "$interval"
+    done
+
+    return 1
+}
+
 # 向 pane 发送 shell 命令并提交（Codex 兼容）
 # CLI 启动阶段 state.json 尚未写入，不能用 _resolve_cli_from_pane，
 # 必须由调用方传入 CLI 命令字符串直接判断。
@@ -707,10 +753,10 @@ _send_keys_enter() {
 
     if _is_codex_cli "$cli_type"; then
         # Codex CLI: Kitty keyboard protocol 导致 C-m / Enter 被静默忽略，
-        # 先发送命令文本，再用 -l 发送原始 CR 字节 (0x0D)
+        # 先发送命令文本，再发送原始 CR 字节 (0x0D)
         tmux send-keys -t "${SESSION_NAME}:${pane_target}" "$cmd"
         sleep "${CODEX_PASTE_DELAY:-0.5}"
-        tmux send-keys -l -t "${SESSION_NAME}:${pane_target}" $'\r'
+        _codex_send_submit_key "$pane_target"
     else
         tmux send-keys -t "${SESSION_NAME}:${pane_target}" "$cmd" C-m
     fi
@@ -909,17 +955,51 @@ _pane_tail_contains_text() {
     [[ -n "$normalized_needle" && "$normalized_snapshot" == *"$normalized_needle"* ]]
 }
 
+_codex_input_block() {
+    local pane_target="$1"
+    local capture_lines="${CODEX_PENDING_INPUT_CAPTURE_LINES:-40}"
+    local snapshot
+
+    snapshot=$(tmux capture-pane -t "${SESSION_NAME}:${pane_target}" -p -S "-${capture_lines}" 2>/dev/null || true)
+    printf '%s\n' "$snapshot" | awk '
+        /^[[:space:]]*›/ {
+            block = $0
+            seen = 1
+            next
+        }
+        seen {
+            block = block "\n" $0
+        }
+        END {
+            if (seen) print block
+        }
+    '
+}
+
+_codex_input_block_contains_text() {
+    local pane_target="$1"
+    local needle="$2"
+    [[ -n "$needle" ]] || return 1
+
+    local input_block normalized_block normalized_needle
+    input_block=$(_codex_input_block "$pane_target")
+    normalized_block=$(printf '%s' "$input_block" | _normalize_inline_text)
+    normalized_needle=$(printf '%s' "$needle" | _normalize_inline_text)
+
+    [[ -n "$normalized_needle" && "$normalized_block" == *"$normalized_needle"* ]]
+}
+
 _pane_tail_matches_pending_submit() {
     local pane_target="$1"
     local anchor_head="$2"
     local anchor_tail="$3"
 
-    if [[ -n "$anchor_head" ]] && _pane_tail_contains_text "$pane_target" "$anchor_head"; then
+    if [[ -n "$anchor_head" ]] && _codex_input_block_contains_text "$pane_target" "$anchor_head"; then
         return 0
     fi
 
     if [[ -n "$anchor_tail" && "$anchor_tail" != "$anchor_head" ]] \
-        && _pane_tail_contains_text "$pane_target" "$anchor_tail"; then
+        && _codex_input_block_contains_text "$pane_target" "$anchor_tail"; then
         return 0
     fi
 
@@ -1086,7 +1166,7 @@ _submit_until_pane_changes() {
             # Codex 正在执行工具时，消息会进入 “after next tool call” 队列。
             # 这时单发 CR 往往无效，需先发送原始 ESC 触发 “interrupt and send immediately”。
             if _codex_has_pending_submit_banner "$pane_target"; then
-                tmux send-keys -l -t "${SESSION_NAME}:${pane_target}" $'\e'
+                _codex_send_interrupt_key "$pane_target"
                 sleep "$delay"
 
                 current_snapshot=$(_capture_pane_tail "$pane_target")
@@ -1095,7 +1175,7 @@ _submit_until_pane_changes() {
                 fi
             fi
 
-            tmux send-keys -l -t "${SESSION_NAME}:${pane_target}" $'\r'
+            _codex_send_submit_key "$pane_target"
         else
             tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
         fi
@@ -1117,7 +1197,7 @@ _submit_until_pane_changes() {
 #
 # Codex CLI (Rust/crossterm) 启用了 Kitty Keyboard Enhancement Protocol，
 # tmux 对此支持有限 (tmux/tmux#4196)，导致 `send-keys Enter` 被静默忽略。
-# 解决方案: 对 Codex 使用 `send-keys -l` 发送原始 CR 字节 (\r / 0x0D)。
+# 解决方案: 对 Codex 使用 hex 发送原始 CR 字节 (\r / 0x0D)。
 # 参考: openai/codex#12645
 _pane_locked_paste_enter() {
     local pane_target="$1"
@@ -1144,15 +1224,19 @@ _pane_locked_paste_enter() {
         # macOS mkdir polyfill: 加锁时已自动注册 EXIT trap 清理，无需额外处理
 
         tmux load-buffer -b "$buf_name" "$content_file"
-        tmux paste-buffer -b "$buf_name" -t "${SESSION_NAME}:${pane_target}" -d
 
         if _is_codex_cli "$cli_type"; then
+            anchor_head=$(_codex_anchor_from_file "$content_file")
+            anchor_tail=$(_codex_tail_anchor_from_file "$content_file")
+
+            tmux paste-buffer -p -r -b "$buf_name" -t "${SESSION_NAME}:${pane_target}" -d
+            sleep "${CODEX_PASTE_DELAY:-0.5}"
+            _wait_for_codex_paste_visible "$pane_target" "$anchor_head" "$anchor_tail" || true
+
             if _settled_send_enabled; then
-                anchor_head=$(_codex_anchor_from_file "$content_file")
-                anchor_tail=$(_codex_tail_anchor_from_file "$content_file")
-                sleep "${CODEX_PASTE_DELAY:-0.5}"
+                settle_snapshot=$(_wait_for_pane_settle "$pane_target" || true)
+                [[ -n "$settle_snapshot" ]] || settle_snapshot=$(_capture_pane_tail "$pane_target")
                 submit_log_size=$(_pane_log_size "$pane_target")
-                settle_snapshot=$(_capture_pane_tail "$pane_target")
 
                 if _submit_until_pane_changes "$pane_target" "$settle_snapshot" "$cli_type"; then
                     if _codex_submit_still_pending "$pane_target" "$anchor_head" "$anchor_tail" "$submit_log_size"; then
@@ -1167,10 +1251,10 @@ _pane_locked_paste_enter() {
             fi
 
             # Codex CLI: Kitty keyboard protocol 导致 Enter 关键字失效，
-            # 必须用 -l 发送原始 CR 字节 (0x0D)
-            sleep "${CODEX_PASTE_DELAY:-0.5}"
-            tmux send-keys -l -t "${SESSION_NAME}:${pane_target}" $'\r'
+            # 必须发送原始 CR 字节 (0x0D)
+            _codex_send_submit_key "$pane_target"
         else
+            tmux paste-buffer -b "$buf_name" -t "${SESSION_NAME}:${pane_target}" -d
             sleep "${PASTE_DELAY:-0.3}"
             tmux send-keys -t "${SESSION_NAME}:${pane_target}" Enter
         fi
@@ -1214,7 +1298,7 @@ _codex_handle_startup_interstitials() {
                 tmux send-keys -t "$pane_ref" "2"
             fi
             sleep "${CODEX_PASTE_DELAY:-0.5}"
-            tmux send-keys -l -t "$pane_ref" $'\r'
+            _tmux_send_hex_key "$pane_ref" 0d
             sleep 1
             return 0
         fi
@@ -1224,7 +1308,7 @@ _codex_handle_startup_interstitials() {
             && [[ "$pane_text" == *"Press enter to continue"* ]]; then
             tmux send-keys -t "$pane_ref" "1"
             sleep "${CODEX_PASTE_DELAY:-0.5}"
-            tmux send-keys -l -t "$pane_ref" $'\r'
+            _tmux_send_hex_key "$pane_ref" 0d
             sleep 1
             return 0
         fi
@@ -1234,7 +1318,7 @@ _codex_handle_startup_interstitials() {
             && [[ "$pane_text" == *"2. Keep current model"* ]]; then
             tmux send-keys -t "$pane_ref" "2"
             sleep "${CODEX_PASTE_DELAY:-0.5}"
-            tmux send-keys -l -t "$pane_ref" $'\r'
+            _tmux_send_hex_key "$pane_ref" 0d
             sleep 1
             return 0
         fi
@@ -1243,7 +1327,7 @@ _codex_handle_startup_interstitials() {
             && [[ "$pane_text" == *"1. Low"* ]] \
             && [[ "$pane_text" == *"2. Medium (default)"* ]]; then
             sleep "${CODEX_PASTE_DELAY:-0.5}"
-            tmux send-keys -l -t "$pane_ref" $'\r'
+            _tmux_send_hex_key "$pane_ref" 0d
             sleep 1
             return 0
         fi
