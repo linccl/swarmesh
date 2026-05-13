@@ -453,6 +453,17 @@ cleanup_worktrees() {
         echo "  git branch -d <分支名>       # 删除已合并的分支"
         echo "  git branch -D <分支名>       # 强制删除分支"
         echo ""
+        echo "清理本次蜂群分支命令（确认不再需要后复制执行）:"
+        echo "  git branch -D \\"
+        local i
+        for i in "${!branches[@]}"; do
+            if [[ "$i" -eq $((${#branches[@]} - 1)) ]]; then
+                echo "    ${branches[$i]}"
+            else
+                echo "    ${branches[$i]} \\"
+            fi
+        done
+        echo ""
     fi
 }
 
