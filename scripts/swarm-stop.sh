@@ -8,6 +8,7 @@
 #   - 保存最终状态和统计信息
 #   - 可选择归档日志文件
 #   - 清理 watcher 进程和临时资源
+#   - 将遗留未读消息标记为已读
 #
 # 使用方法：
 #   swarm-stop.sh [选项]
@@ -48,6 +49,9 @@ Swarm Stop Script - 蜂群系统停止脚本
 
 使用方法:
     ${0##*/} [选项]
+
+默认行为:
+    停止时会自动将所有实例收件箱中的遗留未读消息移入已读区
 
 选项:
     --force         强制停止，不保存状态，不确认
@@ -372,6 +376,40 @@ cleanup_watchers() {
     fi
 }
 
+mark_all_messages_read() {
+    if [[ ! -d "$INBOX_DIR" ]]; then
+        log_info "没有遗留未读消息需要清理"
+        return 0
+    fi
+
+    local moved=0 failed=0
+    shopt -s nullglob
+    local inbox_dir msg_file instance outbox_dir
+    for inbox_dir in "$INBOX_DIR"/*/; do
+        [[ -d "$inbox_dir" ]] || continue
+        instance="$(basename "$inbox_dir")"
+        outbox_dir="${OUTBOX_DIR}/${instance}"
+        mkdir -p "$outbox_dir"
+
+        for msg_file in "$inbox_dir"*.json; do
+            [[ -f "$msg_file" ]] || continue
+            if mv "$msg_file" "$outbox_dir/"; then
+                ((moved++)) || true
+            else
+                ((failed++)) || true
+                log_warn "未读消息清理失败: $msg_file"
+            fi
+        done
+    done
+    shopt -u nullglob
+
+    if [[ "$failed" -gt 0 ]]; then
+        log_warn "遗留未读消息已清理 ${moved} 条，失败 ${failed} 条"
+    else
+        log_success "遗留未读消息已清理 ${moved} 条"
+    fi
+}
+
 remove_dir_with_retry() {
     local target_dir="$1"
     local max_attempts="${2:-5}"
@@ -624,6 +662,9 @@ main() {
 
     # 归档日志
     archive_logs
+
+    # 将所有实例 inbox 中的遗留消息标记为已读，避免下次启动重复提示
+    mark_all_messages_read
 
     # 清理项目目录中注入的蜂群上下文
     cleanup_swarm_context "$STATE_FILE"
