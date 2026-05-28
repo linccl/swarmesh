@@ -492,14 +492,12 @@ cleanup_worktrees() {
         echo "  git branch -D <分支名>       # 强制删除分支"
         echo ""
         echo "清理本次蜂群分支命令（确认不再需要后复制执行）:"
-        echo "  git branch -D \\"
+        printf "  git branch -D"
         local i
-        for i in "${!branches[@]}"; do
-            if [[ "$i" -eq $((${#branches[@]} - 1)) ]]; then
-                echo "    ${branches[$i]}"
-            else
-                echo "    ${branches[$i]} \\"
-            fi
+        local quoted_branch
+        for i in "${branches[@]}"; do
+            printf -v quoted_branch "%q" "$i"
+            printf " %s" "$quoted_branch"
         done
         echo ""
     fi
